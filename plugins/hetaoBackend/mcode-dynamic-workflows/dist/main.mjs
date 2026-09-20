@@ -13638,13 +13638,27 @@ function structuredOutput(raw, validate2, stepId) {
       candidate = JSON.parse(text);
       format = "json";
     } catch {
-      const fenced = text.match(/^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```$/i);
-      if (!fenced || fenced[1].includes("```")) throw invalid("invalid_json");
-      try {
-        candidate = JSON.parse(fenced[1]);
-        format = "json_fence";
-      } catch {
-        throw invalid("invalid_json");
+      const blocks = [...text.matchAll(/```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```/gi)];
+      if (blocks.length > 1) throw invalid("invalid_json");
+      if (blocks.length === 1) {
+        if (blocks[0][1].includes("```")) throw invalid("invalid_json");
+        try {
+          candidate = JSON.parse(blocks[0][1]);
+          format = blocks[0][0] === text ? "json_fence" : "json_fence_embedded";
+        } catch {
+          throw invalid("invalid_json");
+        }
+      } else {
+        const spans = bareSpans(text);
+        if (spans.length !== 1) throw invalid("invalid_json");
+        const tail = text.slice(spans[0][1]).match(/\S/);
+        if (tail && ",]}:".includes(tail[0])) throw invalid("invalid_json");
+        try {
+          candidate = JSON.parse(text.slice(spans[0][0], spans[0][1]));
+          format = "json_embedded";
+        } catch {
+          throw invalid("invalid_json");
+        }
       }
     }
   }
@@ -13655,6 +13669,31 @@ function structuredOutput(raw, validate2, stepId) {
     const cause = reason === "invalid_json" ? "\u8FD4\u56DE\u5185\u5BB9\u4E0D\u662F\u6709\u6548\u7684\u5B8C\u6574 JSON \u6216\u5355\u4E2A\u5B8C\u6574 JSON \u4EE3\u7801\u5757\u3002" : issues.map((e) => `${e.path}${e.missingProperty ? ` \u7F3A\u5C11 ${e.missingProperty}` : ` ${e.message}`}`).join("\uFF1B");
     return failureError({ code: "OUTPUT_SCHEMA_INVALID", stepId, reason, issues, message: `\u8282\u70B9 ${stepId} \u7684\u7ED3\u6784\u5316\u8F93\u51FA\u65E0\u6548\uFF1A${cause}`, suggestion: "\u67E5\u770B\u8282\u70B9\u539F\u59CB\u8F93\u51FA\u5E76\u6838\u5BF9 schema\u3002\u4E0D\u8981\u8BFB\u53D6\u5931\u8D25\u7ED3\u679C\u7684\u5B57\u6BB5\u3001\u586B\u5145\u731C\u6D4B\u503C\u6216\u81EA\u52A8\u91CD\u8BD5\uFF1B\u4FDD\u7559\u672A\u8986\u76D6\u9879\u540E\u518D\u51B3\u5B9A\u4FEE\u6B63\u6216\u91CD\u8DD1\u3002" });
   }
+}
+function bareSpans(text) {
+  const spans = [];
+  let depth = 0, start = -1, inString = false, escaped = false;
+  for (let i2 = 0; i2 < text.length; i2++) {
+    const ch = text[i2];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{" || ch === "[") {
+      if (depth === 0) start = i2;
+      depth++;
+    } else if ((ch === "}" || ch === "]") && depth > 0) {
+      depth--;
+      if (depth === 0) {
+        spans.push([start, i2 + 1]);
+        start = -1;
+      }
+    }
+  }
+  return spans;
 }
 
 // src/dependencies.mjs
