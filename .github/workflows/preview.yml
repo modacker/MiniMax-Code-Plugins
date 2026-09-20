@@ -1,0 +1,23 @@
+# Machinery control run: CodeQL only, on the unfixed v2 head (053c594).
+# Expected: the 3 known alerts (auth regex / innerHTML / cmd.exe) — proving
+# the fork-side preview detects exactly what upstream CodeQL detects.
+name: preview
+on:
+  push:
+    branches: ['preview/**']
+  workflow_dispatch:
+jobs:
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:javascript'
