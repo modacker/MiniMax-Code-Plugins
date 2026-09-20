@@ -30,7 +30,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { cleanupEmptyDefaultSessions } from "./lib/sessions.js";
 import { ensureMcodeCommands } from "./lib/acp-client.js";
 import { authorize } from "./lib/authorize.js";
+import { pushAlert } from "./lib/alerts.js";
 import { SESSIONS_DB } from "./lib/config.js";
+// B01: static import (2026-09-20 rigor fix). events.js exists and has
+// no dependency cycle with cleanup.js; the old dynamic-import dance
+// (with its silent catch) both hid write failures and passed the whole
+// event object as `kind`, stringifying to "[object Object]" on disk.
+import { append as _eventsAppend } from "./lib/events.js";
 
 const ORPHAN_STALE_MS = 24 * 60 * 60 * 1000;
 
@@ -64,27 +70,33 @@ function _dryRunOrphanIds() {
     .map((s) => s.id);
 }
 
-// Best-effort audit write — events.js may not be present in earlier
-// rounds (B01 dependency). Dynamic import + try/catch keeps cleanup
-// resilient.
-let _eventsMod = null;
-let _eventsModTried = false;
-async function _tryAppendEvent(evt) {
-  if (_eventsModTried && !_eventsMod) return;
-  if (!_eventsMod) {
-    _eventsModTried = true;
-    try {
-      const url = new URL("./lib/events.js", import.meta.url);
-      _eventsMod = await import(url.href);
-    } catch {
-      _eventsMod = null;
-      return;
-    }
-  }
-  if (!_eventsMod || typeof _eventsMod.append !== "function") return;
+// _appendOrLoud — write one audit event; never throw (this file runs
+// from a boot-time, fire-and-forget async chain with no HTTP response
+// to fail). "向上传播" here means the anomaly channel: pushAlert +
+// console.error. The return value tells the caller whether the write
+// landed, so the destructive branch can fail closed on intent writes.
+function _appendOrLoud(evt) {
   try {
-    _eventsMod.append(evt);
-  } catch {}
+    _eventsAppend(evt.kind, {
+      target: evt.target || "",
+      cid: evt.cid || "",
+      actor: evt.actor || "startup",
+      payload: evt.data && typeof evt.data === "object" ? evt.data : {},
+    });
+    return true;
+  } catch (e) {
+    try {
+      pushAlert({
+        level: "error",
+        msg: `startup cleanup audit write failed (kind=${evt.kind}): ${e.message}`,
+        src: "cleanup",
+      });
+    } catch {}
+    console.error(
+      `[startup.cleanup] audit write failed (kind=${evt.kind}): ${e.message}`,
+    );
+    return false;
+  }
 }
 
 // 启动时一次性清理：默认名 session（24h 以上未用的）
@@ -114,8 +126,10 @@ export function runStartupCleanup() {
   // Write the dry-run audit (kind:"cleanup.dry_run" via events.js)
   //   and then push the authorize request. Do NOT await — startup
   //   returns immediately; the real delete runs when the user
-  //   confirms or auto-timeout fires.
-  _tryAppendEvent({
+  //   confirms or auto-timeout fires. A failed dry-run audit line is
+  //   loud-but-continue (informational; the gate below is the
+  //   enforcement line).
+  _appendOrLoud({
     kind: "cleanup.dry_run",
     target: "startup.cleanup",
     cid: null,
@@ -133,7 +147,7 @@ export function runStartupCleanup() {
   }).then((result) => {
     if (!result.approved) {
       // Decline / timeout / cancel — disk untouched.
-      _tryAppendEvent({
+      _appendOrLoud({
         kind: "cleanup.declined",
         target: "startup.cleanup",
         cid: null,
@@ -149,12 +163,35 @@ export function runStartupCleanup() {
       );
       return;
     }
-    // Approved: real delete. cleanupEmptyDefaultSessions walks the
-    //   same predicate; we trust it to remove exactly the same set
-    //   (or fewer, if the user typed in a chat in the meantime).
+    // Write-ahead intent: the sweep must be durably audited BEFORE
+    // cleanupEmptyDefaultSessions() touches the sessions store. If
+    // the intent write fails we fail closed — no delete, alert only.
+    const intentOk = _appendOrLoud({
+      kind: "cleanup.intent",
+      target: "startup.cleanup",
+      cid: null,
+      actor: "user",
+      data: {
+        orphanCount: orphanIds.length,
+        decidedBy: result.decidedBy,
+        decidedAt: result.decidedAt,
+      },
+    });
+    if (!intentOk) {
+      console.error(
+        `[startup.cleanup] aborted — audit intent write failed, disk untouched (fail-closed)`,
+      );
+      return;
+    }
+    // Approved + audited: real delete. cleanupEmptyDefaultSessions
+    //   walks the same predicate; we trust it to remove exactly the
+    //   same set (or fewer, if the user typed in a chat in the
+    //   meantime).
     try {
       cleanupEmptyDefaultSessions();
-      _tryAppendEvent({
+      // Outcome event. The delete already ran; a failed write is
+      // loud (alert + stderr) but cannot be rolled back.
+      _appendOrLoud({
         kind: "cleanup.commit",
         target: "startup.cleanup",
         cid: null,
@@ -169,7 +206,7 @@ export function runStartupCleanup() {
         `[startup.cleanup] user-approved — orphan cleanup ran (declared=${orphanIds.length})`,
       );
     } catch (e) {
-      _tryAppendEvent({
+      _appendOrLoud({
         kind: "cleanup.error",
         target: "startup.cleanup",
         cid: null,

@@ -19,10 +19,14 @@ import { PORT, HOST } from "./config.js";
 import { LAN_IP } from "./lan.js";
 import { MCODE_CMD, DEFAULT_WORKSPACE, DEFAULT_MODEL } from "./config.js";
 
-// B01: append-only event stream + sha256 chain. The 7 setters below
-// each call append() to record their state change. Failed appends
-// log + swallow (per events.js#append semantics); they do NOT throw
-// to keep the user-visible action from being aborted by audit issues.
+// B01: append-only event stream + sha256 chain. Every setter below
+// writes a `settings.update.intent` event BEFORE the state change and
+// a `settings.update` outcome event after it (write-ahead audit,
+// 2026-09-20 rigor fix). events.js#append is fail-closed: an intent
+// write failure aborts the change (no mutation happened yet); an
+// outcome write failure propagates to the route, which answers 5xx +
+// pushes an alert — the in-memory change is NOT rolled back (the
+// persist already ran; hiding it would be worse than reporting it).
 import { append as _eventsAppend } from "./events.js";
 
 // -----------------------------------------------------------------------
@@ -494,16 +498,25 @@ export function reloadExternalTokenPlanKeys() {
 
 export function setLanBroadcast(v) {
   const before = lanBroadcastEnabled;
-  lanBroadcastEnabled = !!v;
+  const after = !!v;
+  // Write-ahead intent — throws on audit failure before any mutation.
+  if (before !== after) {
+    _eventsAppend("settings.update.intent", {
+      target: "lanBroadcast",
+      actor: "user",
+      payload: { old: before, new: after },
+    });
+  }
+  lanBroadcastEnabled = after;
   // B01: audit toggle. lanBroadcast is intentionally NOT persisted
   // (the in-memory state survives only until reboot — reboot re-enables
   // it for admin lockout safety). But the toggle itself is a state-
   // changing action and SHOULD be auditable.
-  if (before !== lanBroadcastEnabled) {
+  if (before !== after) {
     _eventsAppend("settings.update", {
       target: "lanBroadcast",
       actor: "user",
-      payload: { old: before, new: lanBroadcastEnabled },
+      payload: { old: before, new: after },
     });
   }
   console.log(
@@ -513,44 +526,68 @@ export function setLanBroadcast(v) {
 
 export function setReadOnly(v) {
   const before = readOnlyEnabled;
-  readOnlyEnabled = !!v;
+  const after = !!v;
+  if (before !== after) {
+    _eventsAppend("settings.update.intent", {
+      target: "readOnly",
+      actor: "user",
+      payload: { old: before, new: after },
+    });
+  }
+  readOnlyEnabled = after;
   console.log(`[webui] read-only mode ${readOnlyEnabled ? "enabled" : "disabled"}`);
   try { persistNow(); } catch (e) { /* logged in persistNow */ }
-  if (before !== readOnlyEnabled) {
+  if (before !== after) {
     _eventsAppend("settings.update", {
       target: "readOnly",
       actor: "user",
-      payload: { old: before, new: readOnlyEnabled },
+      payload: { old: before, new: after },
     });
   }
 }
 
 export function setTokenEnabled(v) {
   const before = tokenAuthEnabled;
-  tokenAuthEnabled = !!v;
+  const after = !!v;
+  if (before !== after) {
+    _eventsAppend("settings.update.intent", {
+      target: "tokenEnabled",
+      actor: "user",
+      payload: { old: before, new: after },
+    });
+  }
+  tokenAuthEnabled = after;
   console.log(`[webui] token auth ${tokenAuthEnabled ? "enabled" : "disabled"}`);
   // No persist needed (lanBroadcast isn't persisted either; on the
   // v1.0.1 contract, tokenEnabled survives a restart by defaulting to
   // true). We DO persist it so a power-cycle keeps the user's choice.
   try { persistNow(); } catch {}
-  if (before !== tokenAuthEnabled) {
+  if (before !== after) {
     _eventsAppend("settings.update", {
       target: "tokenEnabled",
       actor: "user",
-      payload: { old: before, new: tokenAuthEnabled },
+      payload: { old: before, new: after },
     });
   }
 }
 
 export function setTokenAcknowledged(v) {
   const before = tokenAcknowledged;
-  tokenAcknowledged = !!v;
+  const after = !!v;
+  if (before !== after) {
+    _eventsAppend("settings.update.intent", {
+      target: "tokenAcknowledged",
+      actor: "user",
+      payload: { old: before, new: after },
+    });
+  }
+  tokenAcknowledged = after;
   try { persistNow(); } catch {}
-  if (before !== tokenAcknowledged) {
+  if (before !== after) {
     _eventsAppend("settings.update", {
       target: "tokenAcknowledged",
       actor: "user",
-      payload: { old: before, new: tokenAcknowledged },
+      payload: { old: before, new: after },
     });
   }
 }
@@ -576,13 +613,24 @@ export function setAllowedInterfaces(_ifaces) {
 // in sync regardless of which source is currently in use.
 export function setTokenPlanApiKey(k) {
   const before = tokenPlanApiKey;
-  tokenPlanApiKey = typeof k === "string" ? k : "";
-  try { persistNow(); } catch {}
+  const after = typeof k === "string" ? k : "";
   // B01: audit key change. We never log the key value itself (security);
   // we record only "had a key?" / "has a key?" booleans. An operator
   // auditing the stream can see "the key was set/cleared at seq=N" but
   // not the key value.
-  if (before !== tokenPlanApiKey) {
+  if (before !== after) {
+    _eventsAppend("settings.update.intent", {
+      target: "tokenPlanApiKey",
+      actor: "user",
+      payload: {
+        old_present: before.length > 0,
+        new_present: after.length > 0,
+      },
+    });
+  }
+  tokenPlanApiKey = after;
+  try { persistNow(); } catch {}
+  if (before !== after) {
     _eventsAppend("settings.update", {
       target: "tokenPlanApiKey",
       actor: "user",
@@ -596,7 +644,15 @@ export function setTokenPlanApiKey(k) {
 
 export function setQuotaEnabled(v) {
   const before = quotaEnabled;
-  quotaEnabled = !!v;
+  const after = !!v;
+  if (before !== after) {
+    _eventsAppend("settings.update.intent", {
+      target: "quotaEnabled",
+      actor: "user",
+      payload: { old: before, new: after },
+    });
+  }
+  quotaEnabled = after;
   // Disabling also clears the settings.json key (don't keep
   // credentials around if the user explicitly turned the feature
   // off). External env/file keys are NOT cleared here — they're
@@ -610,7 +666,7 @@ export function setQuotaEnabled(v) {
     tokenPlanApiKey = "";
   }
   try { persistNow(); } catch {}
-  if (before !== quotaEnabled) {
+  if (before !== after) {
     _eventsAppend("settings.update", {
       target: "quotaEnabled",
       actor: "user",
@@ -642,6 +698,19 @@ export function rotateToken() {
   const prevToken = currentToken;
   const prevRotatedAt = tokenRotatedAt;
   const prevAck = tokenAcknowledged;
+  // Write-ahead intent (fail-closed): if the audit write fails we
+  // throw BEFORE any state/persist mutation — the token stays as-is.
+  // The flow-level token.reset.intent at the route (routes/settings.js)
+  // covers the authorize→rotate span; this line covers direct
+  // programmatic callers of rotateToken().
+  _eventsAppend("token.rotate.intent", {
+    target: "currentToken",
+    actor: "user",
+    payload: {
+      old_present: prevToken.length > 0,
+      rotatedAt: newRotatedAt,
+    },
+  });
   currentToken = newToken;
   tokenRotatedAt = newRotatedAt;
   tokenAcknowledged = false;
@@ -657,16 +726,23 @@ export function rotateToken() {
   // B01: token rotation is the highest-impact settings change — record
   // it after persist succeeds (so a rolled-back rotation has no event).
   // We log only the rotation timestamp, never the token value (security).
-  _eventsAppend("settings.update", {
-    target: "currentToken",
-    actor: "user",
-    payload: {
-      old_present: prevToken.length > 0,
-      new_present: true,
-      rotatedAt: newRotatedAt,
-    },
-  });
-  syncAuthToken();
+  // Outcome write failure propagates to the caller (route → 5xx +
+  // alert); the rotation itself already succeeded and is NOT rolled
+  // back — syncAuthToken() below must still run so the live auth gate
+  // matches the persisted token.
+  try {
+    _eventsAppend("settings.update", {
+      target: "currentToken",
+      actor: "user",
+      payload: {
+        old_present: prevToken.length > 0,
+        new_present: true,
+        rotatedAt: newRotatedAt,
+      },
+    });
+  } finally {
+    syncAuthToken();
+  }
   return currentToken;
 }
 

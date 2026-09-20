@@ -27,6 +27,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import http from "node:http";
+import { decideNextAuthorization } from "../_setup.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const serverJsPath = join(__dirname, "..", "..", "server.js");
@@ -49,16 +50,23 @@ async function spawnServer(opts = {}) {
         HOST: "127.0.0.1",
         MCODE_WEBUI_SETTINGS_PATH: settingsPath,
         MCODE_WEBUI_EVENTS_PATH: eventsPath,
+        // U1 (2026-09-20 rigor fix): redirect upload dir + sessions db
+        // away from MCODE_ROOT — see router-boot.test.js (stray
+        // .webui-uploads/ breaks marketplace validate.mjs). tmpDir is
+        // per-test mkdtemp'd and rmSync'd in stopServer below.
+        MCODE_WEBUI_UPLOAD_DIR: join(tmpDir, "uploads"),
+        MCODE_WEBUI_SESSIONS_DB: join(tmpDir, "sessions.json"),
         TOKEN: "",
         MCODE_WEBUI_TOKEN_STDOUT: "0",
     };
     if (opts.throttleMs !== undefined) {
         env.STATE_PUSH_THROTTLE_MS = String(opts.throttleMs);
     }
-    // Spawn with --experimental-test-module-mocks so authorize() auto-
-    // approves under server/lib/authorize.js (lines 151-163). The
-    // flag is otherwise inert for server.js startup.
-    const proc = spawn("node", ["--experimental-test-module-mocks", serverJsPath], {
+    // Plain node (no mock flag): the authorize() test-mode auto-approve
+    // was removed in the 2026-09-20 rigor fix. The token-reset test
+    // below drives the gate through the production wire path (SSE
+    // needs_authorization + POST /api/auth/decision).
+    const proc = spawn("node", [serverJsPath], {
         stdio: ["ignore", "pipe", "pipe"],
         cwd: join(__dirname, "..", ".."),
         env,
@@ -243,21 +251,34 @@ describe("sse-channel: /api/events", () => {
     test("auth.token_rotated SSE event fires on token reset", async () => {
         // Open the SSE stream FIRST, then trigger the reset. The server
         // will push the named event auth.token_rotated to all connected
-        // cids. We wait ~800ms so the rotation broadcast reaches us.
+        // cids. We wait ~2500ms so the rotation broadcast reaches us.
         const ssePromise = openSse({
             port: server.port,
             path: "/api/events?cid=test-cid-rot",
-            ms: 1500,
+            ms: 2500,
         });
         // Give the SSE a moment to connect before POSTing the reset,
         // so the server's sseByCid.set(cid, res) has run.
         await new Promise((r) => setTimeout(r, 200));
-        const post = await postJson({
+        // The reset is authorize()-gated (no auto-approve since the
+        // 2026-09-20 rigor fix). Subscribe the decider BEFORE firing
+        // the POST (needs_authorization broadcasts are fire-once),
+        // then drive the real wire path.
+        const decisionPromise = decideNextAuthorization({
+            port: server.port,
+            approve: true,
+            cid: "test-cid-decider",
+        });
+        await new Promise((r) => setTimeout(r, 150));
+        const postPromise = postJson({
             port: server.port,
             path: "/api/settings",
             body: { resetToken: true },
             headers: { "x-test-cid": "test-cid-rot" },
         });
+        const { decision } = await decisionPromise;
+        assert.ok(decision, "auth decision must have been posted");
+        const post = await postPromise;
         assert.equal(post.status, 200, `POST /api/settings resetToken returned ${post.status}`);
         assert.equal(post.json && post.json.ok, true);
         assert.equal(post.json && post.json.tokenRotated, true);

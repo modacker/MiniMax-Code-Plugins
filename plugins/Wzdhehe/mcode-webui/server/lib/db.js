@@ -301,16 +301,22 @@ export function deleteMcodeSessionFromDb(
       // B01: dry-run previews are state-touching actions. Record
       // what would have been deleted. dryRun:true marker lets the
       // audit distinguish "actually deleted" from "previewed".
-      _eventsAppend("session.delete", {
-        target: sid,
-        actor: "user",
-        payload: {
-          matchKind: "dryRun_db",
-          dryRun: true,
-          previewedRows: totalRows,
-          tables: log.length,
-        },
-      });
+      // Fail-closed (2026-09-20): a failed preview audit surfaces as
+      // {ok:false} instead of being swallowed.
+      try {
+        _eventsAppend("session.delete", {
+          target: sid,
+          actor: "user",
+          payload: {
+            matchKind: "dryRun_db",
+            dryRun: true,
+            previewedRows: totalRows,
+            tables: log.length,
+          },
+        });
+      } catch (e) {
+        return { ok: false, reason: "audit_write_failed", error: e.message };
+      }
       return { ok: true, dryRun: true, log, totalRows };
     } catch (e) {
       if (db) try { db.close(); } catch {}
@@ -320,6 +326,21 @@ export function deleteMcodeSessionFromDb(
 
   let db;
   try {
+    // Write-ahead audit (2026-09-20 rigor fix): the intent line must
+    // land BEFORE the transaction opens. Failure → {ok:false} and the
+    // caller aborts; the db is untouched.
+    try {
+      _eventsAppend("session.delete.intent", {
+        target: sid,
+        actor: "user",
+        payload: {
+          matchKind: "db",
+          dryRun: false,
+        },
+      });
+    } catch (e) {
+      return { ok: false, reason: "audit_write_failed", error: e.message };
+    }
     db = new Db(MCODE_RUNTIME_DB, { readonly: false });
     db.pragma("busy_timeout = 5000"); // mcode 端可能在写, 最多等 5s
     const log = [];
@@ -342,19 +363,26 @@ export function deleteMcodeSessionFromDb(
     // actually had rows for this sid — useful for "did this delete
     // touch anything?" debugging. We do NOT log the rows themselves
     // (privacy + volume).
-    _eventsAppend("session.delete", {
-      target: sid,
-      actor: "user",
-      payload: {
-        matchKind: "db",
-        dryRun: false,
-        tablesAffected: log.length,
-        totalRowsDeleted: log.reduce(
-          (s, e) => s + Number((e.split(":")[1] || "0")),
-          0,
-        ),
-      },
-    });
+    // Fail-closed: if the OUTCOME write fails we still report
+    // {ok:false, reason:"audit_write_failed"} — the rows are gone but
+    // the operator must see the audit gap, never a clean ok:true.
+    try {
+      _eventsAppend("session.delete", {
+        target: sid,
+        actor: "user",
+        payload: {
+          matchKind: "db",
+          dryRun: false,
+          tablesAffected: log.length,
+          totalRowsDeleted: log.reduce(
+            (s, e) => s + Number((e.split(":")[1] || "0")),
+            0,
+          ),
+        },
+      });
+    } catch (e) {
+      return { ok: false, reason: "audit_write_failed", error: e.message };
+    }
     return { ok: true, log };
   } catch (e) {
     if (db)

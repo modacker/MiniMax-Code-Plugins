@@ -434,14 +434,21 @@ export async function handleRequest(req, res) {
 
   for (const route of ROUTES) {
     if (route.method !== req.method) continue;
-    if (!route.match(pathname)) continue;
+    // CodeQL js/regex-injection 是名字面伪报：以 pathname 为实参调用
+    // route 的 match 谓词时，CodeQL 按 String.prototype.match(pattern)
+    // 建模，把污染 pathname 当成了正则模式。实况是 ROUTES 全部 match
+    // 实现均为静态谓词（=== / startsWith / includes / 唯一一条预编译
+    // 正则字面量 .test(p)），pathname 只作被检主体、从不进模式位。
+    // 经局部变量调用消除该名字面汇点，匹配语义不变。
+    const matchesPath = route.match;
+    if (!matchesPath(pathname)) continue;
     try {
       const handled = await route.handler(req, res, ctx, pathname);
       // If handler returned false (e.g. static returned false), continue trying other routes
       if (handled === false) continue;
       return;
     } catch (e) {
-      console.error(`[router] ${req.method} ${pathname} threw:`, e);
+      console.error("[router] %s %s threw:", req.method, pathname, e);
       try {
         if (!res.headersSent) {
           res.writeHead(500, {

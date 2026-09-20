@@ -430,3 +430,166 @@ export async function setupMocks(t, overrides = {}) {
     },
   });
 }
+
+// -----------------------------------------------------------------------
+// Decision-injection helper (2026-09-20 rigor fix).
+//
+// authorize() no longer auto-approves under `node --test` (the
+// execArgv branch was removed — it meant no test ever exercised the
+// real decision path). Tests that call route handlers which await
+// authorize() must now drive the REAL path: this helper polls
+// getPendingRequestIds() and resolves each new pending request via
+// _decideForTests(id, approve) — exactly what a user's modal click
+// does through POST /api/auth/decision, minus the HTTP.
+//
+// Properties:
+//   - Touches ZERO production code (getPendingRequestIds /
+//     _decideForTests are authorize.js's existing test surface).
+//   - Does NOT depend on --experimental-test-module-mocks — plain
+//     dynamic import of the real (or, if a test registered one, the
+//     mocked) authorize module. Works in both suite modes.
+//   - Robust to handlers that only reach authorize() after an await
+//     (e.g. body parsing): a short interval polls while fn() runs.
+//
+// Usage:
+//   const res = await withDecisions(
+//     () => handleDeleteSession(fakeReq({}), res, ctx),
+//     { approve: true },
+//   );
+// -----------------------------------------------------------------------
+export async function withDecisions(fn, { approve = true } = {}) {
+  const mod = await import(absPath("lib/authorize.js"));
+  // Defensive: a test may have registered a t.mock.module replacement
+  // for authorize.js that doesn't expose the pending-registry helpers
+  // (e.g. the fixed-decline stub in routes-sessions-search.test.js).
+  // Such stubs resolve immediately — nothing to drive.
+  if (
+    typeof mod.getPendingRequestIds !== "function" ||
+    typeof mod._decideForTests !== "function"
+  ) {
+    return fn();
+  }
+  // Requests that were already pending when withDecisions started
+  // belong to someone else — only decide requests created by fn().
+  const preExisting = new Set(mod.getPendingRequestIds());
+  const decided = new Set();
+  const poll = setInterval(() => {
+    for (const id of mod.getPendingRequestIds()) {
+      if (decided.has(id) || preExisting.has(id)) continue;
+      decided.add(id);
+      mod._decideForTests(id, approve);
+    }
+  }, 2);
+  if (typeof poll.unref === "function") poll.unref();
+  try {
+    return await fn();
+  } finally {
+    clearInterval(poll);
+  }
+}
+
+// -----------------------------------------------------------------------
+// decideNextAuthorization — HTTP-level decision driver for integration
+// tests that spawn the REAL server.js in a child process. Subscribes
+// to the SSE stream, waits for the next `needs_authorization` frame,
+// extracts the requestId, and POSTs /api/auth/decision — the exact
+// wire path the production modal uses.
+//
+// Resolves { requestId, decision } where decision is the parsed
+// /api/auth/decision response. Rejects if no auth request arrives
+// within `timeoutMs` (default 3s).
+//
+// IMPORTANT: start this helper BEFORE firing the gated HTTP request
+// and allow a short delay for the SSE subscription to register —
+// needs_authorization broadcasts are NOT replayed to late subscribers
+// (the pending-request SSE frame is fire-once).
+// -----------------------------------------------------------------------
+export function decideNextAuthorization({ port, approve = true, cid, timeoutMs = 3000 }) {
+  return new Promise((resolve, reject) => {
+    import("node:http").then((http) => {
+      // Once the decision POST is in flight, errors from tearing down
+      // our own SSE subscription ("aborted") must NOT reject the outer
+      // promise — the POST's outcome is the answer.
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { req.destroy(); } catch {}
+        reject(new Error(
+          `decideNextAuthorization: no needs_authorization frame within ${timeoutMs}ms`,
+        ));
+      }, timeoutMs);
+      const req = http.request(
+        {
+          method: "GET",
+          host: "127.0.0.1",
+          port,
+          path: "/api/events" + (cid ? `?cid=${encodeURIComponent(cid)}` : ""),
+        },
+        (res) => {
+          let body = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => {
+            body += chunk;
+            // Frames arrive as `event: needs_authorization\ndata: {...}\n\n`.
+            // Scan the accumulated body each chunk — cheap at test scale.
+            const frames = body.split("\n\n");
+            for (const frame of frames) {
+              const evMatch = frame.match(/^event: needs_authorization$/m);
+              if (!evMatch) continue;
+              const dataLine = frame.split("\n").find((l) => l.startsWith("data: "));
+              if (!dataLine) continue;
+              let payload;
+              try { payload = JSON.parse(dataLine.slice("data: ".length)); } catch { continue; }
+              const requestId = payload && payload.requestId;
+              if (!requestId) continue;
+              clearTimeout(timer);
+              settled = true; // decision POST in flight — ignore teardown noise
+              try { req.destroy(); } catch {}
+              const data = JSON.stringify({ requestId, approve });
+              const post = http.request(
+                {
+                  method: "POST",
+                  host: "127.0.0.1",
+                  port,
+                  path: "/api/auth/decision",
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Content-Length": Buffer.byteLength(data),
+                  },
+                },
+                (postRes) => {
+                  const chunks = [];
+                  postRes.on("data", (c) => chunks.push(c));
+                  postRes.on("end", () => {
+                    let decision;
+                    try { decision = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
+                    resolve({ requestId, decision, status: postRes.statusCode });
+                  });
+                  postRes.on("error", (e) => {
+                    resolve({ requestId, decision: null, status: postRes.statusCode, error: e.message });
+                  });
+                },
+              );
+              post.on("error", (e) => reject(e));
+              post.write(data);
+              post.end();
+              return;
+            }
+          });
+          res.on("error", (e) => {
+            if (settled) return; // our own destroy()
+            clearTimeout(timer);
+            reject(e);
+          });
+        },
+      );
+      req.on("error", (e) => {
+        if (settled) return; // our own destroy()
+        clearTimeout(timer);
+        reject(e);
+      });
+      req.end();
+    }).catch(reject);
+  });
+}

@@ -154,9 +154,11 @@ contribution workflow, see `docs/DEVELOPMENT.md`.
   been expanded). Keep both copies in sync when editing — the plugin tree is
   the source of truth for the release artifact.
 - **For release** (the artifact pushed to the community plugin repo):
-  `npm run package:plugin` copies the plugin tree into a real `dist/Wzdhehe/
-  Mcode-webui/` tree and zips it, verifying the output contains zero
-  symlinks/junctions, satisfying the mcode-plugin-guide contract.
+  the `plugins/Wzdhehe/mcode-webui/` tree itself is the submission
+  artifact (one folder = one plugin). There is no `package:plugin`
+  packaging script in the current script set.
 
-`npm run setup:plugin` is the historical junction-setup script; on the
-current layout it is a no-op for existing directories.
+The historical `setup:plugin` junction-setup script no longer exists
+in this tree's `package.json`. The current script set is
+`test` / `test:unit` / `test:integration`, `check` / `check:ci`,
+`sbom`, and `coverage` (see `package.json#scripts` and `docs/CI.md`).

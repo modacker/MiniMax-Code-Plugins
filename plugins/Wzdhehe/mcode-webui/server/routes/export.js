@@ -15,8 +15,9 @@
 //   - format validation → 400 { error: "unsupported format" }
 //   - session lookup → 404 { error: "session not found" }
 //   - B03 authorize gate: `session.export` action. UI gets a
-//     `needs_authorization` SSE modal; decline → 403. In test mode
-//     (under node --test) authorize auto-approves.
+//     `needs_authorization` SSE modal; decline → 403. Tests drive the
+//     decision via test/_setup.js#withDecisions (no auto-approve —
+//     removed in the 2026-09-20 rigor fix).
 //
 // Output:
 //   - format=json → application/json
@@ -28,13 +29,15 @@ import { existsSync } from "node:fs";
 import { MCODE_RUNTIME_DB } from "../lib/config.js";
 import { getMcodeBetterSqlite3 } from "../lib/db.js";
 import { authorize } from "../lib/authorize.js";
+import { pushAlert } from "../lib/alerts.js";
 import {
   serializeMessages,
   serializeSession,
   slugifyTitle,
   fileTimestamp,
 } from "../lib/markdown.js";
-// B01: append session.export events (best-effort).
+// B01: append session.export events. Fail-closed since the 2026-09-20
+// rigor fix — a failed audit write 5xx's the request + alerts.
 import { append as _eventsAppend } from "../lib/events.js";
 
 const VALID_FORMATS = new Set(["md", "json"]);
@@ -362,7 +365,7 @@ export async function handleExport(req, res, ctx) {
 
   // B03: per-request authorize. Export is non-destructive but exposes
   // conversation history — same gate class as session.delete per the
-  // C06 spec. In test mode (under `node --test`) authorize auto-approves.
+  // C06 spec. Tests drive the decision via test/_setup.js#withDecisions.
   let authResult = null;
   try {
     authResult = await authorize("session.export", {
@@ -385,6 +388,35 @@ export async function handleExport(req, res, ctx) {
         decidedAt: (authResult && authResult.decidedAt) || Date.now(),
       }),
     );
+  }
+
+  // Write-ahead audit (2026-09-20 rigor fix): the approved disclosure
+  // intent is recorded BEFORE any session content is read / merged.
+  // A failed write aborts the export — the conversation history must
+  // not leave the server on an unaudited request.
+  try {
+    _eventsAppend("session.export.intent", {
+      target: id,
+      cid,
+      actor: "user",
+      payload: {
+        format,
+        download,
+        decidedBy: authResult.decidedBy,
+      },
+    });
+  } catch (e) {
+    try {
+      pushAlert({
+        level: "error",
+        msg: `audit write failed (session.export.intent): ${e.message}`,
+        src: "export",
+      });
+    } catch {}
+    console.error("[export] audit intent append failed:", e);
+    return _jsonError(res, 500, "audit write failed", {
+      detail: "session.export.intent",
+    });
   }
 
   // Resolve session
@@ -416,7 +448,9 @@ export async function handleExport(req, res, ctx) {
 
   const messages = _mergeMessages(webuiMsgs, mcodeMsgs);
 
-  // Audit (B01)
+  // Audit (B01) — outcome line, written after the payload is built.
+  // Fail-closed (2026-09-20): the export content must not be served
+  // on a request whose audit line failed to land — 5xx + alert.
   try {
     _eventsAppend("session.export", {
       target: session.id || id,
@@ -434,10 +468,17 @@ export async function handleExport(req, res, ctx) {
       },
     });
   } catch (e) {
-    if (process.env.MCODE_WEBUI_DEBUG) {
-      console.warn("[export] audit append failed:", e.message);
-    }
-    /* audit best-effort */
+    try {
+      pushAlert({
+        level: "error",
+        msg: `audit write failed (session.export): ${e.message}`,
+        src: "export",
+      });
+    } catch {}
+    console.error("[export] audit outcome append failed:", e);
+    return _jsonError(res, 500, "audit write failed", {
+      detail: "session.export",
+    });
   }
 
   // Render

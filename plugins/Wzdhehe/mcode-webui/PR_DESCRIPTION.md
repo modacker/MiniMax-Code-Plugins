@@ -15,10 +15,14 @@
   - `docs/` (ARCHITECTURE, API, CAPABILITIES, DEVELOPMENT, TROUBLESHOOTING,
     BORROW-harness-v2, MATH-skeleton-webui-v2, ANTI-PATTERNS-FIX-PLAN,
     PROJECT-CHARTER-webui-v2, VERIFICATION-REPORT, HTTPS-REVERSE-PROXY, CI)
-  - `server/`, `public/`, `test/`, `scripts/` (real directories, kept in sync
-    with the project root; packaged as-is into `dist/` for the release artifact)
-  - `package.json` (copy of project root, with `setup:plugin`,
-    `package:plugin`, `check`, and `sbom` scripts)
+  - `server/`, `public/`, `test/`, `checks/`, `scripts/` (real directories, kept
+    in sync with the project root; packaged as-is into `dist/` for the release
+    artifact. `checks/` holds the module-mocked suites that need
+    `--experimental-test-module-mocks` and are therefore excluded from the
+    marketplace root gate's flagless discovery — see docs/CI.md)
+  - `package.json` (copy of project root, with `test` / `test:unit` /
+    `test:mocked` / `test:integration`, `check` / `check:ci`, `coverage`, and
+    `sbom` scripts)
 
 ## v2.0.0 changes from v1.x (industrialization)
 
@@ -44,8 +48,8 @@ for the charter):
 | 1 | **Verifiability** — append-only NDJSON event stream + SHA-256 hash chain | `server/lib/events.js` (B01) + 18 hook sites |
 | 2 | **Observability** — independent anomaly SSE channel + bell-icon data feed | `server/lib/alerts.js` + `server/routes/alerts.js` (B02) |
 | 4 | **Governability** — per-request `authorize(action, ctx)` Promise, 5-minute default fail-closed, 16 hook sites | `server/lib/authorize.js` (B03) |
-| 5 | **Reproducibility** — `package-lock.json` + CycloneDX 1.5 SBOM + npm-audit integration | `.github/workflows/ci.yml` + `scripts/gen-sbom.mjs` (C02) |
-| 6 | **Testability** — `node --test` matrix (Node 22 / Node 24 × macOS / Linux / Windows) | `.github/workflows/ci.yml` (C02) |
+| 5 | **Reproducibility** — `package-lock.json` + CycloneDX 1.5 SBOM + npm-audit integration | `scripts/gen-sbom.mjs` + `docs/CI.md` local gates (C02) |
+| 6 | **Testability** — dual-mode `node --test` suite (with / without `--experimental-test-module-mocks`) + local cross-Node/OS matrix recipe | `docs/CI.md` (C02) + marketplace root `validate` CI |
 | 7 | **Discoverability** — 13 `plugin.json` capabilities each carry a `description` (204-286 chars); CONTRIBUTING.md has a "Common npm test failures" section | `plugin.json` + `README.md` + `CONTRIBUTING.md` (B05) |
 | 8 | **Math-grounded architecture** — every subsystem carries a citation to a `sih-math` theorem (PROB-018 / ORD-022 / TOP-008 / ALG-001 / etc.) | `docs/MATH-skeleton-webui-v2-2026-09-20.md` (A02) |
 | 9 | **Single source of truth** — `scripts/check-docs-alignment.mjs` exits 0 in CI after the v2 reconcile | `scripts/check-docs-alignment.mjs` (B05) + §6 reconcile |
@@ -173,8 +177,11 @@ Test breakdown (selected):
 - 5 unit-edge suites from D01 — 130 tests (db resolver / rate limit / markdown / quota / events concurrency)
 - 4 integration suites from D02 — 38 tests (router-boot / sse-channel / event-chain / transports matrix / check-docs)
 
-CI: GitHub Actions on Node 22 / Node 24 × macOS / Linux / Windows.
-Full PR suite runs via `npm run check:ci && npm test && npm run sbom && npm audit`.
+CI: the marketplace repository's root GitHub Actions workflow (ubuntu,
+Node 22) runs `npm ci && npm run check`, which recursively executes this
+plugin's suite. There is no plugin-owned workflow — the gates that
+actually run are documented in `docs/CI.md`. Local full suite:
+`npm run check:ci && npm test && npm run sbom && npm audit`.
 
 ## Manual test evidence
 

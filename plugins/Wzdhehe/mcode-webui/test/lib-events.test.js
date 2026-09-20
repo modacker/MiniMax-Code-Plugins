@@ -10,8 +10,9 @@
 //   6. recover gracefully when the file is missing / corrupt / unreadable
 //   7. expose verify() that detects tampering
 //   8. expose tail() for the operator
-//   9. NOT throw on audit failures (per settings.js "audit-miss is the
-//      lesser evil" convention)
+//   9. THROW on audit write failures (fail-closed, 2026-09-20 rigor
+//      fix — an audited action must not complete with a missing audit
+//      line; routes translate the throw into HTTP 5xx + an alert)
 //
 // Test strategy:
 //   - Use a fresh tmp dir per test (MCODE_WEBUI_EVENTS_PATH override).
@@ -30,6 +31,7 @@ import {
   existsSync,
   readFileSync,
   writeFileSync,
+  chmodSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -219,13 +221,55 @@ describe("events — actor / target / cid defaults", () => {
   });
 });
 
-describe("events — error resilience", () => {
-  test("returns null instead of throwing when path is unwritable", () => {
-    // Point to a path under a non-existent dir + read-only parent
-    // (root on Linux, None on macOS). Simpler: point to /dev/null/full
-    // on macOS — that special file returns ENOSPC on write. But
-    // that's platform-specific. Instead, just verify append() does
-    // not throw on a normal file path even if we feed it junk data.
+describe("events — error resilience (fail-closed)", () => {
+  test("append THROWS when the events dir is unwritable (fail-closed)", () => {
+    // Point the events path inside a read-only directory. append()
+    // must throw (2026-09-20 rigor fix) — the caller aborts the gated
+    // action instead of completing it unaudited.
+    const roDir = mkdtempSync(join(tmpdir(), "webui-events-ro-"));
+    try {
+      chmodSync(roDir, 0o555); // r-x — no write for owner
+      const roPath = join(roDir, "events.ndjson");
+      // NOTE: running as root would bypass mode bits; on the supported
+      // dev/CI hosts (non-root) the write fails with EACCES.
+      const isRoot = process.getuid && process.getuid() === 0;
+      if (isRoot) {
+        assert.ok(true, "running as root — mode-bit probe skipped");
+        return;
+      }
+      process.env.MCODE_WEBUI_EVENTS_PATH = roPath;
+      events._resetForTests();
+      assert.throws(() => events.append("x", { data: {} }));
+      // And nothing landed on disk.
+      assert.equal(existsSync(roPath), false, "no file in read-only dir");
+    } finally {
+      try { chmodSync(roDir, 0o755); } catch {}
+      try { rmSync(roDir, { recursive: true, force: true }); } catch {}
+      // Restore the per-test override set by beforeEach.
+      process.env.MCODE_WEBUI_EVENTS_PATH = tmpEventsPath;
+      events._resetForTests();
+    }
+  });
+
+  test("append THROWS when the existing chain file is unreadable", () => {
+    // _writeAtomic must not "write the new line only" on a read
+    // failure — that truncates the chain (the fail-open condition the
+    // 2026-09-20 audit flagged). Simulate: make the FILE unreadable
+    // (mode 000) after a first successful write.
+    const r0 = events.append("first", { data: {} });
+    assert.ok(r0);
+    chmodSync(tmpEventsPath, 0o000);
+    try {
+      const isRoot = process.getuid && process.getuid() === 0;
+      if (!isRoot) {
+        assert.throws(() => events.append("second", { data: {} }));
+      }
+    } finally {
+      try { chmodSync(tmpEventsPath, 0o600); } catch {}
+    }
+  });
+
+  test("junk (non-object) data does not throw on a writable path", () => {
     const r = events.append("x", { data: undefined });
     assert.ok(r, "should not throw");
   });
@@ -356,5 +400,19 @@ describe("events — atomic write semantics", () => {
     events.append("x", { data: {} });
     const tmpFile = tmpEventsPath + ".tmp";
     assert.equal(existsSync(tmpFile), false, ".tmp should be cleaned up");
+  });
+});
+
+describe("events — _resetForTests deleteFile fix (2026-09-20)", () => {
+  test("_resetForTests({deleteFile:true}) actually deletes the file", () => {
+    // The old implementation called require("node:fs") inside an ESM
+    // module — a ReferenceError the inner catch swallowed, leaving
+    // opts.deleteFile silently ineffective. The fix imports unlinkSync
+    // at module top; this test pins the fixed behavior.
+    events.append("a", { data: {} });
+    assert.equal(existsSync(tmpEventsPath), true, "file exists before reset");
+    events._resetForTests({ deleteFile: true });
+    assert.equal(existsSync(tmpEventsPath), false,
+      "deleteFile:true must actually unlink the events file");
   });
 });

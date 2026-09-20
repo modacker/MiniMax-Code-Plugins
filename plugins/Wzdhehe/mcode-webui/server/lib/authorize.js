@@ -13,9 +13,16 @@
 //     actions).
 //
 //   • Audit trail (Lease B01 dependency): every approve / reject /
-//     timeout writes one NDJSON event via dynamic import of
-//     `server/lib/events.js`. events.js is best-effort — if B01 has
-//     not landed yet, authorize still functions in-process.
+//     timeout writes one NDJSON event via the static import of
+//     `server/lib/events.js` (fail-closed since the 2026-09-20 rigor
+//     fix). The DECISION-OUTCOME audit write (auth.approve/reject/
+//     timeout/cancelled) is loud-but-non-blocking: on write failure we
+//     pushAlert + console.error and still resolve the user's decision,
+//     because a click in the modal is irreversible — throwing away the
+//     user's explicit choice to spite a broken disk would turn one
+//     failure into two. The destructive action itself is separately
+//     guarded by the route-level write-ahead intent events (see
+//     routes/sessions.js etc.), which DO fail closed.
 //
 //   • Pure module: no fs / spawn / router side-effects on import. The
 //     `handleAuthDecision` HTTP handler is exported for the router
@@ -37,6 +44,8 @@
 
 import { randomUUID } from "node:crypto";
 import { pushAuthRequest, pushAuthDecision } from "./state-bus.js";
+import { pushAlert } from "./alerts.js";
+import { append as _eventsAppend } from "./events.js";
 
 // ---------- action whitelist ----------
 
@@ -71,43 +80,72 @@ const _pending = new Map();
 
 // ---------- audit (B01 events.js) ----------
 
-let _eventsMod = null;
-let _eventsModTried = false;
-async function _tryWriteEvent(evt) {
-  if (_eventsModTried && !_eventsMod) return; // already known missing
-  if (!_eventsMod) {
-    _eventsModTried = true;
-    try {
-      const url = new URL("./events.js", import.meta.url);
-      _eventsMod = await import(url.href);
-    } catch {
-      _eventsMod = null;
-      return;
-    }
-  }
-  if (!_eventsMod || typeof _eventsMod.append !== "function") return;
+// _tryWriteEvent — synchronous, loud-but-non-blocking audit write.
+// events.js#append is fail-closed (throws) since the 2026-09-20 rigor
+// fix; authorize deliberately does NOT propagate that throw:
+//   - For decision-OUTCOME events (auth.approve / auth.reject /
+//     auth.timeout / auth.cancelled) the user's click already
+//     happened and is irreversible. Swallowing the DECISION would
+//     deadlock the modal on a broken audit disk AND lose the user's
+//     explicit choice; the destructive mutation downstream is guarded
+//     by the route-level write-ahead intent events, which do fail
+//     closed. So: record the miss on the anomaly channel (pushAlert)
+//     + stderr, then continue.
+//   - For auth.pending / auth.bypass the same loud-continue applies:
+//     these are observability lines, not the enforcement line.
+function _tryWriteEvent(evt) {
   try {
-    _eventsMod.append(evt);
-  } catch {
-    // audit failure must not break authorize flow
+    // Normalize to the events.js#append(kind, fields) signature. The
+    // old dynamic-import caller passed the whole object as `kind`,
+    // which events.js stringified into `"[object Object]"` — four such
+    // corrupted lines exist in real audit chains (2026-09-20 audit).
+    // `data` → `payload` because append() only accepts the payload via
+    // the explicit `payload` key when meta keys (target/cid/actor) are
+    // present.
+    _eventsAppend(evt.kind, {
+      target: evt.target || "",
+      cid: evt.cid || "",
+      actor: evt.actor || "system",
+      payload: evt.data && typeof evt.data === "object" ? evt.data : {},
+    });
+  } catch (e) {
+    try {
+      pushAlert({
+        level: "error",
+        msg: `auth audit write failed (kind=${evt && evt.kind}): ${e.message}`,
+        src: "authorize",
+      });
+    } catch {}
+    console.error(
+      `[webui] authorize audit write failed (kind=${evt && evt.kind}): ${e.message}`,
+    );
   }
 }
 
 // ---------- core API ----------
 
-// authorize(action, ctx, opts) → Promise<{approved, decidedBy, decidedAt}>
-//   action: one of AUTHORIZE_ACTIONS (throws on invalid)
-//   ctx:    { cid: string, [any extra context] } — cid is optional;
-//           empty cid = broadcast to all SSE clients
-//   opts:   { timeoutMs?: number, metadata?: object, bypass?: boolean }
-//           bypass=true skips the user gate (only for trusted internal
-//           callers — e.g. LAN token rotation triggered by C08 modal
-//           that already presented its own confirmation UI).
-//
-// Returns:
-//   { approved: true,  decidedBy: 'user',   decidedAt: ms }
-//   { approved: false, decidedBy: 'user',   decidedAt: ms }   (user declined)
-//   { approved: false, decidedBy: 'timeout',decidedAt: ms }   (default fail-closed)
+  // authorize(action, ctx, opts) → Promise<{approved, decidedBy, decidedAt}>
+  //   action: one of AUTHORIZE_ACTIONS (throws on invalid)
+  //   ctx:    { cid: string, [any extra context] } — cid is optional;
+  //           empty cid = broadcast to all SSE clients
+  //   opts:   { timeoutMs?: number, metadata?: object, bypass?: boolean }
+  //           bypass=true skips the user gate (only for trusted internal
+  //           callers — e.g. LAN token rotation triggered by C08 modal
+  //           that already presented its own confirmation UI).
+  //
+  // NOTE (2026-09-20 rigor fix): there is deliberately NO test-mode
+  //   auto-approve. The old branch inspected Node's runtime flag vector
+  //   for --test / --experimental-test-module-mocks and approved every
+  //   gated action without a user decision — which meant no test ever
+  //   exercised the real decision path, and any future flag confusion
+  //   in the production flag vector would silently disable the gate.
+  //   Tests now drive the REAL path via test/_setup.js#withDecisions
+  //   (in process) or SSE + POST /api/auth/decision (integration).
+  //
+  // Returns:
+  //   { approved: true,  decidedBy: 'user',   decidedAt: ms }
+  //   { approved: false, decidedBy: 'user',   decidedAt: ms }   (user declined)
+  //   { approved: false, decidedBy: 'timeout',decidedAt: ms }   (default fail-closed)
 export function authorize(action, ctx = {}, opts = {}) {
   if (!_isValidAction(action)) {
     return Promise.resolve({
@@ -130,37 +168,6 @@ export function authorize(action, ctx = {}, opts = {}) {
       decidedBy: "bypass",
       decidedAt: Date.now(),
     });
-  }
-  // Test-mode auto-approve: under `node --test` (detected by the
-  // --experimental-test-module-mocks / --test flag in execArgv, which
-  // node:test injects) we auto-approve synchronously UNLESS the caller
-  // explicitly opts out via opts.testMode === false (lib-authorize's
-  // own tests pass that flag to exercise the real flow).
-  //
-  // Why this exists: handleDeleteSession / handleCleanupOrphans /
-  // handlePostSettings / runStartupCleanup / slash handlers now await
-  // authorize(). The pre-B03 test suite (sessions.test.js, etc.) calls
-  // those handlers directly with no SSE setup, so a real authorize()
-  // would hang on the 5-min user decision forever. Auto-approving in
-  // test mode keeps the existing assertions valid while preserving
-  // the production semantics (the gate is live in prod, where
-  // execArgv does not include --test).
-  //
-  // Tests that exercise the gate explicitly (lib-authorize.test.js)
-  // pass opts.testMode === false to force the real flow.
-  if (opts.testMode !== false) {
-    const isUnderNodeTest =
-      Array.isArray(process.execArgv) &&
-      process.execArgv.some((a) => typeof a === "string" &&
-        (a === "--test" || a.startsWith("--test=") ||
-         a === "--experimental-test-module-mocks"));
-    if (isUnderNodeTest) {
-      return Promise.resolve({
-        approved: true,
-        decidedBy: "auto-test",
-        decidedAt: Date.now(),
-      });
-    }
   }
   const cid = (ctx && typeof ctx.cid === "string") ? ctx.cid : "";
   const requestId = randomUUID();
@@ -303,8 +310,6 @@ export function _resetForTests() {
     } catch {}
   }
   _pending.clear();
-  _eventsMod = null;
-  _eventsModTried = false;
 }
 
 // Resolve a pending request without going through HTTP. Used by tests

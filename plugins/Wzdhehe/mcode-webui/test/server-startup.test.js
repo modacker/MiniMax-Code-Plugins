@@ -54,6 +54,14 @@ async function _spawnFirstRun({ tokenStdout, port } = {}) {
     ...process.env,
     TOKEN: "",
     MCODE_WEBUI_SETTINGS_PATH: settingsPath,
+    // U1 (2026-09-20 rigor fix): the first-run sub-tests booted the real
+    // server.js without redirecting the upload dir / events path — same
+    // stray-.webui-uploads pollution the bootstrap sub-test above already
+    // redirects. All three land in the per-test tmpDir, which is rmSync'd
+    // at the end of this helper.
+    MCODE_WEBUI_UPLOAD_DIR: join(tmpDir, "uploads"),
+    MCODE_WEBUI_EVENTS_PATH: join(tmpDir, "events.ndjson"),
+    MCODE_WEBUI_SESSIONS_DB: join(tmpDir, "sessions.json"),
     PORT: String(usePort),
   };
   if (tokenStdout !== undefined) env.MCODE_WEBUI_TOKEN_STDOUT = tokenStdout;

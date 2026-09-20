@@ -18,8 +18,34 @@ import { getMcodeModelLimit } from "../lib/models.js";
 import { pushStateFor, clients } from "../lib/state-bus.js";
 import { MCODE_RUNTIME_DB } from "../lib/config.js";
 import { authorize } from "../lib/authorize.js";
+import { pushAlert } from "../lib/alerts.js";
 // B01: append session lifecycle events to the hash chain.
 import { append as _eventsAppend } from "../lib/events.js";
+
+// _auditFail — shared failure sink for audit writes (fail-closed,
+// 2026-09-20 rigor fix). events.js#append THROWS on write failure; a
+// governance action must not complete with a missing audit trail, so
+// every route-level append is wrapped and lands here: HTTP 5xx + one
+// alert on the anomaly channel. `what` names the flow for the operator.
+function _auditFail(res, e, what) {
+  try {
+    pushAlert({
+      level: "error",
+      msg: `audit write failed (${what}): ${e && e.message ? e.message : String(e)}`,
+      src: "sessions",
+    });
+  } catch {}
+  console.error(`[webui] audit write failed (${what}):`, e);
+  if (res && !res.headersSent) {
+    res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({
+      ok: false,
+      error: "audit write failed",
+      detail: what,
+    }));
+  }
+  return undefined;
+}
 
 // v1.0: 防"删了又出现" — webui 常驻的 mcode acp 子进程内存里还持有该 session,
 //   且会把注册表回写 db (删除后 local_runtime_sessions 行被重建 + session/list 仍返回)。
@@ -93,15 +119,22 @@ export async function handleNewSession(req, res, ctx) {
   // We log the webui session id + title + workspace — these are not
   // sensitive (the id is a randomUUID, title is user-visible). mcode
   // session id is null at create time so it's omitted from data.
-  _eventsAppend("session.create", {
-    target: id,
-    cid,
-    actor: "user",
-    payload: {
-      title: item.title,
-      workspace: sessionWs,
-    },
-  });
+  // Fail-closed: if the audit write fails we 5xx instead of claiming
+  // success with an unaudited mutation (no rollback — the JSON store
+  // write already happened; the alert carries the mismatch).
+  try {
+    _eventsAppend("session.create", {
+      target: id,
+      cid,
+      actor: "user",
+      payload: {
+        title: item.title,
+        workspace: sessionWs,
+      },
+    });
+  } catch (e) {
+    return _auditFail(res, e, "session.create");
+  }
   pushStateFor(cid);
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
   return res.end(JSON.stringify({ ok: true, session: item }));
@@ -196,18 +229,22 @@ export async function handleSwitchSession(req, res, ctx) {
   // which prior session. matchKind tells us whether we matched by
   // mcodeSessionId or webuiId (useful when debugging "why did this
   // resolve to session X"). prevSid is the prior session id (or "" if
-  // this was the first switch).
-  _eventsAppend("session.switch", {
-    target: cs.sessionId,
-    cid,
-    actor: "user",
-    payload: {
-      from: prevSid || "",
-      matchKind: matchKind || "new_from_mcode",
-      mcodeSessionId: cs.mcodeSessionId || "",
-      title: cs.sessionTitle,
-    },
-  });
+  // this was the first switch). Fail-closed → 5xx + alert.
+  try {
+    _eventsAppend("session.switch", {
+      target: cs.sessionId,
+      cid,
+      actor: "user",
+      payload: {
+        from: prevSid || "",
+        matchKind: matchKind || "new_from_mcode",
+        mcodeSessionId: cs.mcodeSessionId || "",
+        title: cs.sessionTitle,
+      },
+    });
+  } catch (e) {
+    return _auditFail(res, e, "session.switch");
+  }
   pushStateFor(cid);
   console.log(
     `[switch] cid=${cid} OK prev.sessionId=${prevSid ? prevSid.substring(0, 8) : "null"}… → new.sessionId=${cs.sessionId.substring(0, 8)}… title="${cs.sessionTitle}" chatLen=${cs.chat.length}`,
@@ -282,6 +319,27 @@ export async function handleDeleteSession(req, res, ctx) {
         decidedAt: authResult.decidedAt,
       }));
     }
+    // Write-ahead audit (2026-09-20 rigor fix): the destructive intent
+    // MUST be durably recorded BEFORE any persistent mutation (db rows,
+    // sessions store, subprocess kill). If this append fails we abort
+    // the delete entirely — an unaudited destructive action is the one
+    // failure mode this gate exists to prevent. The matching outcome
+    // event (kind "session.delete") is written after the mutation.
+    try {
+      _eventsAppend("session.delete.intent", {
+        target: id,
+        cid,
+        actor: "user",
+        payload: {
+          matchKind: matchKind || "unknown",
+          isOrphan: idx < 0,
+          chatLen: idx >= 0 && all[idx] && Array.isArray(all[idx].chat) ? all[idx].chat.length : 0,
+          decidedBy: authResult.decidedBy,
+        },
+      });
+    } catch (e) {
+      return _auditFail(res, e, "session.delete.intent");
+    }
   }
   // v0.5.bx-19: 兜底 — webui session db 找不到, 但 id 是 mvs_xxx → 当孤儿 mcode session 直接 SQL 删
   if (idx < 0) {
@@ -303,17 +361,24 @@ export async function handleDeleteSession(req, res, ctx) {
           resetContext(cs);
           pushStateFor(cid);
         }
-        // B01: orphan mcode session deletion (no webui session row)
-        _eventsAppend("session.delete", {
-          target: id,
-          cid,
-          actor: "user",
-          payload: {
-            matchKind: "orphan_mcode",
-            dryRun,
-            rowsAffected: (mcodeDbDel.log || []).length,
-          },
-        });
+        // B01: orphan mcode session deletion (no webui session row).
+        // Outcome event; the intent line was written before the gate
+        // fan-out above. Failure → 5xx + alert (rows are already gone;
+        // the operator must see the audit gap, not a silent success).
+        try {
+          _eventsAppend("session.delete", {
+            target: id,
+            cid,
+            actor: "user",
+            payload: {
+              matchKind: "orphan_mcode",
+              dryRun,
+              rowsAffected: (mcodeDbDel.log || []).length,
+            },
+          });
+        } catch (e) {
+          return _auditFail(res, e, "session.delete(orphan_mcode)");
+        }
         res.writeHead(200, {
           "Content-Type": "application/json; charset=utf-8",
         });
@@ -353,16 +418,22 @@ export async function handleDeleteSession(req, res, ctx) {
     // is previewing a delete, so record the preview but never the
     // actual session content. dryRun:true marker lets verify / audit
     // distinguish "actually deleted" from "previewed delete".
-    _eventsAppend("session.delete", {
-      target: id,
-      cid,
-      actor: "user",
-      payload: {
-        matchKind,
-        dryRun: true,
-        previewedRows: mcodeDbDel.totalRows || 0,
-      },
-    });
+    // Fail-closed → 5xx + alert (preview didn't mutate, but an
+    // unaudited preview still misleads the operator's audit view).
+    try {
+      _eventsAppend("session.delete", {
+        target: id,
+        cid,
+        actor: "user",
+        payload: {
+          matchKind,
+          dryRun: true,
+          previewedRows: mcodeDbDel.totalRows || 0,
+        },
+      });
+    } catch (e) {
+      return _auditFail(res, e, "session.delete(dryRun)");
+    }
     res.writeHead(200, {
       "Content-Type": "application/json; charset=utf-8",
     });
@@ -423,19 +494,26 @@ export async function handleDeleteSession(req, res, ctx) {
   // their active session cleared (this is the "fan-out" effect that
   // surprised users historically), and the mcode db deltas. Title
   // is logged (not sensitive — it was user-visible in the sidebar).
-  _eventsAppend("session.delete", {
-    target: id,
-    cid,
-    actor: "user",
-    payload: {
-      matchKind,
-      dryRun: false,
-      remaining: all.length,
-      touchedCids: touchedCids.length,
-      mcodeRowsAffected: mcodeDbDel && mcodeDbDel.log ? mcodeDbDel.log.length : 0,
-      title: deletedItem.title,
-    },
-  });
+  // Outcome event; failure → 5xx + alert. The deletion itself already
+  // happened — we do NOT paper over it with a 200, the operator must
+  // see both the response failure and the alert.
+  try {
+    _eventsAppend("session.delete", {
+      target: id,
+      cid,
+      actor: "user",
+      payload: {
+        matchKind,
+        dryRun: false,
+        remaining: all.length,
+        touchedCids: touchedCids.length,
+        mcodeRowsAffected: mcodeDbDel && mcodeDbDel.log ? mcodeDbDel.log.length : 0,
+        title: deletedItem.title,
+      },
+    });
+  } catch (e) {
+    return _auditFail(res, e, "session.delete");
+  }
   console.log(
     `[delete] cid=${cid} OK match=${matchKind} deleted.webuiId=${deletedItem.id.substring(0, 8)}… remaining=${all.length}`,
   );
@@ -517,7 +595,8 @@ export async function handleAcpSessionTitle(req, res, _ctx) {
 //   is appended to AUTHORIZE_ACTIONS in server/lib/authorize.js so
 //   the whitelist check accepts it. In production this pops the same
 //   needs_authorization SSE modal as session.delete / session.export;
-//   under `node --test` it auto-approves (see authorize.js:136-149).
+//   tests drive the decision via test/_setup.js#withDecisions (the
+//   execArgv auto-approve was removed in the 2026-09-20 rigor fix).
 //
 //   Audit (B01): the search itself is non-destructive so we do NOT
 //   append a session.search event by default. The authorize call
@@ -534,7 +613,8 @@ export async function handleSearchSessions(req, res, ctx) {
   if (limit > 100) limit = 100;
   // B03 gate: cross-workspace reads surface titles from workspaces
   //   the user is not currently in. Gate the same way session.delete
-  //   / session.export are gated. Test-mode auto-approves.
+  //   / session.export are gated. Tests drive the real decision path
+  //   via test/_setup.js#withDecisions.
   const authResult = await authorize("session.search", {
     cid,
     q,
@@ -715,6 +795,25 @@ export async function handleCleanupOrphans(req, res, ctx) {
       decidedAt: authResult.decidedAt,
     }));
   }
+  // Write-ahead audit: record the sweep intent BEFORE any per-session
+  // delete runs (each delegated delete writes its own
+  // session.delete.intent / session.delete pair). Failure aborts the
+  // whole sweep — orphan deletion is destructive and must not proceed
+  // unaudited.
+  try {
+    _eventsAppend("sessions.cleanup-orphans.intent", {
+      target: "sessions.cleanup-orphans",
+      cid,
+      actor: "user",
+      payload: {
+        orphanCount: targetIds.length,
+        orphanIds: targetIds.slice(0, 32),
+        decidedBy: authResult.decidedBy,
+      },
+    });
+  } catch (e) {
+    return _auditFail(res, e, "sessions.cleanup-orphans.intent");
+  }
   // Approved: delegate each delete to handleDeleteSession so the
   //   existing fan-out / mcode db cleanup / cross-tab reset logic
   //   stays in one place. We synthesize a minimal `req` with the
@@ -746,6 +845,23 @@ export async function handleCleanupOrphans(req, res, ctx) {
   console.log(
     `[cleanup-orphans] cid=${cid} OK deleted=${deleted.length} failed=${failed.length}`,
   );
+  // Outcome event for the sweep as a whole. Failure → 5xx + alert:
+  // some or all deletes already ran, so the operator must see the
+  // audit gap rather than a silent 200.
+  try {
+    _eventsAppend("sessions.cleanup-orphans.done", {
+      target: "sessions.cleanup-orphans",
+      cid,
+      actor: "user",
+      payload: {
+        deleted: deleted.length,
+        failed: failed.length,
+        decidedBy: authResult.decidedBy,
+      },
+    });
+  } catch (e) {
+    return _auditFail(res, e, "sessions.cleanup-orphans.done");
+  }
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
   return res.end(JSON.stringify({
     ok: true,

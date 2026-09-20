@@ -8,9 +8,17 @@
 //   2. alerts push → events.ndjson has kind:"alert.{level}" (B02)
 //   3. Tamper detection: corrupt line N → verify() returns
 //      { ok:false, error:"hash_mismatch", line:N }
-//   4. B01 + B02 + B03 三方整合: authorize() under test mode auto-
-//      approves → settings mutation writes events.ndjson + no alert
-//      fires for benign writes (alerts are for system signals).
+//   4. B01 + B02 + B03 三方整合: authorize() gated token.reset driven
+//      through the REAL wire path (SSE needs_authorization frame +
+//      POST /api/auth/decision) → settings mutation writes
+//      events.ndjson + no alert fires for benign writes.
+//   5. Gate-blocking (2026-09-20 rigor fix): user decline → 403 +
+//      nothing deleted; short-timeout → fail-closed reject; user
+//      approve → deletion lands AND events.verify() still ok.
+//
+// The child server is spawned WITHOUT --experimental-test-module-mocks:
+// the authorize() test-mode auto-approve was removed in the rigor fix,
+// and integration tests must drive the real decision wire path.
 
 import { test, describe } from "node:test";
 import { strict as assert } from "node:assert";
@@ -18,12 +26,15 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import http from "node:http";
 import { createHash } from "node:crypto";
+import { decideNextAuthorization } from "../_setup.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const serverJsPath = join(__dirname, "..", "..", "server.js");
+const SERVER_DIR = join(__dirname, "..", "..", "server");
+const absPath = (rel) => pathToFileURL(join(SERVER_DIR, rel)).href;
 
 function pickPort() {
     return 19700 + Math.floor(Math.random() * 80);
@@ -40,13 +51,19 @@ async function spawnServer(opts = {}) {
         HOST: "127.0.0.1",
         MCODE_WEBUI_SETTINGS_PATH: settingsPath,
         MCODE_WEBUI_EVENTS_PATH: eventsPath,
+        // U1 (2026-09-20 rigor fix): redirect upload dir + sessions db
+        // away from MCODE_ROOT — see router-boot.test.js (stray
+        // .webui-uploads/ breaks marketplace validate.mjs). tmpDir is
+        // per-test mkdtemp'd and rmSync'd in stopServer below.
+        MCODE_WEBUI_UPLOAD_DIR: join(tmpDir, "uploads"),
+        MCODE_WEBUI_SESSIONS_DB: join(tmpDir, "sessions.json"),
         TOKEN: "",
         MCODE_WEBUI_TOKEN_STDOUT: "0",
     };
-    // Spawn with --experimental-test-module-mocks so authorize() auto-
-    // approves under server/lib/authorize.js (lines 151-163). Required
-    // for the B03 integration test (token.reset posts a gated mutation).
-    const proc = spawn("node", ["--experimental-test-module-mocks", serverJsPath], {
+    // Plain node: no mock flag. The authorize() gate is fully live in
+    // the child; gated requests are decided through the production
+    // wire path (SSE + POST /api/auth/decision).
+    const proc = spawn("node", [serverJsPath], {
         stdio: ["ignore", "pipe", "pipe"],
         cwd: join(__dirname, "..", ".."),
         env,
@@ -281,17 +298,26 @@ describe("event-chain: alerts integration shape", () => {
             "alerts.js should call append(`alert.${level}`, ...)");
     });
 
-    test("authorize.js imports events.js (B03 + B01 integration)", async () => {
+    test("authorize.js imports events.js statically (B03 + B01 integration)", async () => {
         const { readFileSync: rfs } = await import("node:fs");
         const src = rfs(join(__dirname, "..", "..", "server", "lib", "authorize.js"), "utf8");
+        // 2026-09-20 rigor fix: static import (the dynamic-import dance
+        // hid write failures and corrupted the kind field).
         assert.match(src, /\.\/events\.js/,
             "authorize.js should reference ./events.js");
-        assert.match(src, /\bimport\(/,
-            "authorize.js should use dynamic import()");
+        assert.match(
+            src, /import\s*\{[^}]*append[^}]*\}\s*from\s*["']\.\/events\.js["']/,
+            "authorize.js should statically import append from ./events.js",
+        );
         // authorize writes auth.pending / auth.approve / auth.reject /
         // auth.timeout / auth.bypass — these are the B03 audit kinds.
         assert.match(src, /auth\.(pending|approve|reject|timeout|bypass)/,
             "authorize.js should emit auth.* audit events");
+        // Decision-outcome audit failures must be loud: pushAlert +
+        // console.error (the user's click is irreversible, so the
+        // decision still resolves — see the rationale in the source).
+        assert.match(src, /pushAlert/,
+            "authorize.js should push an alert when an audit write fails");
     });
 });
 
@@ -380,17 +406,18 @@ describe("event-chain: tamper detection via verify()", () => {
 // -----------------------------------------------------------------------
 // Test 4: B01 + B02 + B03 三方整合 (settings mutation with authorize gate).
 //
-// authorize.js under `node --test` auto-approves (authorize.js lines
-// 151-163), so a POST /api/settings resetToken=true:
-//   - passes B03 authorize() with decidedBy:"auto-test"
-//   - settings.js#rotateToken() updates the token
-//   - events.js#append() writes one event with kind:"settings.write"
+// The child server runs the REAL gate (no auto-approve). A POST
+// /api/settings resetToken=true:
+//   - authorize() pends and pushes needs_authorization over SSE
+//   - the test captures the frame, POSTs /api/auth/decision (approve)
+//   - the gate resolves approved → settings.js#rotateToken() runs
+//   - events.js#append() writes auth.* + token.reset.* + settings.* lines
 //   - state-bus.js#broadcastTokenRotated() pushes auth.token_rotated
 //     to all SSE clients
 //   - NO alert fires (benign state change — alerts are for system
 //     signals only)
 //
-// We assert that the chain gains a settings.write event AND the SSE
+// We assert that the chain gains settings.* events AND the SSE
 // channel receives auth.token_rotated.
 // -----------------------------------------------------------------------
 describe("event-chain: B01 + B02 + B03 integration via token reset", () => {
@@ -420,7 +447,7 @@ describe("event-chain: B01 + B02 + B03 integration via token reset", () => {
                     const timer = setTimeout(() => {
                         try { req.destroy(); } catch {}
                         resolve({ status: res.statusCode, body });
-                    }, 1500);
+                    }, 2500);
                     res.on("end", () => {
                         clearTimeout(timer);
                         resolve({ status: res.statusCode, body });
@@ -436,19 +463,36 @@ describe("event-chain: B01 + B02 + B03 integration via token reset", () => {
         });
         // Let the SSE connect.
         await new Promise((r) => setTimeout(r, 200));
-        const post = await postJson({
+        // Start the decider FIRST and let its SSE subscription register
+        // (broadcasts are not replayed to late subscribers), THEN fire
+        // the gated POST, then drive the decision through the
+        // production wire path.
+        const decisionPromise = decideNextAuthorization({
+            port: server.port,
+            approve: true,
+            cid: "cid-decider",
+        });
+        await new Promise((r) => setTimeout(r, 150));
+        const postPromise = postJson({
             port: server.port,
             path: "/api/settings",
             body: { resetToken: true },
         });
+        const { decision } = await decisionPromise;
+        assert.ok(decision, "decision POST must have answered");
+        const post = await postPromise;
         assert.equal(post.status, 200, `resetToken: ${post.status}. body: ${post.body}`);
         assert.equal(post.json && post.json.tokenRotated, true);
-        // events.ndjson should have one settings.* line.
+        // events.ndjson should have settings.* lines (write-ahead intent
+        // + outcome) plus the flow-level token.reset.* lines.
         await new Promise((r) => setTimeout(r, 50));
         const events = readEvents(server.eventsPath);
         assert.ok(events.length >= 1, "at least one event written");
         const settingsEvents = events.filter((e) => /^settings\./.test(e.kind || ""));
         assert.ok(settingsEvents.length >= 1, "at least one settings.* event");
+        const tokenResetEvents = events.filter((e) => /^token\.reset\./.test(e.kind || ""));
+        assert.ok(tokenResetEvents.length >= 2,
+            "token.reset.intent + token.reset.done both recorded");
         // The auth.token_rotated SSE frame must be on the wire.
         const res = await ssePromise;
         assert.match(
@@ -456,5 +500,179 @@ describe("event-chain: B01 + B02 + B03 integration via token reset", () => {
             /event: auth\.token_rotated/,
             `SSE body should contain auth.token_rotated frame. body: ${res.body.slice(0, 500)}`,
         );
+    });
+});
+
+// -----------------------------------------------------------------------
+// Test 5 (2026-09-20 rigor fix): gate-blocking integration.
+//   (a) user declines session.delete → 403, session NOT deleted
+//   (b) short timeoutMs on the real authorize() → fail-closed reject,
+//       auth.timeout event recorded, chain still verifies
+//   (c) user approves session.delete → 200, session deleted, intent +
+//       outcome events recorded, events.verify() reports ok on the
+//       whole chain
+// -----------------------------------------------------------------------
+describe("event-chain: gate-blocking (decline / timeout / approve)", () => {
+    let server;
+    test.beforeEach(async () => {
+        server = await spawnServer();
+    });
+    test.afterEach(async () => {
+        if (server) await stopServer(server.proc, server.tmpDir);
+        server = null;
+    });
+
+    // Small raw-JSON request helper (POST/DELETE/GET).
+    function requestJson({ method = "GET", port, path, body }) {
+        return new Promise((resolve, reject) => {
+            const data = body === undefined ? null : JSON.stringify(body);
+            const headers = {};
+            if (data !== null) {
+                headers["Content-Type"] = "application/json";
+                headers["Content-Length"] = Buffer.byteLength(data);
+            }
+            const req = http.request(
+                { method, host: "127.0.0.1", port, path, headers },
+                (res) => {
+                    const chunks = [];
+                    res.on("data", (c) => chunks.push(c));
+                    res.on("end", () => {
+                        const raw = Buffer.concat(chunks).toString("utf8");
+                        let json;
+                        try { json = JSON.parse(raw); } catch {}
+                        resolve({ status: res.statusCode, body: raw, json });
+                    });
+                    res.on("error", reject);
+                },
+            );
+            req.on("error", reject);
+            if (data !== null) req.write(data);
+            req.end();
+        });
+    }
+
+    async function listSessionIds(port) {
+        const res = await requestJson({ port, path: "/api/sessions" });
+        assert.equal(res.status, 200);
+        return (res.json && res.json.sessions || []).map((s) => s.id);
+    }
+
+    async function createSession(port) {
+        const res = await requestJson({
+            method: "POST",
+            port,
+            path: "/api/sessions",
+            body: {},
+        });
+        assert.equal(res.status, 200, `session create failed: ${res.body}`);
+        assert.ok(res.json && res.json.session && res.json.session.id);
+        return res.json.session.id;
+    }
+
+    // Fire a gated DELETE and drive the decision through the real wire
+    // path. Subscribes the decider SSE first, then fires the request.
+    async function deleteWithDecision(port, id, approve) {
+        const decisionPromise = decideNextAuthorization({ port, approve, cid: "cid-decider" });
+        // Give the decider's SSE connection a moment to register before
+        // the gate broadcast fires (broadcasts are not replayed).
+        await new Promise((r) => setTimeout(r, 150));
+        const reqPromise = requestJson({ method: "DELETE", port, path: `/api/sessions/${id}` });
+        const { decision } = await decisionPromise;
+        const res = await reqPromise;
+        return { res, decision };
+    }
+
+    test("(a) user declines session.delete → 403 + session survives", async () => {
+        const id = await createSession(server.port);
+        assert.ok((await listSessionIds(server.port)).includes(id),
+            "precondition: created session is listed");
+        const { res, decision } = await deleteWithDecision(server.port, id, false);
+        assert.ok(decision, "decision endpoint answered");
+        assert.equal(res.status, 403, `declined delete must 403, got ${res.status}: ${res.body}`);
+        assert.equal(res.json && res.json.ok, false);
+        assert.match(res.json && res.json.error || "", /authorize declined/);
+        assert.equal(res.json.decidedBy, "user");
+        // NOT deleted.
+        const ids = await listSessionIds(server.port);
+        assert.ok(ids.includes(id), "declined delete must leave the session on disk");
+        // Audit: intent event for the delete must NOT exist (only the
+        // auth.pending / auth.reject lines from authorize itself).
+        await new Promise((r) => setTimeout(r, 50));
+        const events = readEvents(server.eventsPath);
+        const intents = events.filter((e) => e.kind === "session.delete.intent");
+        assert.equal(intents.length, 0,
+            "declined delete must not write a session.delete.intent line");
+        const rejects = events.filter((e) => e.kind === "auth.reject");
+        assert.ok(rejects.length >= 1, "auth.reject outcome recorded");
+        const v = verifyChain(server.eventsPath);
+        assert.equal(v.ok, true, `chain must still verify: ${JSON.stringify(v)}`);
+    });
+
+    test("(b) short timeoutMs on the real authorize() → fail-closed reject", async () => {
+        // In-process, real module (no mocks): the gate must resolve
+        // approved:false on timeout and record auth.timeout on the
+        // isolated chain. Route-level behavior of a timeout is the same
+        // 403 branch covered in (a) (approved:false → declined).
+        const eventsPath = join(server.tmpDir, "timeout-events.ndjson");
+        process.env.MCODE_WEBUI_EVENTS_PATH = eventsPath;
+        try {
+            const auth = await import(absPath("lib/authorize.js"));
+            auth._resetForTests();
+            const result = await auth.authorize(
+                "session.delete",
+                { cid: "cid-timeout" },
+                { timeoutMs: 50 },
+            );
+            assert.equal(result.approved, false, "timeout must fail closed");
+            assert.equal(result.decidedBy, "timeout");
+            // The timeout outcome is audited on the chain.
+            await new Promise((r) => setTimeout(r, 30));
+            const events = readEvents(eventsPath);
+            const timeouts = events.filter((e) => e.kind === "auth.timeout");
+            assert.ok(timeouts.length >= 1, "auth.timeout event recorded");
+            const pendings = events.filter((e) => e.kind === "auth.pending");
+            assert.ok(pendings.length >= 1, "auth.pending event recorded");
+            assert.equal(pendings[0].target, "session.delete");
+            // The real verify() from production code must accept the chain.
+            const eventsMod = await import(absPath("lib/events.js"));
+            const v = eventsMod.verify({ path: eventsPath });
+            assert.equal(v.ok, true, `verify() failed: ${JSON.stringify(v)}`);
+            assert.ok(v.count >= 2, `expected >=2 events, got ${v.count}`);
+        } finally {
+            // Restore the shared env + drop any in-process pending
+            // requests so later tests are unaffected.
+            delete process.env.MCODE_WEBUI_EVENTS_PATH;
+            try {
+                const auth = await import(absPath("lib/authorize.js"));
+                auth._resetForTests();
+            } catch {}
+        }
+    });
+
+    test("(c) user approves session.delete → deletion + chain verify ok", async () => {
+        const id = await createSession(server.port);
+        const { res, decision } = await deleteWithDecision(server.port, id, true);
+        assert.ok(decision, "decision endpoint answered");
+        assert.equal(res.status, 200, `approved delete must 200, got ${res.status}: ${res.body}`);
+        assert.equal(res.json && res.json.ok, true);
+        assert.equal(res.json.deleted, id);
+        // Deleted for real.
+        const ids = await listSessionIds(server.port);
+        assert.ok(!ids.includes(id), "approved delete must remove the session");
+        // Audit: write-ahead intent + outcome both recorded, in order.
+        await new Promise((r) => setTimeout(r, 50));
+        const events = readEvents(server.eventsPath);
+        const kinds = events.map((e) => e.kind);
+        const intentIdx = kinds.indexOf("session.delete.intent");
+        const outcomeIdx = kinds.indexOf("session.delete");
+        assert.ok(intentIdx >= 0, "session.delete.intent recorded");
+        assert.ok(outcomeIdx > intentIdx, "outcome recorded after intent");
+        const approvals = events.filter((e) => e.kind === "auth.approve");
+        assert.ok(approvals.length >= 1, "auth.approve outcome recorded");
+        // The production verify() must accept the whole chain.
+        const eventsMod = await import(absPath("lib/events.js"));
+        const v = eventsMod.verify({ path: server.eventsPath });
+        assert.equal(v.ok, true, `verify() failed: ${JSON.stringify(v)}`);
+        assert.ok(v.count >= 4, `expected >=4 events (pending/approve/intent/outcome), got ${v.count}`);
     });
 });

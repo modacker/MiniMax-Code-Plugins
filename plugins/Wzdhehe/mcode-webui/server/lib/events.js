@@ -37,6 +37,7 @@ import {
   closeSync,
   mkdirSync,
   statSync,
+  unlinkSync,
 } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
@@ -228,19 +229,23 @@ function _writeAtomic(line) {
   _ensureDir();
   const path = _eventsPath();
   const newLine = line.endsWith("\n") ? line : line + "\n";
-  // Read existing content (if any) to preserve the chain.
+  // Read existing content (if any) to preserve the chain. A read
+  // failure (perms, racing unlink) is FATAL for the append — we must
+  // NOT fall through and write "new line only": that silently
+  // truncates the audit chain, and a truncated chain that keeps
+  // accepting writes is exactly the fail-open condition the 2026-09-20
+  // audit flagged. Fail-closed: propagate so the caller aborts the
+  // gated action (routes translate this to HTTP 5xx + an alert).
   let existing = "";
   try {
     if (existsSync(path)) {
       existing = readFileSync(path, "utf8");
     }
   } catch (e) {
-    // Read failure (perms, racing unlink) — fall through and write
-    // just the new line. The next verify() will detect the truncation
-    // (count mismatch against high-water mark).
-    console.warn(
-      `[webui] events read ${path} for atomic append failed: ${e.message} — proceeding with new line only (potential truncation, verify() will detect)`,
+    console.error(
+      `[webui] events read ${path} for atomic append failed: ${e.message} — aborting append (fail-closed, no truncation)`,
     );
+    throw e;
   }
   const content = existing + newLine;
   // Write the combined content to .tmp, then rename atomically.
@@ -288,48 +293,50 @@ function _writeAtomic(line) {
 // strict shape prevents caller typo bugs (e.g. `taret:` instead of
 // `target:`) from silently landing in `line.data`.
 //
-// Error model:
-//   - If the write fails (disk full, permission denied), we log and
-//     swallow — we DO NOT throw, because audit-log failures shouldn't
-//     take down a settings toggle or session delete. The caller already
-//     mutated in-memory state; the audit miss is the lesser evil compared
-//     to leaving the user with a half-applied action.
-//   - To detect audit misses, run verify() periodically (or after a
-//     suspected incident): it returns { ok: false, ... } on missing lines.
+// Error model (fail-closed, 2026-09-20 rigor fix):
+//   - If the write fails (disk full, permission denied, unreadable
+//     prior content), append() THROWS after logging. Audit capability
+//     is a precondition for completing audited actions, not an
+//     optional decoration: a governance action that completes while
+//     its audit trail is missing is exactly the fail-open condition
+//     this module exists to prevent. Callers translate the throw into
+//     HTTP 5xx + an alerts-channel signal (see routes/* and
+//     authorize.js).
+//   - verify() / tail() remain non-throwing read-only diagnostics;
+//     a broken chain is reported as data, not as an exception.
 //
 // Thread-safety / concurrency:
-//   - Settings.js's persistNow() is also fire-and-forget with try/catch
-//     (lines 499, 508, 513, 537, 554). We follow the same convention.
 //   - Two simultaneous append() calls in the same process are NOT
 //     racy because Node is single-threaded — _seqCounter and
 //     _lastAfterHash are read+updated synchronously before the async
 //     fs.writeFileSync returns. Each line sees its predecessor's hash.
 export function append(kind, fields = {}, opts = {}) {
-  try {
-    const target = (fields && fields.target) || opts.target || "";
-    const cid = (fields && fields.cid) || opts.cid || "";
-    const actor = (fields && fields.actor) || opts.actor || "user";
-    // Payload is whatever the caller put in `payload` (preferred) or
-    // `data` (legacy alias) — explicit key, not "everything else".
-    let payload = {};
-    if (fields && typeof fields === "object") {
-      if (typeof fields.payload === "object" && fields.payload !== null) {
-        payload = fields.payload;
-      } else if (typeof fields.data === "object" && fields.data !== null) {
-        // Back-compat: callers who write { data: {...} } (no top-level
-        // target/cid/actor) get that object as payload. We treat `data`
-        // AS the payload only when it's clearly the payload (no other
-        // meta keys mixed in).
-        const hasMetaKeys =
-          fields.target !== undefined ||
-          fields.cid !== undefined ||
-          fields.actor !== undefined;
-        if (!hasMetaKeys) {
-          payload = fields.data;
-        }
+  const target = (fields && fields.target) || opts.target || "";
+  const cid = (fields && fields.cid) || opts.cid || "";
+  const actor = (fields && fields.actor) || opts.actor || "user";
+  // Payload is whatever the caller put in `payload` (preferred) or
+  // `data` (legacy alias) — explicit key, not "everything else".
+  let payload = {};
+  if (fields && typeof fields === "object") {
+    if (typeof fields.payload === "object" && fields.payload !== null) {
+      payload = fields.payload;
+    } else if (typeof fields.data === "object" && fields.data !== null) {
+      // Back-compat: callers who write { data: {...} } (no top-level
+      // target/cid/actor) get that object as payload. We treat `data`
+      // AS the payload only when it's clearly the payload (no other
+      // meta keys mixed in).
+      const hasMetaKeys =
+        fields.target !== undefined ||
+        fields.cid !== undefined ||
+        fields.actor !== undefined;
+      if (!hasMetaKeys) {
+        payload = fields.data;
       }
     }
-    const line = _buildLine({
+  }
+  let line;
+  try {
+    line = _buildLine({
       actor,
       kind,
       target,
@@ -337,15 +344,18 @@ export function append(kind, fields = {}, opts = {}) {
       data: payload,
     });
     _writeAtomic(JSON.stringify(line));
-    _setLastAfterHash(line.after_hash);
-    return line;
   } catch (e) {
-    // Best-effort logging — don't crash the calling action.
-    console.warn(
-      `[webui] events append kind=${kind} failed: ${e.message} (continuing)`,
+    // Fail-closed: log loudly and rethrow. The in-memory chain tail is
+    // NOT advanced (the line never landed on disk), so a later append
+    // after recovery re-chains from the true on-disk state only if the
+    // caches are reset; verify() remains the operator's ground truth.
+    console.error(
+      `[webui] events append kind=${kind} failed: ${e.message} (fail-closed, rethrowing)`,
     );
-    return null;
+    throw e;
   }
+  _setLastAfterHash(line.after_hash);
+  return line;
 }
 
 // verify — read the whole file, walk forward, recompute each line's
@@ -470,8 +480,11 @@ export function _resetForTests(opts = {}) {
   _lastAfterHash = "";
   _lastHashInitialized = false;
   if (opts.deleteFile) {
+    // unlinkSync comes from the module-top `node:fs` import. The old
+    // implementation called require("node:fs") inside an ESM module —
+    // a ReferenceError the try/catch swallowed, silently leaving the
+    // file on disk and opts.deleteFile a no-op (2026-09-20 audit).
     try {
-      const { unlinkSync } = require("node:fs");
       unlinkSync(_eventsPath());
     } catch {}
   }

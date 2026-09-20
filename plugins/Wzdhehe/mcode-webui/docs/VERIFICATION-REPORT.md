@@ -209,6 +209,17 @@ $ grep -nE "authorize\\(" server/lib/slash.js | wc -l
 
 **状态**：✅ PASS。
 
+> **更正注记（2026-09-20，webui-rigor-fix 批）**：本节"测试证据"中
+> "`test/integration/event-chain.test.js` 含 B03 + B01 联动：authorize
+> under test mode auto-approves" 的陈述已失效。authorize 的测试态自动
+> 放行（execArgv 探测分支与 `opts.testMode` 残留）已于同批 G1 簇在
+> `server/lib/authorize.js` 中整体移除；现行测试经 `test/_setup.js`
+> 的决策注入助手驱动真实决策路径，authorize 闸不再存在任何测试态
+> 旁路。历史行按原样保留，不重写。另注：紧邻的下节 §2.5 所列插件级
+> `.github/workflows/ci.yml` 亦已于同批 H1 簇删除——GitHub 只读取仓库
+> 根 `.github/workflows/`，该文件从未触发过任何运行；现行 CI 现实见
+> `docs/CI.md` 开头的诚实性注记。
+
 ### 2.5 判据 5：可重现性（lockfile + SBOM + CVE）
 
 **承载 lease**：C02（核心）。

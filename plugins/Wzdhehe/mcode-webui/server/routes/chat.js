@@ -10,7 +10,12 @@ import {
   persistCurrentChat,
 } from "../lib/sessions.js";
 import { pushStateFor, pushAlert, getActiveChild } from "../lib/state-bus.js";
-import { handleLocalSlash, handleCmdCommand } from "../lib/interaction/commands.js";
+// 2026-09-20 rigor fix (G1 bypass finding): import the lib/slash.js shell,
+//   NOT interaction/commands.js directly. The shell carries the B03
+//   authorize("slash.clear") gate + write-ahead audit (slash.clear.intent /
+//   chat.clear) for the destructive /clear and /new commands; importing the
+//   raw dispatcher bypassed both in production.
+import { handleLocalSlash, handleCmdCommand } from "../lib/slash.js";
 import { runMcodeAcp } from "../lib/mcode-acp.js";
 import { collectExecResult, runMcodeExec } from "../lib/mcode-exec.js";
 import { DEFAULT_MODEL } from "../lib/config.js";

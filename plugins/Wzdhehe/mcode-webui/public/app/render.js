@@ -716,7 +716,22 @@ export function renderSessions() {
       item.classList.add('confirming')
       const bar = document.createElement('div')
       bar.className = 'session-confirm'
-      bar.innerHTML = `<span>${t('session_delete_confirm')}</span><button class="session-confirm-yes" data-id="${btn.getAttribute('data-id')}">${t('session_delete_yes')}</button><button class="session-confirm-no" title="${t('session_delete_cancel')}">×</button>`
+      // DOM 构造替代 innerHTML 拼串：data-id 取自 DOM attribute（不可信），
+      // 直接插进 HTML 属性位带引号即可破属性注入（CodeQL js/xss-through-dom）。
+      // textContent 与 setAttribute 零 HTML 解析，结构与 class 与文案不变。
+      const confirmText = document.createElement('span')
+      confirmText.textContent = t('session_delete_confirm')
+      const yesBtn = document.createElement('button')
+      yesBtn.className = 'session-confirm-yes'
+      yesBtn.setAttribute('data-id', btn.getAttribute('data-id'))
+      yesBtn.textContent = t('session_delete_yes')
+      const noBtn = document.createElement('button')
+      noBtn.className = 'session-confirm-no'
+      noBtn.setAttribute('title', t('session_delete_cancel'))
+      noBtn.textContent = '×'
+      bar.appendChild(confirmText)
+      bar.appendChild(yesBtn)
+      bar.appendChild(noBtn)
       item.appendChild(bar)
       const timer = setTimeout(() => cancelConfirm(item), 5000)
       item._confirmTimer = timer

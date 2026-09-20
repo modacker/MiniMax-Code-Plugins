@@ -24,14 +24,14 @@ Clone and run:
 ```bash
 git clone https://github.com/Wzdhehe/Mcode-webui.git
 cd Mcode-webui
-npm install               # only devDeps (eslint, prettier, c8)
-npm test                  # 382 unit tests + 1 skipped (383 total)
-npm run lint              # eslint flat config, must be 0 warnings
+npm ci                    # devDependencies only (c8 — coverage)
+npm test                  # unit + mocked checks + integration + matrix
+npm run check             # docs / manifest alignment gate
 npm run dev               # node server.js
 # → http://127.0.0.1:8080/
 ```
 
-`npm test` and `npm run lint` **must pass** before opening a PR.
+`npm test` and `npm run check` **must pass** before opening a PR.
 
 ## Screenshots
 
@@ -108,9 +108,14 @@ the mock registration take effect.
 
 **Fix**:
 
-- Always run tests via `npm test` (which sets
-  `--experimental-test-module-mocks`). Calling `node --test test/*.test.js`
-  directly **does not** register the flag.
+- Mocked suites live in `checks/*.check.mjs` (moved out of `test/` by
+  the 2026-09-20 rigor fix: `t.mock.module` needs the flag, and the
+  marketplace root gate executes everything under `test/` flagless).
+  Run them via `npm test`, `npm run test:mocked`, or
+  `node --experimental-test-module-mocks --test checks/<name>.check.mjs`.
+- `test/*.test.js` is the flagless root-gate surface: a
+  `t.mock.module` call added there fails the whole file under the
+  marketplace gate. New flag-dependent tests belong in `checks/`.
 - If you must call `node` directly, use the same flag list as
   `package.json#scripts.test`.
 
@@ -130,8 +135,8 @@ npm test
 rm -rf "$(dirname "$MCODE_RUNTIME_DB")"
 ```
 
-The CI matrix sets this env automatically; you only need to set it
-manually for local test runs.
+Nothing sets this env automatically — this plugin has no CI of its
+own (see `docs/CI.md`); set it manually for local test runs.
 
 ## Repository layout
 
@@ -156,22 +161,23 @@ Mcode-webui/                          # ← the development tree (root)
 real directory copy (not a junction or symlink — those break
 zip-packaging and confuse `git log`).
 
-`npm run setup:plugin` is a no-op on the current layout (it used to
-create junctions; the trees have been expanded since).
+The historical `setup:plugin` junction-setup script no longer exists
+in this tree's `package.json`. The current script set is
+`test` / `test:unit` / `test:integration`, `check` / `check:ci`,
+`sbom`, and `coverage` (see `package.json#scripts` and `docs/CI.md`).
 
 ## Editing flow
 
 1. **Edit at the repo root** (`server/`, `public/`, `test/`).
 2. **Mirror the change to the plugin tree** — copy the changed files
    from `<root>/server/...` to `plugins/Wzdhehe/mcode-webui/server/...`,
-   and the same for `public/`, `test/`, `docs/`.
-   (The `package:plugin` script does this for you, but a
-   per-PR manual sync is fine for small changes.)
+   and the same for `public/`, `test/`, `docs/`. (There is no
+   packaging script in the current script set; the sync is manual
+   per PR.)
 3. **Run the gate**:
    ```bash
    npm test
-   npm run lint
-   npm run validate:plugin
+   npm run check
    ```
 4. **Commit** with a conventional message (see below).
 5. **Push** to a feature branch and open a PR.
@@ -210,9 +216,10 @@ practice; log + continue.
 
 ## Pull request checklist
 
-- [ ] `npm test` passes (382 + 1 skipped)
-- [ ] `npm run lint` is clean (0 warnings)
-- [ ] `npm run validate:plugin` is clean (mirrors official gate)
+- [ ] `npm test` passes (with `--experimental-test-module-mocks`)
+- [ ] Flagless `node --test` also passes (dual-mode requirement — see
+      `docs/CI.md`)
+- [ ] `npm run check` is clean (docs / manifest alignment gate)
 - [ ] Plugin tree (`plugins/.../Mcode-webui/`) is in sync with root
 - [ ] No personal data in commit content (no IPs, no usernames, no
       real session IDs)
@@ -257,8 +264,9 @@ short version:
 1. Bump `version` in `package.json` (root + plugin copy).
 2. Move "Unreleased" section in `CHANGELOG.md` to a dated
    versioned section.
-3. `npm run package:plugin` — produces `dist/Wzdhehe/mcode-webui/`
-   + `dist/Wzdhehe/Mcode-webui.zip`.
+3. Package the plugin tree. There is no `package:plugin` script in
+   the current script set; the `plugins/Wzdhehe/mcode-webui/` tree
+   itself is the submission artifact (see step 4).
 4. Open a PR to the community registry
    [`MiniMax-AI/MiniMax-Code-Plugins`](https://github.com/MiniMax-AI/MiniMax-Code-Plugins)
    adding only the `plugins/Wzdhehe/mcode-webui/` tree (per the

@@ -312,9 +312,16 @@ log + a disabled feature) — it does not crash.
 
 ## 7. Testing & reproducibility
 
-- `npm test` runs `node --experimental-test-module-mocks --test test/*.test.js`.
-  382 passing tests, 1 skipped, 0 failing on a clean checkout.
-- `npm run lint` — ESLint flat config, 0 warnings on a clean checkout.
+- `npm test` runs `node --experimental-test-module-mocks --test
+  test/*.test.js checks/*.check.mjs test/integration/*.test.js
+  test/matrix/*.test.js` (mocked suites live outside `test/` so the
+  flagless marketplace root gate never trips on the mock flag — see
+  docs/CI.md "Test layout and suite routing").
+- No lint gate exists: the `lint` script was removed in the
+  2026-09-20 rigor fix (this tree never contained an ESLint or
+  Prettier config; a declared gate that never ran green was deleted
+  along with its unused devDependencies — see docs/CI.md honesty
+  notes).
 - All tests use **temp file fixtures** (`mkdtempSync`). No test writes
   to the user's real `~/.minimax/` or `~/.mcode-webui/` directory unless
   `MCODE_RUNTIME_DB` / `MCODE_WEBUI_SETTINGS_PATH` env is explicitly
@@ -326,8 +333,11 @@ log + a disabled feature) — it does not crash.
   registry-installed or non-canonical layouts point at the right
   binary explicitly. Resolution priority: env override > `$MCODE_CMD`
   derived > dev layout fallback.
-- Cross-platform: tests pass on Windows + Linux + macOS (CI matrix
-  Node 22 + 24).
+- Cross-platform: there is **no CI matrix**. The only CI is the
+  marketplace root gate (single ubuntu / Node 22 job: `npm ci` +
+  `npm run check`, which recursively runs every file under `test/`
+  flagless). Cross-platform verification is a manual local recipe —
+  see docs/CI.md "Local matrix".
 
 ---
 

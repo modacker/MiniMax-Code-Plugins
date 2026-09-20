@@ -1,14 +1,18 @@
 // webui/server/lib/slash.js
-// Thin compatibility shell — re-exports the slash command API from the
-// new interaction/feedback subsystem split. See BORROW-dsh-deepseek-
-// harness-2026-08-28 § 3 (Subsystem split) and lease B04 for the
-// rationale.
+// Gate-bearing shell over the interaction/feedback subsystem split. See
+// BORROW-dsh-deepseek-harness-2026-08-28 § 3 (Subsystem split) and lease
+// B04 for the rationale.
 //
-// Routes should import from the specific module (e.g. interaction/
-// commands.js) — this file remains only as a backward-compat entry
-// point for any external consumer that still imports lib/slash.js.
+// ROUTES MUST IMPORT FROM HERE, NOT from interaction/commands.js.
+//   (2026-09-20 rigor fix: routes/chat.js used to import the raw
+//   dispatcher directly, which made the B03 authorize() gate and the
+//   write-ahead audit below dead code in production. interaction/
+//   commands.js is the UNGATED implementation — only this shell may
+//   import its dispatchers, so the gate sits before every mutation.)
+//
 // The 6 modules in interaction/ and feedback/ own the seams; this
-// shell just glues their public surface.
+// shell glues their public surface and adds the security invariants
+// (gate + audit) that must not be bypassed by import-site choice.
 //
 // B01: the destructible commands (/clear /new) live in interaction/
 // commands.js (B04's scope). B01 cannot modify that file. We wrap
@@ -49,9 +53,15 @@ function _destructiveCmd(cmdName) {
 // B03 helper: append a decline note to the chat so the user gets
 //   visible feedback when they (or the 5-min timeout) blocked the
 //   destructive command. Mirrors the production handlers' style of
-//   pushing a string into cs.chat. The /api/send and /api/cmd routes
-//   already invoke pushStateFor after handleLocalSlash / handleCmdCommand
-//   return, so we don't need to push state here.
+//   pushing a string into cs.chat. NOTE (2026-09-20 rigor fix): this
+//   helper deliberately does NOT import state-bus to push a state
+//   frame — the note rides the next per-cid push (handleSend pushes
+//   before dispatch; the underlying handlers push after mutation).
+//   The ack'd HTTP response has already returned by then (both
+//   /api/send and /api/cmd are fire-and-forget), so there is no
+//   route-level push after handleLocalSlash / handleCmdCommand
+//   returns, contrary to what an earlier revision of this comment
+//   claimed.
 function _appendDeclineNote(cs, cid, cmd, decidedBy) {
   if (!cs) return;
   const note = `● 已取消 /${cmd} (授权未通过: ${decidedBy})`;
@@ -84,7 +94,26 @@ export async function handleLocalSlash(content, cs, cid) {
       _appendDeclineNote(cs, cid, m.cmd, authResult.decidedBy);
       return { handled: true, continueMcode: false };
     }
-    // approved — fall through to delegate, but still audit (B01).
+    // Write-ahead audit (2026-09-20 rigor fix): durable intent line
+    // BEFORE the chat mutation. append() is fail-closed — a failed
+    // write propagates to the caller (routes/chat.js → HTTP 5xx +
+    // alert) with cs.chat untouched. We deliberately do NOT catch
+    // and decline-note here: an unaudited destructive command must
+    // abort loudly, not "succeed" silently on a broken audit disk.
+    _eventsAppend("slash.clear.intent", {
+      target: (cs && cs.sessionId) || "(no-session)",
+      cid,
+      actor: "user",
+      payload: {
+        source: "local_slash",
+        cmd: m.cmd,
+        chatLenBefore: ((cs && cs.chat) || []).length,
+        authorize: { decidedBy: authResult.decidedBy, decidedAt: authResult.decidedAt },
+      },
+    });
+    // Delegate; then record the outcome AFTER the mutation (also
+    // fail-closed / propagating — same rationale as the intent).
+    const result = await _handleLocalSlashImpl(content, cs, cid);
     _eventsAppend("chat.clear", {
       target: (cs && cs.sessionId) || "(no-session)",
       cid,
@@ -96,7 +125,7 @@ export async function handleLocalSlash(content, cs, cid) {
         authorize: { decidedBy: authResult.decidedBy, decidedAt: authResult.decidedAt },
       },
     });
-    return _handleLocalSlashImpl(content, cs, cid);
+    return result;
   }
   // Non-destructive paths (status / help / usage / goal / etc.):
   //   unchanged from B01 — no gate, no extra audit.
@@ -121,6 +150,20 @@ export async function handleCmdCommand(cmd, cs, cid) {
       _appendDeclineNote(cs, cid, name, authResult.decidedBy);
       return { handled: true, continueMcode: false };
     }
+    // Write-ahead intent — see handleLocalSlash for the rationale.
+    _eventsAppend("slash.clear.intent", {
+      target: (cs && cs.sessionId) || "(no-session)",
+      cid,
+      actor: "user",
+      payload: {
+        source: "cmd_button",
+        cmd: name,
+        chatLenBefore: ((cs && cs.chat) || []).length,
+        authorize: { decidedBy: authResult.decidedBy, decidedAt: authResult.decidedAt },
+      },
+    });
+    const result = await _handleCmdCommandImpl(cmd, cs, cid);
+    // Outcome — AFTER the mutation, fail-closed (propagates).
     _eventsAppend("chat.clear", {
       target: (cs && cs.sessionId) || "(no-session)",
       cid,
@@ -132,7 +175,7 @@ export async function handleCmdCommand(cmd, cs, cid) {
         authorize: { decidedBy: authResult.decidedBy, decidedAt: authResult.decidedAt },
       },
     });
-    return _handleCmdCommandImpl(cmd, cs, cid);
+    return result;
   }
   return _handleCmdCommandImpl(cmd, cs, cid);
 }

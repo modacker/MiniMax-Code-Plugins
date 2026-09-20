@@ -31,6 +31,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import http from "node:http";
+import { decideNextAuthorization } from "../_setup.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const serverJsPath = join(__dirname, "..", "..", "server.js");
@@ -57,20 +58,25 @@ async function spawnServer() {
         HOST: "127.0.0.1", // loopback only — auth gates still bypass for local
         MCODE_WEBUI_SETTINGS_PATH: settingsPath,
         MCODE_WEBUI_EVENTS_PATH: eventsPath,
+        // U1 (2026-09-20 rigor fix): redirect upload dir + sessions db
+        // away from MCODE_ROOT — server.js mkdirSync(UPLOAD_DIR) at boot
+        // and persistCurrentChat's saveSessions would otherwise create
+        // stray .webui-uploads/ + .webui-sessions.json in the plugin
+        // tree, which breaks marketplace validate.mjs ("invalid Plugin
+        // directory"). tmpDir is per-test mkdtemp'd and rmSync'd in
+        // stopServer below, so cleanup stays automatic.
+        MCODE_WEBUI_UPLOAD_DIR: join(tmpDir, "uploads"),
+        MCODE_WEBUI_SESSIONS_DB: join(tmpDir, "sessions.json"),
         TOKEN: "", // explicit empty so auth init is deterministic
         // Disable TOKEN_STDOUT so stdout is clean for assertion.
         MCODE_WEBUI_TOKEN_STDOUT: "0",
     };
-    // Spawn with --experimental-test-module-mocks in execArgv so that
-    // server/lib/authorize.js auto-approves when the export route
-    // calls authorize("session.export", ...). The check is in
-    // authorize.js lines 151-163 — it inspects the CHILD process's
-    // process.execArgv for "--test" / "--experimental-test-module-mocks".
-    // Without this flag, the route hangs waiting for an SSE-driven
-    // /api/auth/decision POST — and that route isn't wired in
-    // router.js (B03 known blocker). The flag is otherwise inert for
-    // server.js startup (no test files are loaded by the child).
-    const proc = spawn("node", ["--experimental-test-module-mocks", serverJsPath], {
+    // Plain node (no mock flag): the authorize() test-mode auto-approve
+    // was removed in the 2026-09-20 rigor fix. Gated routes (export)
+    // are decided through the production wire path — the test
+    // subscribes the decider SSE, captures needs_authorization, and
+    // POSTs /api/auth/decision (see the export tests below).
+    const proc = spawn("node", [serverJsPath], {
         stdio: ["ignore", "pipe", "pipe"],
         cwd: join(__dirname, "..", ".."),
         env,
@@ -298,14 +304,26 @@ test("router-boot: POST /api/usage/forecast returns 404 (route is GET-only)", as
 
 // -----------------------------------------------------------------------
 // /api/sessions/<id>/export — happy md path + error 404 (unknown id).
-// B03 authorize() auto-approves under `node --test` (authorize.js
-// lines 151-163), so the request reaches the handler.
+// The authorize gate is live (auto-approve removed in the 2026-09-20
+// rigor fix); the gated requests below drive the real decision wire
+// path via decideNextAuthorization.
 // -----------------------------------------------------------------------
 test("router-boot: GET /api/sessions/<id>/export?format=json returns 404 for unknown id", async () => {
-    const res = await httpRequest({
+    // Subscribe the decider BEFORE firing the gated request
+    // (needs_authorization broadcasts are fire-once).
+    const decisionPromise = decideNextAuthorization({
+        port: server.port,
+        approve: true,
+        cid: "cid-router-boot",
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    const resPromise = httpRequest({
         port: server.port,
         path: "/api/sessions/nonexistent-session-id-xyz/export?format=json",
     });
+    const { decision } = await decisionPromise;
+    assert.ok(decision, "auth decision must have been posted");
+    const res = await resPromise;
     // 404 path: session lookup fails (export.js line 392-394).
     assert.equal(res.status, 404, `expected 404, got ${res.status}. body: ${res.body}`);
     assert.ok(res.json, "error response is JSON");

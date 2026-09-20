@@ -324,3 +324,18 @@ $ grep -E "^##" COVERAGE-REPORT.md | head -10
 | 2 | 工具异常 | 不触发 |
 
 **结论：退出码 0，deferred 代码段已显式注释（§4），pre-existing 失败不属 D01 范围。**
+
+---
+
+## 8. c8 排除面现状补注（2026-09-20，webui-rigor-fix 批 H1 簇）
+
+> 本节为如实申报，不修饰 §1–§6 的数字。`package.json` 的 `c8.exclude` 当前豁免四件：
+
+| 豁免文件 | 现状 | 处置方向 |
+|---|---|---|
+| `server/lib/mcode-exec.js` | 同批 S1 簇已落位 `test/lib-mcode-exec.test.js`（MCODE_CMD 解析器单测：PATH 定位、.cmd/.bat 垫片直 spawn、fail-closed 抛错），但文件仍在 c8 豁免面内，覆盖率未计量 | 豁免重估为后续债，如实挂账 |
+| `server/lib/mcode-acp.js` | 无专属单测，覆盖率未计量 | 后续债，如实挂账 |
+| `server/lib/mcode-rpc.js` | 有专属单测 `checks/lib-mcode-rpc.check.mjs`（2026-09-20 M1 簇随 mock 依赖件迁移，纯导出与权限映射，部分覆盖），但文件在 c8 豁免面内，覆盖率未计量 | 后续债，如实挂账 |
+| `server/acp.mjs` | 无单元测试，覆盖率未计量 | 后续债，如实挂账 |
+
+**口径声明：§1–§6 的覆盖率数字（全局 92.93% lines / 82.99% branches）仅对五个 D01 目标模块成立，不是全仓覆盖率。** 四件豁免文件不进 c8 计量，全仓实际覆盖率低于上表数字。除 `mcode-exec.js` 有明确的同批补测计划外，其余三件为已申报的后续债，本报告不虚饰其覆盖状态。

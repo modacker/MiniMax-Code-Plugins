@@ -70,7 +70,17 @@ try {
   console.log('[webui] init done')
 } catch (e) {
   console.error('[webui INIT FATAL]', e?.stack || e?.message || e)
-  document.body.innerHTML = '<pre style="color:red;padding:20px;font-size:14px;">⚠ webui JS 初始化失败:\n\n' + (e?.stack || e?.message || JSON.stringify(e)) + '\n\n请截图给开发</pre>'
+  // v2 security fix (PR #55 / CodeQL): the old code assigned a
+  //   concatenated HTML string directly — e?.stack is untrusted text
+  //   and must never be parsed as markup. DOM construction +
+  //   textContent keeps the same visuals (red mono text, 20px padding,
+  //   14px font) with zero HTML parsing.
+  const pre = document.createElement('pre')
+  pre.style.color = 'red'
+  pre.style.padding = '20px'
+  pre.style.fontSize = '14px'
+  pre.textContent = '⚠ webui JS 初始化失败:\n\n' + (e?.stack || e?.message || JSON.stringify(e)) + '\n\n请截图给开发'
+  document.body.replaceChildren(pre)
   throw e
 }
 

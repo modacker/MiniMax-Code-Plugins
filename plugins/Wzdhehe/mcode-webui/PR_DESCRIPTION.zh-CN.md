@@ -16,10 +16,11 @@
   - `docs/`（ARCHITECTURE、API、CAPABILITIES、DEVELOPMENT、TROUBLESHOOTING、
     BORROW-harness-v2、MATH-skeleton-webui-v2、ANTI-PATTERNS-FIX-PLAN、
     PROJECT-CHARTER-webui-v2、VERIFICATION-REPORT、HTTPS-REVERSE-PROXY、CI）
-  - `server/`、`public/`、`test/`、`scripts/`（真实目录，与项目根保持同步；打包时按原样
-    进入 `dist/` 作为发布产物）
-  - `package.json`（与项目根一致，含 `setup:plugin`、`package:plugin`、`check`、
-    `sbom` 脚本）
+  - `server/`、`public/`、`test/`、`checks/`、`scripts/`（真实目录，与项目根保持同步；打包时
+    按原样进入 `dist/` 作为发布产物。`checks/` 承载依赖 `--experimental-test-module-mocks`
+    的模块 mock 套件，因此不进市仓根门禁的无旗标发现面——见 docs/CI.md）
+  - `package.json`（与项目根一致，含 `test` / `test:unit` / `test:mocked` /
+    `test:integration`、`check` / `check:ci`、`coverage`、`sbom` 脚本）
 
 ## v2.0.0 相对 v1.x 的变更（工业化）
 
@@ -43,8 +44,8 @@
 | 1 | **可验证性** — append-only NDJSON 事件流 + SHA-256 hash 链 | `server/lib/events.js`（B01）+ 18 hook 点 |
 | 2 | **可观测性** — 独立的异常 SSE 通道 + 铃铛图标数据源 | `server/lib/alerts.js` + `server/routes/alerts.js`（B02） |
 | 4 | **可治理性** — 每次请求 `authorize(action, ctx)` Promise，默认 5 分钟 fail-closed，16 个 hook 点 | `server/lib/authorize.js`（B03） |
-| 5 | **可复现性** — `package-lock.json` + CycloneDX 1.5 SBOM + npm-audit 集成 | `.github/workflows/ci.yml` + `scripts/gen-sbom.mjs`（C02） |
-| 6 | **可测试性** — `node --test` 矩阵（Node 22 / Node 24 × macOS / Linux / Windows） | `.github/workflows/ci.yml`（C02） |
+| 5 | **可复现性** — `package-lock.json` + CycloneDX 1.5 SBOM + npm-audit 集成 | `scripts/gen-sbom.mjs` + `docs/CI.md` 本地门禁（C02） |
+| 6 | **可测试性** — 双模 `node --test` 套件（带 / 不带 `--experimental-test-module-mocks`）+ 本地跨 Node/OS 矩阵配方 | `docs/CI.md`（C02）+ 市仓根 `validate` CI |
 | 7 | **可发现性** — 13 个 `plugin.json` capability 都带 `description`（204-286 字符）；CONTRIBUTING.md 含 "Common npm test failures" 小节 | `plugin.json` + `README.md` + `CONTRIBUTING.md`（B05） |
 | 8 | **数学根基架构** — 每个子系统带 `sih-math` 定理引用（PROB-018 / ORD-022 / TOP-008 / ALG-001 等） | `docs/MATH-skeleton-webui-v2-2026-09-20.md`（A02） |
 | 9 | **单一真理源** — `scripts/check-docs-alignment.mjs` 在 v2 reconcile 后于 CI 退出 0 | `scripts/check-docs-alignment.mjs`（B05）+ §6 reconcile |
@@ -169,8 +170,9 @@ rate-limit.js     : 99.20% lines / 87.80% branches
 - D01 的 5 个 unit-edge 套件 — 130 tests（db resolver / rate limit / markdown / quota / events concurrency）
 - D02 的 4 个集成套件 — 38 tests（router-boot / sse-channel / event-chain / transports matrix / check-docs）
 
-CI：GitHub Actions 上 Node 22 / Node 24 × macOS / Linux / Windows。
-完整 PR 套件跑 `npm run check:ci && npm test && npm run sbom && npm audit`。
+CI：市仓根 GitHub Actions workflow（ubuntu、Node 22）跑 `npm ci && npm run check`，
+递归执行本插件全套件。无插件自有 workflow——真实在跑的门禁以 `docs/CI.md` 为准。
+本地完整套件：`npm run check:ci && npm test && npm run sbom && npm audit`。
 
 ## 手动测试证据
 

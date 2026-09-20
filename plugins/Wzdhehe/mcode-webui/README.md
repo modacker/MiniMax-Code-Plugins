@@ -31,7 +31,8 @@ node server.js
 | `docs/` | ARCHITECTURE, API, CAPABILITIES, DEVELOPMENT, TROUBLESHOOTING |
 | `server/` | Node.js HTTP + SSE server |
 | `public/` | Static frontend SPA |
-| `test/` | `node:test` unit tests |
+| `test/` | `node:test` suites — flagless root-gate surface (see docs/CI.md) |
+| `checks/` | mocked unit checks (`t.mock.module`; need the module-mocks flag) |
 | `package.json` | Project metadata + scripts |
 
 ## Screenshots

@@ -72,6 +72,16 @@ capabilities_existing = "docs/CAPABILITIES.md"
 
 # PROJECT CHARTER: mcode-webui v2
 
+> **更正注记（2026-09-20，webui-rigor-fix 批 M1）。** 本章程多处历史行引用
+> `.github/workflows/ci.yml` 作为已交付产物——§6 基线表第 5 行（可重现性）、
+> §7.3 lease C02 行、§9.1 反面模式表第 11 行——且 [scope] 块列有
+> "CI 矩阵（Node 22/24 × macOS/Linux/Windows）+ SBOM + CVE"。这些引用
+> 描述的是一个提交在 `plugins/Wzdhehe/mcode-webui/.github/workflows/`
+> 之下的 workflow 文件：GitHub 只读取仓库根的 `.github/workflows/`，
+> 子目录位置永不触发，一次也没有运行过。该死文件已在 webui-rigor-fix 批 H1
+> 删除，真实门禁（市仓根 validate + 本地全量门 + 本地矩阵 recipe）现由
+> `docs/CI.md` 如实承载。本注记更正记录，不重写下方历史行。
+
 > 本章程定义 `modacker/MiniMax-Code-Plugins` fork 下 `plugins/Wzdhehe/mcode-webui/` 从 v1.0.0 → v2.0.0 重构的**范畴、目标、形态、里程碑、工作方法**。
 > 它是 19 个 lease（A01-A04 / B01-B05 / C01-C08 / D01-D03）的总入口。
 > 详尽编排见 `PLAN-webui-v2-refactor.DRAFT.md`，本章程为治理层与工程层的接缝。

@@ -136,16 +136,15 @@ webui 在 `mcode-rpc.js` 把这些列白名单 + 优雅降级（toast + 兜底�
 
 `plugins/Wzdhehe/mcode-webui/` 是 Agent Plugins 1.0 规范的产物，
 会提交到[官方插件社区](https://github.com/MiniMax-AI/MiniMax-Code-Plugins)。
-
-```bash
-npm run validate:plugin   # 契约检查（跟官方门禁镜像）
-npm run package:plugin    # dist/Wzdhehe/mcode-webui/ + .zip
-```
+插件树本身即提交产物（一个目录 = 一个插件）。历史脚本
+`validate:plugin` / `package:plugin` 已随脚本集收口删除，现行命令为
+`npm run check`（对齐闸）与 `npm test` 等，全量清单见
+[docs/CI.md](docs/CI.md)。
 
 ## 贡献
 
-见 [CONTRIBUTING.md](CONTRIBUTING.md)。`npm test`（382 通过 + 1 跳过）
-和 `npm run lint` 必须保持全绿；插件树（`plugins/.../mcode-webui/`）
+见 [CONTRIBUTING.md](CONTRIBUTING.md)。`npm test` 与 `npm run check`
+必须保持全绿；插件树（`plugins/.../mcode-webui/`）
 的副本与仓库根保持同步。
 
 ## 开源协议

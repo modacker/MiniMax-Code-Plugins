@@ -70,10 +70,12 @@ describe("events concurrency (D01) — reset stability", () => {
     assert.equal(r.seq, 2);
   });
 
-  test("reset alone preserves on-disk file (deleteFile option is best-effort)", () => {
-    // The SUT's `deleteFile` option uses `require("node:fs")` which
-    // doesn't unlink anything in pure-ESM modules. We verify the
-    // observed behavior: reset alone does NOT touch the file.
+  test("reset alone preserves on-disk file (deleteFile is opt-in)", () => {
+    // Plain _resetForTests() clears ONLY the in-memory seq/hash caches —
+    // the file is untouched. (The deleteFile option is now functional
+    // after the 2026-09-20 fix — it imports unlinkSync at module top
+    // instead of the silently-swallowed require() — but it must remain
+    // opt-in so plain resets never destroy evidence.)
     events.append("a", { data: { x: 1 } });
     const r1 = events.append("b", { data: { x: 2 } });
     const beforeSize = statSync(tmpEventsPath).size;
@@ -92,8 +94,9 @@ describe("events concurrency (D01) — reset stability", () => {
 
   test("simulated fresh start: write+rm file+reset → next append starts at seq=1", () => {
     // Manually delete the file + reset to simulate a clean fresh
-    // process — `_resetForTests({ deleteFile: true })` is unreliable
-    // in ESM context, so we use unlinkSync directly.
+    // process. (Also covered via _resetForTests({deleteFile:true}) in
+    // lib-events.test.js since the 2026-09-20 unlinkSync fix; this
+    // variant keeps the explicit rm form as a belt-and-braces check.)
     events.append("a", { data: { x: 1 } });
     rmSync(tmpEventsPath, { force: true });
     events._resetForTests();

@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "mcode-webui",
   "version": "2.0.0",
-  "description": "Browser-based chat frontend for the mcode agent runtime. v2.0.0 industrializes the v1.x surface with append-only event stream + hash chain, independent anomaly SSE channel, per-request authorize() gate, interaction/feedback subsystem split, plugin metadata drift detector, CI matrix + SBOM + CVE, rate limiting, virtual chat list, cross-workspace session search, session export (Markdown / JSON), quota forecast, and token-onboarding modal. Zero npm dependencies; runs on Node 22+.",
+  "description": "Browser-based chat frontend for the mcode agent runtime. v2.0.0 industrializes the v1.x surface with append-only event stream + hash chain, independent anomaly SSE channel, per-request authorize() gate, interaction/feedback subsystem split, plugin metadata drift detector, local SBOM + CVE gates, rate limiting, virtual chat list, cross-workspace session search, session export (Markdown / JSON), quota forecast, and token-onboarding modal. Zero npm dependencies; runs on Node 22+.",
   "author": {
     "name": "Wzdhehe"
   },

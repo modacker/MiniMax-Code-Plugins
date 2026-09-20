@@ -75,7 +75,12 @@ export function extractToken(req) {
   // EventSource / fetch with custom headers can use `Authorization: Bearer`.
   const auth = req.headers && req.headers.authorization;
   if (auth) {
-    const m = /^Bearer\s+(.+)$/i.exec(String(auth));
+    // v2 security fix (PR #55 / CodeQL): the old `^Bearer\s+(.+)$` paired
+    // an overlapping `\s+`/`.+` — polynomial backtracking on hostile
+    // headers. `[ \t]+` then `(\S.*)` use disjoint character classes, so
+    // the match is linear. Whitespace other than SP/HTAB after "Bearer"
+    // now fails closed (falls through to the query-string path).
+    const m = /^Bearer[ \t]+(\S.*)$/i.exec(String(auth));
     if (m) return clip(m[1].trim());
   }
   // URL query fallback (also covers EventSource on browsers that strip
