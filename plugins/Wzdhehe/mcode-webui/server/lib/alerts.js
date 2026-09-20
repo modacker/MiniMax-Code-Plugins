@@ -28,7 +28,12 @@ const DEDUP_WINDOW_MS = 60_000;
 
 const _buffer = []; // newest at end
 const _subscribers = new Set(); // SSE response objects
-const _dedupIndex = new Map(); // dedupKey → { idx, ts }
+// dedupKey → { alert, ts }. Storing the alert object (by reference) — not
+// its buffer index — means wrap-and-shift of the ring buffer does not
+// invalidate the dedup hit. (See Finding 1 fix; previously we stored idx
+// and the `if (cur.idx === 0) delete` block only handled one specific
+// case, leaving stale idx>0 entries after every other wrap.)
+const _dedupIndex = new Map();
 
 // ---------- helpers ----------
 
@@ -42,15 +47,13 @@ function dedupKey(level, msg, src, cid) {
 function pushRing(alert) {
     _buffer.push(alert);
     if (_buffer.length > RING_SIZE) {
-        const dropped = _buffer.shift();
-        // If the dropped entry was a dedup-keyed one, also clear the
-        // dedup index entry so the next identical alert is treated as
-        // fresh (otherwise the dedup map would point at the wrong index
-        // after a wrap).
-        if (dropped && dropped._dedupKey) {
-            const cur = _dedupIndex.get(dropped._dedupKey);
-            if (cur && cur.idx === 0) _dedupIndex.delete(dropped._dedupKey);
-        }
+        // Drop the oldest entry. We do NOT touch _dedupIndex here: the
+        // dedup index stores the alert object by reference (see comment
+        // on _dedupIndex declaration), so a wrap doesn't invalidate any
+        // dedup hit — `existing.alert` always resolves to the live
+        // alert, whether or not it's still in the buffer. The dedup
+        // window itself (DEDUP_WINDOW_MS) handles staleness.
+        _buffer.shift();
     }
 }
 
@@ -76,19 +79,31 @@ async function tryWriteEvent(alert) {
     }
     if (!_eventsMod || typeof _eventsMod.append !== "function") return;
     try {
-        // B01 contract: append(kind: string, data: object, opts?: object).
+        // B01 contract: append(kind, fields, opts).
         //   `target` and `cid` are hoisted to top-level fields inside
-        //   append(), so we pass them inside data and let append lift
-        //   them. sessionId stays in payload since append() does not
-        //   hoist it.
+        //   append(). ALL other alert fields MUST go inside `payload` —
+        //   events.append() treats any top-level field outside the
+        //   reserved {target,cid,actor,kind,seq,ts,before_hash,after_hash}
+        //   set as a typo and silently drops it. (See Finding 2 fix:
+        //   previously id/msg/count/sessionId/data were passed at
+        //   top-level and the entire payload vanished from the line.)
+        const {
+            id,
+            msg,
+            count,
+            sessionId,
+            data,
+        } = alert;
         _eventsMod.append(`alert.${alert.level}`, {
             target: alert.src || "",
             cid: alert.cid || "",
-            id: alert.id,
-            msg: alert.msg,
-            count: alert.count,
-            sessionId: alert.sessionId || null,
-            data: alert.data || null,
+            payload: {
+                id,
+                msg,
+                count,
+                sessionId: sessionId || null,
+                data: data || null,
+            },
         });
     } catch {
         // audit write failure must not break the alert flow
@@ -128,7 +143,10 @@ export function pushAlert(input) {
     const existing = _dedupIndex.get(key);
     if (existing && now - existing.ts < DEDUP_WINDOW_MS) {
         // Merge into the existing entry — bump count, refresh ts.
-        const target = _buffer[existing.idx];
+        // Resolve via the stored alert reference, not via buffer index,
+        // so a ring-buffer wrap cannot redirect the increment to the
+        // wrong alert. (See Finding 1 fix.)
+        const target = existing.alert;
         if (target) {
             target.count = (target.count || 1) + 1;
             target.ts = now;
@@ -142,7 +160,7 @@ export function pushAlert(input) {
     alert.count = 1;
     alert._dedupKey = key;
     pushRing(alert);
-    _dedupIndex.set(key, { idx: _buffer.length - 1, ts: now });
+    _dedupIndex.set(key, { alert, ts: now });
     broadcast({ kind: "append", alert });
     // Fire-and-forget audit write
     tryWriteEvent(alert);

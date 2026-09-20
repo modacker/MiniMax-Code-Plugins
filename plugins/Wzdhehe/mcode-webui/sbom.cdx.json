@@ -2,14 +2,14 @@
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
   "version": 1,
-  "serialNumber": "urn:uuid:fe0e383f-d7f6-4581-99f0-91309a2c4908",
+  "serialNumber": "urn:uuid:c3671eef-bc47-4044-8fa3-3466b70c658d",
   "metadata": {
-    "timestamp": "2026-09-19T17:11:27.214Z",
+    "timestamp": "2026-09-20T00:46:43.590Z",
     "tools": [
       {
         "vendor": "mcode-webui",
         "name": "gen-sbom.mjs",
-        "version": "1.0.0"
+        "version": "2.0.0"
       }
     ],
     "authors": [
@@ -18,11 +18,11 @@
       }
     ],
     "component": {
-      "bom-ref": "pkg:npm/mcode-webui@1.0.0",
+      "bom-ref": "pkg:npm/mcode-webui@2.0.0",
       "type": "application",
       "name": "mcode-webui",
-      "version": "1.0.0",
-      "description": "HTTP/SSE wrapper for mcode exec --output-format stream-json. Zero deps, Node 22+.",
+      "version": "2.0.0",
+      "description": "v2.0.0 industrializes the v1.x surface with append-only event stream + hash chain, independent anomaly SSE channel, per-request authorize() gate, interaction/feedback subsystem split, plugin metadata drift detector, CI matrix + SBOM + CVE, rate limiting, virtual chat list, cross-workspace session search, session export (Markdown / JSON), quota forecast, and token-onboarding modal. Zero npm dependencies; runs on Node 22+.",
       "licenses": [
         {
           "license": {

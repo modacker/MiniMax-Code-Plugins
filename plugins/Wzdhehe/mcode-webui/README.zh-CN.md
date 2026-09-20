@@ -50,6 +50,40 @@
 - **两种传输** —— `mcode acp`（默认，多轮）+ `mcode exec`
   兜底（用于老版本客户端 / 降级模式）
 
+## 界面预览
+
+`docs/screenshots/` 下的 PNG 是 **真实截图**，2026-09-20 用
+ego-browser skill 在运行的 v2.0.0 服务器
+（`PORT=8123 HOST=127.0.0.1 MCODE_CMD=/Users/moc/.minimax-code/bin/mcode`）
+上抓取。覆盖最有代表性的五个视图：启动界面、恢复中的 "Greeting"
+会话对话中段、左下设置面板（暗色 / 英文 / 局域网访问）、已输入但
+未发送的输入框、提交后展示 SSE delta 流。
+
+| # | 说明 |
+|---|---|
+| 1 | **启动界面** — 首次启动的空白聊天视图：顶部栏含 workspace / model / LAN 标识、空对话区、底部 prompt 输入框 |
+| 2 | **对话中段** — webui 渲染 "Greeting" 会话：历史已加载、SSE 流式助手回复进行中、页内 tok/s 表、每回合上下文窗口标识 |
+| 3 | **设置面板** — 左下卡片，含外观（暗色）、语言（英文）、局域网访问开关；点 "LAN Access" 触发 `POST /api/settings` 并通过 `auth.token_rotated` SSE 广播 |
+| 4 | **输入框已输入** — 输入 textarea 显示真实用户 prompt（"Can you list the files in this workspace?"），含 send/stop 控件、`/` 命令提示、`@file` 注入提示、回车发送提示 |
+| 5 | **提交后 + 工具调用** — 按下回车后的 webui：用户消息已渲染、助手回合流式输出、（若模型选择）Bash / Read / Write 工具调用块，含结构化参数预览，调用结束后自动折叠箭头 |
+
+### 内联预览
+
+下方图片链接使用相对路径 `docs/screenshots/`，在插件树
+`plugins/Wzdhehe/mcode-webui/` 下可正确解析。
+
+![启动界面 — 首次启动的空白聊天视图](docs/screenshots/01-startup.png)
+
+![对话中段 — Greeting 会话已加载，SSE delta 进行中](docs/screenshots/02-chat-session.png)
+
+![设置面板 — 外观 / 语言 / 局域网访问开关](docs/screenshots/03-settings-panel.png)
+
+![输入框已输入 — 真实 prompt 加 send/stop 控件 + 斜杠提示](docs/screenshots/04-chat-typed.png)
+
+![提交后 + 工具调用 — 用户消息已渲染、助手 SSE delta 流式、工具调用块已展开](docs/screenshots/05-tool-call.png)
+
+> 想贡献截图？见 [CONTRIBUTING.md](CONTRIBUTING.md#screenshots)。
+
 ## 快速开始
 
 ```bash

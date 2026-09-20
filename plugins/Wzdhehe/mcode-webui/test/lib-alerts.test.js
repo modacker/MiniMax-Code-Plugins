@@ -14,6 +14,8 @@ import { test, describe, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const absPath = (rel) =>
     pathToFileURL(join(import.meta.dirname, "..", "server", rel)).href;
@@ -129,6 +131,76 @@ describe("pushAlert — dedup", () => {
         alerts.pushAlert({ level: "warn", msg: "y", src: "s", cid: "cid-1" });
         assert.equal(alerts.getAlertCount(), 2);
     });
+
+    test("dedup survives ring wrap (no collateral increment on stale index)", () => {
+        // Regression for V01 Finding 1:
+        //   When the ring buffer wraps, the _dedupIndex Map used to hold
+        //   {idx, ts} entries pointing at buffer positions. After a wrap,
+        //   those idx values were stale — _buffer[existing.idx] would
+        //   resolve to a *different* alert in the buffer, and the
+        //   count++ would corrupt that sibling alert. The previous code
+        //   only handled the case `cur.idx === 0` (the dropped entry was
+        //   at index 0); every other wrap leaked a stale entry.
+        //
+        //   Fix: _dedupIndex now stores the alert object reference, not
+        //   a buffer index. This test reproduces the original failure
+        //   mode and asserts no collateral increment occurs.
+        for (let i = 0; i < 100; i++) {
+            alerts.pushAlert({
+                level: "info",
+                msg: "m" + i,
+                src: "t",
+                cid: "c",
+            });
+        }
+        for (let i = 100; i < 105; i++) {
+            alerts.pushAlert({
+                level: "info",
+                msg: "m" + i,
+                src: "t",
+                cid: "c",
+            });
+        }
+        // Buffer now holds [m5..m104] (5 wraps, length 100). m50 sits
+        // at index 45. m55 sits at index 50 — exactly where the OLD
+        // broken dedup index would point if m50 had been re-pushed.
+        const r = alerts.pushAlert({
+            level: "info",
+            msg: "m50",
+            src: "t",
+            cid: "c",
+        });
+        assert.equal(r.msg, "m50", "dedup hit must return the original m50 alert");
+        assert.equal(r.count, 2, "m50 count must be incremented to 2");
+
+        const recent = alerts.getRecentAlerts();
+        assert.equal(recent.length, 100);
+
+        const m50 = recent.find((a) => a.msg === "m50");
+        assert.ok(m50, "m50 should still be in the ring buffer at index 45");
+        assert.equal(m50.count, 2);
+
+        const m55 = recent.find((a) => a.msg === "m55");
+        assert.ok(m55, "m55 should be in the ring buffer");
+        assert.equal(
+            m55.count,
+            1,
+            "m55 must NOT have its count incremented (the old bug would bump it to 2 because _buffer[50] used to point there)",
+        );
+
+        // The crucial regression assertion: the ONLY alert in the
+        // buffer with count > 1 is m50. Any other alert with count > 1
+        // means the dedup index was resolved against a stale buffer
+        // position — the original bug.
+        const collateral = recent
+            .filter((a) => a.count !== 1)
+            .map((a) => ({ msg: a.msg, count: a.count }));
+        assert.deepEqual(
+            collateral,
+            [{ msg: "m50", count: 2 }],
+            "only m50 should have count > 1; no collateral increments",
+        );
+    });
 });
 
 describe("pushAlert — SSE broadcast", () => {
@@ -218,6 +290,80 @@ describe("pushAlert — event-stream emission (B01 dependency)", () => {
         // give the dynamic-import microtask a tick to settle
         await new Promise((r) => setImmediate(r));
         assert.equal(alerts.getAlertCount(), 1);
+    });
+
+    test("audit write carries alert payload (id, msg, count, sessionId, data)", async () => {
+        // Regression for V01 Finding 2:
+        //   alerts.js used to call events.append(kind, { target, cid, id,
+        //   msg, count, sessionId, data }) — passing alert fields at the
+        //   top level of the `fields` object. events.append() only hoists
+        //   {target, cid, actor}; every other top-level field is
+        //   silently dropped. Result: the audit line ended up with
+        //   data: {} and ALL alert fields lost.
+        //
+        //   Fix: wrap alert fields inside `payload: {...}` per the
+        //   events.js contract. This test redirects events.ndjson via
+        //   MCODE_WEBUI_EVENTS_PATH, pushes an alert carrying sessionId
+        //   + data, waits for the fire-and-forget audit write, then
+        //   reads events.ndjson and asserts the payload survived.
+
+        const tmpDir = mkdtempSync(join(tmpdir(), "webui-alerts-audit-"));
+        const tmpEventsPath = join(tmpDir, "events.ndjson");
+        process.env.MCODE_WEBUI_EVENTS_PATH = tmpEventsPath;
+
+        // events.js is dynamic-imported by alerts.js on first push.
+        // We import it here too so we can clear its in-memory seq / hash
+        // state (otherwise a previous test's chain head leaks in).
+        const events = await import(absPath("lib/events.js"));
+        events._resetForTests();
+
+        try {
+            const a = alerts.pushAlert({
+                level: "error",
+                msg: "mcode subprocess crashed",
+                src: "chat:send",
+                cid: "cid-1",
+                sessionId: "mvs_test_session_xyz",
+                data: { exitCode: 1, signal: "SIGSEGV" },
+            });
+
+            // tryWriteEvent is fire-and-forget (async dynamic import +
+            // append). Give the microtask queue a chance to settle.
+            await new Promise((r) => setTimeout(r, 200));
+
+            const raw = readFileSync(tmpEventsPath, "utf8").trim();
+            const lines = raw.split("\n").filter((l) => l.length > 0);
+            assert.ok(
+                lines.length >= 1,
+                "events.ndjson should have at least one line after pushAlert",
+            );
+            const last = JSON.parse(lines[lines.length - 1]);
+
+            // Top-level hoisted fields
+            assert.equal(last.kind, "alert.error");
+            assert.equal(last.target, "chat:send");
+            assert.equal(last.cid, "cid-1");
+
+            // The crux of the regression: the payload must carry all
+            // alert fields. Under the old bug, last.data was {}.
+            assert.equal(typeof last.data.id, "string");
+            assert.equal(last.data.id, a.id);
+            assert.equal(last.data.msg, "mcode subprocess crashed");
+            assert.equal(last.data.count, 1);
+            assert.equal(last.data.sessionId, "mvs_test_session_xyz");
+            assert.deepEqual(last.data.data, {
+                exitCode: 1,
+                signal: "SIGSEGV",
+            });
+        } finally {
+            try {
+                rmSync(tmpDir, { recursive: true, force: true });
+            } catch {}
+            // Don't unset MCODE_WEBUI_EVENTS_PATH — other tests in the
+            // same suite may rely on it being absent for their own
+            // scoping. (This is a leaf test; the per-file after() in
+            // lib-events.test.js handles its own cleanup.)
+        }
     });
 });
 

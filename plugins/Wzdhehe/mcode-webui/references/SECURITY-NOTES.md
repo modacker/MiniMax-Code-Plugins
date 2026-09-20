@@ -89,6 +89,119 @@ The webui only forwards stdin / parses stdout / renders the SSE stream.
 
 ---
 
+## CORS / 跨源资源共享 (Cross-Origin Resource Sharing)
+
+> **Disclosure scope:** CORS configuration is **intentional** for v2.0
+> (LAN sharing — see §1 / `0.0.0.0` rationale). This section makes the
+> exact header values, threat model, and operator-facing mitigations
+> explicit per [OWASP CORS Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html#cross-origin-resource-sharing)
+> and red-line 7 (披露完整性 / disclosure completeness).
+
+### Configuration (verbatim)
+
+The CORS headers are set on **every** response in
+[`server/router.js`](server/router.js#L344-L348):
+
+```js
+res.setHeader("Access-Control-Allow-Origin", "*");
+res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
+res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+```
+
+This config is locked in by
+[`test/router-cors.test.js`](test/router-cors.test.js#L35) — the test
+"`Allow-Headers includes Authorization`" is a **reviewer-required
+assertion** added per v1.0.1 PR #16 review feedback (without
+`Authorization` in `Allow-Headers`, cross-origin `fetch()` calls with
+`Bearer` tokens would fail the preflight and never reach the handler).
+
+### Threat model — why this is intentional
+
+The webui's primary use case is browser-based access from a device on
+the same LAN as the server (phone, second laptop, tablet). Combined
+with the §1 default `0.0.0.0` bind, that means the browser client is
+**not** necessarily same-origin with the server — for example, a phone
+on `http://192.168.1.10:8080` may be served by a webui that the
+desktop launched on a different host. Without permissive CORS, those
+cross-origin clients can't talk to the API.
+
+The trade-off chosen for v2.0:
+
+- **Permissive CORS** (`Allow-Origin: *` + `Authorization` in
+  `Allow-Headers`) — enables browser clients on the LAN to authenticate
+  via `Authorization: Bearer <token>` without any origin pinning.
+- **Token gate stays mandatory** for non-loopback requests (see §2.3,
+  §9.1) — so unauthenticated cross-origin requests still 401.
+
+The alternative — an origin whitelist — was rejected for v2.0 because
+it would force every LAN operator to enumerate their phone / tablet /
+laptop origins before first use. That's a worse UX than the disclosure
+load this section carries.
+
+### Risk — cross-origin CSRF surface
+
+`Allow-Origin: *` + `Allow-Headers: Authorization` creates a **real
+cross-origin CSRF surface** when the token is in attacker-reachable
+storage (URL query string, `localStorage`, XSS-injected state):
+
+- Browsers do **not** block `fetch("http://server:8080/api/...", {
+  headers: { Authorization: "Bearer <stolen-token>" } })` from
+  `evil.com` because `Authorization` is a custom header, not a
+  credential (cookie). CORS preflight succeeds (the server echoes
+  `Allow-Headers: Content-Type, Authorization`); the actual request
+  executes with the stolen token.
+- The destructive endpoints in §3 — `DELETE /api/sessions/:id`,
+  `POST /api/settings {resetToken: true}`, `POST /api/settings
+  {readOnly: false}`, `POST /api/debug/inject` (when `DEBUG_INJECT=1`)
+  — all accept `Authorization: Bearer` and run cross-origin without
+  any further challenge.
+- Combined with §2.3 (token may travel in `?token=` query string and
+  end up in browser history / referer / proxy logs), an attacker who
+  exfiltrates the token — via XSS into a benign page, browser
+  extension, or proxy capture — can drive destructive operations from
+  any web origin without the victim's browser warning them.
+
+This is **not** a CSRF in the classical sense (no cookie / no GET-side
+state), but it is the modern equivalent: cross-origin authenticated
+request forgery, gated only by possession of the secret.
+
+### Mitigations (recommended for operators)
+
+In order of operational cost:
+
+1. **Loopback-only bind** — set `HOST=127.0.0.1` (see §1). Eliminates
+   the entire cross-origin surface because the server is unreachable
+   from any other device, let alone any other origin. This is the
+   default-recommended posture for desktop-only use.
+2. **Disable LAN broadcast** — `POST /api/settings {lanBroadcast:
+   false}` (see §3.3). Server returns 403 with a friendly page for
+   non-local requests. Does not change CORS, but kills the cross-device
+   attack surface that motivates permissive CORS in the first place.
+3. **Tighten the read-only gate** — flip on the read-only toggle
+   (§9): `POST /api/settings {readOnly: true}` makes non-local
+   `POST` / `DELETE` return 403. Cross-origin reads still work, but
+   the destructive endpoints become unreachable cross-origin.
+4. **Rotate the token before any cross-origin exposure** — operators
+   who open the server to the LAN and intend to use browser clients
+   from multiple origins should rotate the token (§9.3) so any
+   previously-leaked value becomes inert. The new value is broadcast
+   over SSE to live clients and stored in their `localStorage`.
+5. **Fork + patch `router.js`** for higher-security deployments —
+   replace `Allow-Origin: *` with a strict whitelist (the file is
+   ~3 lines; the change is reviewed in v1.0.1 PR #16 thread). Trade-off:
+   every browser origin must be enumerated before first use.
+
+### Cross-references
+
+- §1 — `0.0.0.0` rationale and LAN broadcast toggle
+- §2.3 — Token in URL query string (related exfiltration vector)
+- §3 — Destructive endpoints (`DELETE /api/sessions/:id`,
+  `POST /api/settings {resetToken: true}`, `/api/debug/*`)
+- §9 — Token auth gate + `auth.token_rotated` SSE broadcast
+- `test/router-cors.test.js` — locks the current configuration
+
+---
+
 ## 3. Destructive operations
 
 ### 3.1 `DELETE /api/sessions/:id` — **cross-deletes into mavis sqlite**
