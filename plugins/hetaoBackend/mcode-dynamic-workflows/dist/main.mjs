@@ -7682,7 +7682,7 @@ var require_cross_spawn = __commonJS({
     var cp = __require("child_process");
     var parse6 = require_parse();
     var enoent = require_enoent();
-    function spawn4(command, args, options) {
+    function spawn5(command, args, options) {
       const parsed = parse6(command, args, options);
       const spawned = cp.spawn(parsed.command, parsed.args, parsed.options);
       enoent.hookChildProcess(spawned, parsed);
@@ -7694,8 +7694,8 @@ var require_cross_spawn = __commonJS({
       result.error = result.error || enoent.verifyENOENTSync(result.status, parsed);
       return result;
     }
-    module.exports = spawn4;
-    module.exports.spawn = spawn4;
+    module.exports = spawn5;
+    module.exports.spawn = spawn5;
     module.exports.sync = spawnSync;
     module.exports._parse = parse6;
     module.exports._enoent = enoent;
@@ -7708,7 +7708,7 @@ import { resolve as resolve3, join as join4 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir as homedir2 } from "node:os";
 import { readFile as readFile3, writeFile, mkdir, open as open3, rename } from "node:fs/promises";
-import { spawn as spawn3 } from "node:child_process";
+import { spawn as spawn4 } from "node:child_process";
 
 // src/store.mjs
 import { DatabaseSync } from "node:sqlite";
@@ -13626,6 +13626,7 @@ function agentFailure(status, { maxSteps, timeoutMs, exitCode = null, cause = ""
 function failureError(details, usage = null) {
   return Object.assign(new Error(details.message), { details, usage });
 }
+var EXECUTOR_FAILURE_CODES = /* @__PURE__ */ new Set(["MCODE_START_FAILED", "MCODE_MISSING_RESULT", "MCODE_PROTOCOL_ERROR", "MCODE_CLEANUP_UNCONFIRMED", "MCODE_EXIT"]);
 
 // src/structured-output.mjs
 function structuredOutput(raw, validate2, stepId) {
@@ -13948,6 +13949,9 @@ import { realpath, open } from "node:fs/promises";
 import { constants as constants2 } from "node:fs";
 import { resolve as resolve2, relative, isAbsolute, sep } from "node:path";
 
+// src/availability.mjs
+import { spawn } from "node:child_process";
+
 // src/mcode-location.mjs
 import { access, stat, readFile, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
@@ -14066,8 +14070,81 @@ async function resolveMcode(command = "mcode", { env = process.env, home = homed
   return null;
 }
 
+// src/availability.mjs
+async function preflightMcode(command = "mcode", { args = [], env = process.env, timeoutMs = 2e4 } = {}) {
+  let cli = null;
+  try {
+    cli = await resolveMcode(command, { env });
+  } catch (e) {
+    return {
+      ok: false,
+      code: "MCODE_PREFLIGHT_FAILED",
+      executor: "mcode",
+      probe: null,
+      message: `MCode CLI \u89E3\u6790\u5931\u8D25\uFF1A${safeDetail(e.message)}`,
+      suggestion: "\u4FEE\u590D\u8BE5 CLI \u5B89\u88C5\u540E\u91CD\u8BD5\uFF1B\u672C\u6B21\u8FD0\u884C\u672A\u6267\u884C\u4EFB\u4F55 Agent\u3002"
+    };
+  }
+  if (!cli) {
+    return {
+      ok: false,
+      code: "MCODE_PREFLIGHT_FAILED",
+      executor: "mcode",
+      probe: null,
+      message: "\u627E\u4E0D\u5230 MCode CLI\uFF0C\u8BF7\u901A\u8FC7\u5B98\u65B9\u6E20\u9053\u5B89\u88C5\u5E76\u767B\u5F55\uFF0C\u518D\u6309 Skill \u7684 CLI preflight \u68C0\u67E5 mcode --version \u548C mcode exec --help\u3002",
+      suggestion: "\u5B89\u88C5\u6216\u4FEE\u590D mcode \u540E\u91CD\u8BD5\uFF1B\u672C\u6B21\u8FD0\u884C\u672A\u6267\u884C\u4EFB\u4F55 Agent\u3002"
+    };
+  }
+  const probe = await new Promise((resolve4) => {
+    const captured = { stdout: "", stderr: "" };
+    let timedOut = false;
+    const child = spawn(cli.command, [...cli.args, ...args, "--version"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    timer.unref();
+    for (const [stream, key] of [[child.stdout, "stdout"], [child.stderr, "stderr"]]) {
+      stream.setEncoding("utf8");
+      stream.on("data", (chunk) => {
+        const text = captured[key];
+        captured[key] = text.length + chunk.length > 8e3 ? text : text + chunk;
+      });
+    }
+    const finish = (result) => {
+      clearTimeout(timer);
+      resolve4(result);
+    };
+    child.on("error", (e) => finish({ exitCode: null, spawnError: e.code ?? safeDetail(e.message), ...captured, timedOut }));
+    child.on("close", (exitCode) => finish({ exitCode, spawnError: null, ...captured, timedOut }));
+  });
+  if (probe.exitCode === 0 && !probe.spawnError && !probe.timedOut) {
+    return {
+      ok: true,
+      executor: "mcode",
+      probe: "--version",
+      source: cli.source,
+      checkedAt: Date.now(),
+      version: probe.stdout.trim().split("\n").pop()?.slice(0, 120) || null
+    };
+  }
+  const cause = probe.timedOut ? `\u63A2\u6D4B\u8D85\u65F6\uFF08\u8D85\u8FC7 ${Math.round(timeoutMs / 1e3)} \u79D2\u672A\u9000\u51FA\uFF09` : probe.spawnError ? `\u65E0\u6CD5\u542F\u52A8\uFF08${probe.spawnError}\uFF09` : `mcode --version \u9000\u51FA\u7801 ${probe.exitCode ?? "\u672A\u77E5"}`;
+  const tail = safeDetail(probe.stderr.trim() || probe.stdout.trim()).slice(-300);
+  return {
+    ok: false,
+    code: "MCODE_PREFLIGHT_FAILED",
+    executor: "mcode",
+    probe: "--version",
+    exitCode: probe.exitCode,
+    spawnError: probe.spawnError,
+    ...tail ? { stderr: tail } : {},
+    message: `MCode CLI \u4E0D\u53EF\u7528\uFF1A${cause}${tail ? `\uFF1A${tail}` : ""}\u3002\u672C\u6B21\u8FD0\u884C\u5DF2\u6309\u5931\u8D25\u5904\u7406\uFF0C\u672A\u6267\u884C\u4EFB\u4F55 Agent\u3002`,
+    suggestion: "\u5148\u5728\u7EC8\u7AEF\u8FD0\u884C mcode --version \u786E\u8BA4\u53EF\u7528\uFF1A\u68C0\u67E5 mcode \u5B89\u88C5\u4E0E\u5347\u7EA7\uFF08\u7248\u672C\u635F\u574F\u6216\u539F\u751F\u6A21\u5757\u4E0D\u5339\u914D\u65F6\u91CD\u88C5\uFF09\u3001\u767B\u5F55\u72B6\u6001\u4E0E\u7F51\u7EDC\uFF0C\u4FEE\u590D\u540E\u6062\u590D\u8FD0\u884C\u3002"
+  };
+}
+
 // src/executor.mjs
-import { spawn } from "node:child_process";
+import { spawn as spawn2 } from "node:child_process";
 
 // src/process-tree.mjs
 import { execFile } from "node:child_process";
@@ -14158,7 +14235,7 @@ async function mcodeExecute(spec, { signal, onEvent, workspace, command, args = 
     if (configPath) argv.push("--config", configPath);
     if (spec.model) argv.push("--model", spec.model);
     if (spec.effort) argv.push("--effort", spec.effort);
-    const child = spawn(command, argv, { cwd: workspace, shell: false, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: { ...process.env, MCODE_WORKFLOW_CHILD: "1" } });
+    const child = spawn2(command, argv, { cwd: workspace, shell: false, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: { ...process.env, MCODE_WORKFLOW_CHILD: "1" } });
     let buffer = "", stderr = "", terminal2 = null, protocolError = null, finished2 = false, completing = false, cleanup = null, watchdogExpired = false;
     const stop = () => {
       if (cleanup || finished2) return;
@@ -14399,6 +14476,14 @@ var Engine = class extends EventEmitter {
     this.store.saveTemplate(template);
     return template;
   }
+  // Executor preflight (fail-loud). Returns null when there is nothing to
+  // probe — demo runs, or a test-injected execute() that replaces the real
+  // CLI entirely. For mcode runs the result is stamped on the run as the
+  // readable `preflight` field surfaced by workflow_status.
+  async preflightExecutor(run) {
+    if (run.executor !== "mcode" || this.options.execute) return null;
+    return preflightMcode(this.options.command ?? "mcode", { args: this.options.args ?? [] });
+  }
   async approve(id2, { revision } = {}) {
     check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
     let run = this.store.get(id2);
@@ -14408,13 +14493,19 @@ var Engine = class extends EventEmitter {
     check(!this.approving.has(id2), "\u5DE5\u4F5C\u6D41\u6B63\u5728\u542F\u52A8");
     this.approving.add(id2);
     try {
-      if (run.executor === "mcode" && !this.options.execute) check(await resolveMcode(this.options.command ?? "mcode"), "\u627E\u4E0D\u5230 MCode CLI\uFF0C\u8BF7\u5B89\u88C5\u5E76\u767B\u5F55\u540E\u5F00\u59CB\u3002");
+      const preflight = await this.preflightExecutor(run);
+      if (preflight && !preflight.ok) {
+        Object.assign(run, { status: "failed", error: preflight.message, errorDetails: preflight, preflight });
+        this.save(run);
+        this.emitEvent(id2, "run.finished", { status: "failed", error: preflight.message });
+        check(false, preflight.message);
+      }
       const fingerprints = await this.fingerprints(run.input.files ?? []);
       run = this.store.get(id2);
       check(run?.status === "pending_review" && run.revision === revision, "\u5BA1\u6838\u7248\u672C\u5DF2\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u62D3\u6251\u540E\u518D\u5F00\u59CB");
       check(!this.closing && !this.active.has(id2) && this.active.size < 3, "\u670D\u52A1\u6B63\u5728\u5173\u95ED\u6216\u6267\u884C\u5BB9\u91CF\u5DF2\u6EE1");
       check(run.workspace === this.options.workspace, "\u5DE5\u4F5C\u533A\u5DF2\u6539\u53D8\uFF0C\u8BF7\u521B\u5EFA\u65B0\u5DE5\u4F5C\u6D41");
-      Object.assign(run, { fingerprints, approvedRevision: revision, approvedAt: Date.now() });
+      Object.assign(run, { fingerprints, approvedRevision: revision, approvedAt: Date.now(), ...preflight ? { preflight } : {} });
       this.save(run);
       this.emitEvent(id2, "run.approved", { revision });
       this.launch(run);
@@ -14535,8 +14626,26 @@ var Engine = class extends EventEmitter {
       await Promise.allSettled([...ctx.operations]);
       await worker.terminate();
       const steps = this.store.steps(run.id);
-      run.status = ctx.intent ?? (ok ? steps.some((s) => s.status !== "succeeded") ? "completed_with_gaps" : "succeeded" : "failed");
+      const agents = steps.filter((s) => s.kind === "agent");
+      const executorFailure = agents.find((s) => s.status !== "succeeded" && EXECUTOR_FAILURE_CODES.has(s.errorDetails?.code))?.errorDetails ?? null;
       if (ok && !ctx.intent) {
+        if (!agents.length && run.topology?.nodes?.some((n) => n.kind === "agent")) {
+          run.status = "failed";
+          run.errorDetails = {
+            code: "NO_AGENTS_EXECUTED",
+            plannedAgentNodes: run.topology.nodes.filter((n) => n.kind === "agent").length,
+            message: "\u811A\u672C\u5DF2\u5B8C\u6210\uFF0C\u4F46\u62D3\u6251\u4E2D\u8BA1\u5212\u7684 Agent \u8282\u70B9\u4E00\u4E2A\u90FD\u6CA1\u6709\u6267\u884C\uFF080 \u4E2A\u6B65\u9AA4\u88AB\u6D3E\u53D1\uFF09\u3002\u8FD0\u884C\u6309\u5931\u8D25\u5904\u7406\u3002",
+            suggestion: "\u68C0\u67E5\u811A\u672C\u662F\u5426\u5728 try/catch \u4E2D\u541E\u6389\u4E86\u542F\u52A8\u5931\u8D25\u5E76\u63D0\u524D\u8FD4\u56DE\uFF1B\u4FEE\u590D\u540E\u53EF\u6062\u590D\u8FD0\u884C\uFF0C\u5DF2\u6267\u884C\u8282\u70B9\u4F1A\u590D\u7528\u3002"
+          };
+          run.error = run.errorDetails.message;
+        } else if (executorFailure && !agents.some((s) => s.status === "succeeded")) {
+          run.status = "failed";
+          run.error = executorFailure.message;
+          run.errorDetails = executorFailure;
+        } else {
+          run.status = steps.some((s) => s.status !== "succeeded") ? "completed_with_gaps" : "succeeded";
+          if (executorFailure) run.errorDetails = executorFailure;
+        }
         try {
           boundedJSON(value, 1e5);
           run.result = value;
@@ -14545,6 +14654,7 @@ var Engine = class extends EventEmitter {
           run.error = e.message;
         }
       } else {
+        run.status = ctx.intent ?? "failed";
         const failure2 = workflowFailure(value);
         run.error = ctx.reason ?? failure2.message;
         run.errorDetails = ctx.failure ?? failure2.details ?? run.errorDetails;
@@ -14823,7 +14933,15 @@ var Engine = class extends EventEmitter {
     check(!run.revision || run.approvedRevision === run.revision, "\u672A\u5BA1\u6838\u5DE5\u4F5C\u6D41\u4E0D\u80FD\u6062\u590D\uFF0C\u8BF7\u521B\u5EFA\u65B0\u8349\u7A3F");
     check(["paused", "failed", "interrupted", "cancelled", "needs_attention", "completed_with_gaps"].includes(run.status), "\u5F53\u524D\u72B6\u6001\u4E0D\u80FD\u6062\u590D");
     check(run.status !== "needs_attention" || options.confirmStopped === true, "\u4E0A\u6B21\u5F02\u5E38\u9000\u51FA\uFF0C\u9700\u786E\u8BA4\u65E7 Agent \u5DF2\u505C\u6B62");
-    if (run.executor === "mcode" && !this.options.execute) check(await resolveMcode(this.options.command ?? "mcode"), "\u627E\u4E0D\u5230 MCode CLI\uFF0C\u8BF7\u5B89\u88C5\u5E76\u767B\u5F55\u540E\u6062\u590D\u3002");
+    const preflight = await this.preflightExecutor(run);
+    if (preflight) {
+      if (!preflight.ok) {
+        run.preflight = preflight;
+        this.save(run);
+        check(false, preflight.message);
+      }
+      run.preflight = preflight;
+    }
     assertValidDependencies(previewTopology(run.script, run.input));
     const limits = resolveLimits(options, runLimits(run)), maxCalls = options.maxCalls ?? run.maxCalls;
     check(Number.isInteger(maxCalls) && maxCalls >= 1 && maxCalls <= 100, "\u8C03\u7528\u6570\u8303\u56F4 1\u2013100");
@@ -27726,7 +27844,7 @@ if (values.stdio && process.env.MCODE_WORKFLOW_CHILD === "1") {
         const log = await open3(join4(dataDir, "service.log"), "a", 384);
         const args = [fileURLToPath(import.meta.url), "--workspace", workspace, "--data-dir", dataDir];
         for (const key of ["port", "mcode-script", "worker-config"]) if (values[key] !== void 0) args.push("--" + key, key === "port" ? values[key] : resolve3(values[key]));
-        const child = spawn3(process.execPath, args, { cwd: workspace, detached: true, stdio: ["ignore", log.fd, log.fd], windowsHide: true });
+        const child = spawn4(process.execPath, args, { cwd: workspace, detached: true, stdio: ["ignore", log.fd, log.fd], windowsHide: true });
         let spawnError;
         child.once("error", (e) => {
           spawnError = e;
