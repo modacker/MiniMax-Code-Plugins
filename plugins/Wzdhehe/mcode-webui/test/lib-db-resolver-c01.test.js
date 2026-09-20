@@ -40,6 +40,22 @@ const dbUrl = absPath("lib/db.js");
 
 let db;
 
+// v2 (2026-09-20 webui-manual-audit): pin MCODE_CMD to the PATH
+// placeholder BEFORE db.js (and thus config.js) is imported below —
+// config.js freezes MCODE_CMD at import time (env MCODE_CMD > repo
+// layout mcode.cmd > ~/.minimax-code/mcode.cmd > "mcode"), so a
+// per-test mutation in a before() hook would be too late. db.js only
+// emits MCODE_CMD-derived better-sqlite3 candidates when the value is
+// NOT the placeholder (db.js:122), so this pin (a) suppresses tier 2
+// on machines where an mcode.cmd layout exists and (b) neutralizes a
+// real-binary MCODE_CMD inherited from the developer's shell — either
+// would let the host load its better-sqlite3 and flip the D01
+// not-loaded tests to ok:true. Every other describe in this file
+// passes mcodeCmd explicitly, so the pin is inert outside D01.
+// Restored in the file-level after() below.
+const SAVED_MCODE_CMD = process.env.MCODE_CMD;
+process.env.MCODE_CMD = "mcode";
+
 before(async () => {
   db = await import(dbUrl);
 });
@@ -49,6 +65,8 @@ after(() => {
     "MCODE_BETTER_SQLITE3",
     "MCODE_WEBUI_RESOLVER_JSON",
   ]) delete process.env[k];
+  if (SAVED_MCODE_CMD === undefined) delete process.env.MCODE_CMD;
+  else process.env.MCODE_CMD = SAVED_MCODE_CMD;
 });
 
 // ---------------------------------------------------------------------------
@@ -364,10 +382,91 @@ describe("db.js — C01 built-in fallback ordering", () => {
 // ---------------------------------------------------------------------------
 describe("db.js — D01 deleteMcodeSessionFromDb pre-flight gates", () => {
   let realDbPath;
+  // v2 (2026-09-20 webui-manual-audit): env-isolation fixtures for the
+  // two not-loaded tests. They used to pass only on hosts where NO
+  // better-sqlite3 could load; the day the locally installed mcode
+  // (~/.minimax-code) bundled an ABI-compatible better-sqlite3, the
+  // resolver SUCCEEDED via tier 4a, the delete ran for real (ok:true),
+  // and both tests failed on that machine only. The fixtures pin EVERY
+  // resolver tier to a deterministic can't-load state, so the outcome
+  // is identical on loadable and unloadable hosts:
+  //   tier 1  MCODE_BETTER_SQLITE3 → package dir whose main throws at
+  //           module evaluation. Pure-JS throw: no native binding, no
+  //           ABI, no platform/Node-version dependence — unloadable
+  //           everywhere. NOTE the resolver does NOT short-circuit on
+  //           a failed env override: db.js:192-199 records the failure
+  //           and falls through to the next candidate, so the env
+  //           override alone can't force the branch — the remaining
+  //           tiers must be defeated too (that's what isoHome and the
+  //           resolver-json redirect below are for).
+  //   tier 2  MCODE_CMD — pinned to the "mcode" placeholder at the top
+  //           of this file (see SAVED_MCODE_CMD) → db.js:122 emits no
+  //           MCODE_CMD-derived candidates.
+  //   tier 3  MCODE_WEBUI_RESOLVER_JSON → nonexistent temp path →
+  //           _loadUserResolverConfig fails open to [] (db.js:86-89),
+  //           also masking any real ~/.mcode-webui/db-resolver.json
+  //           user pin that exists on the host.
+  //   tier 4a HOME/USERPROFILE → empty temp dir → <home>/.minimax-code/
+  //           lib/... doesn't exist. homedir() is re-read per call
+  //           (db.js:117 default param) and follows $HOME on POSIX /
+  //           $USERPROFILE on win32, so both are redirected.
+  //   tier 4b dev layout (<plugin-root>/node_modules/@minimax-ai/...)
+  //           is a repo-layout property, not env-defeatable — it does
+  //           not exist in this repo, so it always probes as missing.
+  // The first isolated probe also latches the resolver's sticky failure
+  // flag (_McodeBetterSqlite3Failed, db.js:40/184), so the second test
+  // returns via the cached-null path — same `if (!Db)` branch in
+  // deleteMcodeSessionFromDb either way. Each test re-applies the
+  // isolation itself so both stay deterministic under
+  // --test-name-pattern (single-test runs).
+  let isoDir; // parent of the tier-1 fixture + resolver-json decoy
+  let unloadablePkg; // tier-1 fixture: package dir that throws on require
+  let isoHome; // tier-4a fixture: empty home directory
   before(() => {
+    isoDir = mkdtempSync(join(tmpdir(), "mcode-d01-isolate-"));
+    unloadablePkg = join(isoDir, "better-sqlite3");
+    mkdirSync(unloadablePkg);
+    writeFileSync(
+      join(unloadablePkg, "package.json"),
+      JSON.stringify({ name: "better-sqlite3", main: "index.js" }),
+    );
+    writeFileSync(
+      join(unloadablePkg, "index.js"),
+      'throw new Error("D01 fixture: better-sqlite3 must not load");',
+    );
+    isoHome = mkdtempSync(join(tmpdir(), "mcode-d01-home-"));
     realDbPath = mkdtempSync(join(tmpdir(), "mcode-d01-realdb-")) + "/fixture.sqlite";
     writeFileSync(realDbPath, "");
   });
+  after(() => {
+    for (const d of [isoDir, isoHome]) {
+      try { rmSync(d, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  // Save/set/restore the process-global env exactly like the Tier-1
+  // describe blocks above (per-test set + finally-restore). Returns a
+  // restore() closure so both not-loaded tests share one implementation.
+  const isolateSqliteEnv = () => {
+    const keys = [
+      "MCODE_BETTER_SQLITE3",
+      "MCODE_WEBUI_RESOLVER_JSON",
+      "HOME",
+      "USERPROFILE",
+    ];
+    const saved = {};
+    for (const k of keys) saved[k] = process.env[k];
+    process.env.MCODE_BETTER_SQLITE3 = unloadablePkg;
+    process.env.MCODE_WEBUI_RESOLVER_JSON = join(isoDir, "no-resolver.json");
+    process.env.HOME = isoHome;
+    process.env.USERPROFILE = isoHome;
+    return () => {
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    };
+  };
 
   test("invalid sid → {ok:false, reason:'not_mcode_sid'} WITHOUT touching db", () => {
     const r = db.deleteMcodeSessionFromDb("not-a-mvs-id", {
@@ -390,24 +489,40 @@ describe("db.js — D01 deleteMcodeSessionFromDb pre-flight gates", () => {
 
   test("MCODE_RUNTIME_DB exists but better-sqlite3 not loaded → better_sqlite3_not_loaded", () => {
     // Real file so existsSync returns true. better-sqlite3 is the next
-    // gate. The function returns either {reason: "better_sqlite3_not_loaded"}
-    // or {error: <string>} depending on whether the resolver short-circuits.
-    const r = db.deleteMcodeSessionFromDb("mvs_abcdef0123456789abcdef0123456789", {
-      MCODE_RUNTIME_DB: realDbPath,
-    });
-    assert.equal(r.ok, false, "delete must not succeed when sqlite isn't loadable");
-    assert.ok(
-      r.reason === "better_sqlite3_not_loaded" || typeof r.error === "string",
-      `expected reason or error info, got ${JSON.stringify(r)}`,
-    );
+    // gate. With every resolver tier pinned to can't-load (see the
+    // fixture block above) the probe all-fails and
+    // getMcodeBetterSqlite3() returns null deterministically on ANY
+    // host — loadable or not. v2 (2026-09-20 webui-manual-audit):
+    // tightened from the old disjunctive assert ("reason OR error
+    // string", which only held when the host happened to be
+    // unloadable) to the exact gate return shape.
+    const restore = isolateSqliteEnv();
+    try {
+      const r = db.deleteMcodeSessionFromDb("mvs_abcdef0123456789abcdef0123456789", {
+        MCODE_RUNTIME_DB: realDbPath,
+      });
+      assert.deepEqual(r, { ok: false, reason: "better_sqlite3_not_loaded" });
+    } finally {
+      restore();
+    }
   });
 
   test("dry-run with unavailable better-sqlite3 still surfaces NOT ok", () => {
-    const r = db.deleteMcodeSessionFromDb("mvs_abcdef0123456789abcdef0123456789", {
-      MCODE_RUNTIME_DB: realDbPath,
-      dryRun: true,
-    });
-    assert.equal(r.ok, false, "dryRun must not succeed without sqlite either");
+    // v2 (2026-09-20 webui-manual-audit): same isolation re-applied so
+    // this test is deterministic even when run alone (--test-name-pattern),
+    // though the first test's all-fail probe already latched
+    // _McodeBetterSqlite3Failed for this process. Tightened from
+    // ok:false-only to the exact NOT-ok shape.
+    const restore = isolateSqliteEnv();
+    try {
+      const r = db.deleteMcodeSessionFromDb("mvs_abcdef0123456789abcdef0123456789", {
+        MCODE_RUNTIME_DB: realDbPath,
+        dryRun: true,
+      });
+      assert.deepEqual(r, { ok: false, reason: "better_sqlite3_not_loaded" });
+    } finally {
+      restore();
+    }
   });
 
   test("MCODE_SESSION_DELETE_TABLES has all expected table names (regression guard)", () => {

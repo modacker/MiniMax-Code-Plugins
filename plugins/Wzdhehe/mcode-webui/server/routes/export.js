@@ -25,9 +25,14 @@
 //   - ?download=true → Content-Disposition: attachment; filename="<slug>-<ts>.<ext>"
 
 import { loadSessions } from "../lib/sessions.js";
-import { existsSync } from "node:fs";
-import { MCODE_RUNTIME_DB } from "../lib/config.js";
-import { getMcodeBetterSqlite3 } from "../lib/db.js";
+// v2 (2026-09-20 webui-manual-audit): _readMcodeTranscript's core moved to
+// lib/transcript.js so POST /api/sessions/switch can share the exact same
+// table-probing + fail-soft logic. Default probe set there is the legacy
+// 3-candidate list carried over VERBATIM (same SQL, same row mapping, same
+// reason strings) — export behavior is unchanged. existsSync /
+// MCODE_RUNTIME_DB / getMcodeBetterSqlite3 are no longer imported here
+// because only the extracted reader used them.
+import { readMcodeTranscript } from "../lib/transcript.js";
 import { authorize } from "../lib/authorize.js";
 import { pushAlert } from "../lib/alerts.js";
 import {
@@ -224,75 +229,11 @@ function _parseChatLines(lines) {
 
 // Best-effort: read mcode session transcript from runtime-state.sqlite.
 // Returns { messages, ok } — ok=false means we set _meta.mcode_unavailable.
+// v2 (2026-09-20 webui-manual-audit): body extracted to lib/transcript.js
+// (readMcodeTranscript) — legacy probe set only, so this stays a pass-through
+// and export behavior is byte-identical to the inline version.
 function _readMcodeTranscript(mcodeSid) {
-  if (!mcodeSid) return { messages: [], ok: false, reason: "no_mcode_sid" };
-  if (!/^mvs_[a-f0-9]{32}$/.test(mcodeSid)) {
-    return { messages: [], ok: false, reason: "bad_mcode_sid" };
-  }
-  if (!existsSync(MCODE_RUNTIME_DB)) {
-    return { messages: [], ok: false, reason: "mcode_db_not_found" };
-  }
-  const Db = getMcodeBetterSqlite3();
-  if (!Db) {
-    return { messages: [], ok: false, reason: "better_sqlite3_not_loaded" };
-  }
-  let db;
-  try {
-    db = new Db(MCODE_RUNTIME_DB, { readonly: true });
-    // The mcode schema is unstable — try a handful of likely shapes.
-    // If none match, fail-soft and let the caller mark _meta.mcode_unavailable.
-    const candidates = [
-      {
-        table: "local_runtime_message_rows",
-        sql:
-          "SELECT role, content, tool_calls_json FROM local_runtime_message_rows WHERE session_id = ? ORDER BY seq ASC, ts ASC, rowid ASC",
-      },
-      {
-        table: "local_runtime_messages",
-        sql:
-          "SELECT role, content, tool_calls_json FROM local_runtime_messages WHERE session_id = ? ORDER BY seq ASC, ts ASC, rowid ASC",
-      },
-      {
-        table: "local_runtime_message_rows",
-        sql:
-          "SELECT role, content FROM local_runtime_message_rows WHERE session_id = ? ORDER BY rowid ASC",
-      },
-    ];
-    for (const c of candidates) {
-      try {
-        const rows = db.prepare(c.sql).all(mcodeSid);
-        if (Array.isArray(rows) && rows.length > 0) {
-          const msgs = rows
-            .map((r) => {
-              const role = (r && r.role) ? String(r.role).toLowerCase() : "system";
-              const content = (r && typeof r.content === "string") ? r.content : "";
-              let tool_calls = null;
-              if (r.tool_calls_json) {
-                try {
-                  const parsed = JSON.parse(r.tool_calls_json);
-                  if (Array.isArray(parsed)) tool_calls = parsed;
-                } catch {
-                  /* malformed — ignore */
-                }
-              }
-              const m = { role, content };
-              if (tool_calls) m.tool_calls = tool_calls;
-              return m;
-            })
-            .filter((m) => m.content || (m.tool_calls && m.tool_calls.length));
-          db.close();
-          return { messages: msgs, ok: true, source: c.table };
-        }
-      } catch {
-        // table missing or schema mismatch — try next
-      }
-    }
-    db.close();
-    return { messages: [], ok: false, reason: "no_matching_table" };
-  } catch (e) {
-    if (db) try { db.close(); } catch {}
-    return { messages: [], ok: false, reason: "db_error", error: e.message };
-  }
+  return readMcodeTranscript(mcodeSid);
 }
 
 // Merge webui messages + mcode transcript. Strategy: webui is authoritative

@@ -5,8 +5,8 @@
 
 import { applyI18n, applyTheme, currentLang, setLang, t, toggleTheme } from './i18n.js'
 import { MODE_ICONS, __DBG, escapeHtml, formatNumber, formatResetTime, formatTimeUntil, nextFiveHourReset, nextWeeklyReset, parseMarkdown, showToast } from './util.js'
-import { refreshSessions, API_SUFFIX, CID, CID_QUERY, HEADERS, TOKEN, TOKEN_QUERY, autoRefreshTimer, closeApiKeyModal, connect, es, getGeneralQuota, leftOpen, openApiKeyModal, refreshUsage, renderUsage, renderUsagePopover, renderUsageValue, rightOpen, sessionSearchQuery, setLeftOpen, setRightOpen, setSearchQuery, setSidebarReady, setState, state, toggleUsagePopover, tokenParam, urlParams } from './state.js'
-import { ASK_ANSWERS_LS_KEY, ASK_DISMISSED_LS_KEY, ASK_MODAL_STATE, DISMISSED_QUESTIONS, askModalNextOrSend, askModalPqKey, askModalSkip, attachStructuredBlockHandlers, bindAskModal, buildAskUserPrompt, cancelConfirm, clearAskPresentedKeys, closeAskModal, collapsedWorkspaces, collectAskBlock, collectPlanBlock, deleteSession, hideRightForWelcome, loadAskDismissed, loadAskUserAnswers, onAskModalOptClick, onAskModalOtherInput, openAskModal, openPlanModal, parseChatLines, render, renderAskBlock, renderAskModalContent, renderAskUserToolIfChanged, renderChat, renderContext, renderGoal, renderLanCardContent, renderMessage, renderPlanBlock, renderRight, renderSessions, renderTodo, renderUserFooter, resetAskDismissed, saveAskDismissed, saveAskUserAnswers, saveCollapsedWorkspaces, sendAskAnswer, setAskUserAnswer, submitAskModal, suppressAskModal, switchSession, wsShortName } from './render.js'
+import { refreshSessions, API_SUFFIX, CID, CID_QUERY, HEADERS, TOKEN, TOKEN_QUERY, autoRefreshTimer, clearAlerts, closeApiKeyModal, connect, es, getGeneralQuota, getPendingAuthRequests, leftOpen, markAllAlertsRead, openApiKeyModal, refreshUsage, renderUsage, renderUsagePopover, renderUsageValue, rightOpen, sessionSearchQuery, setLeftOpen, setRightOpen, setSearchQuery, setSidebarReady, setState, state, submitAuthDecision, toggleUsagePopover, tokenParam, urlParams } from './state.js'
+import { ASK_ANSWERS_LS_KEY, ASK_DISMISSED_LS_KEY, ASK_MODAL_STATE, AUTH_MODAL_STATE, DISMISSED_QUESTIONS, askModalNextOrSend, askModalPqKey, askModalSkip, attachStructuredBlockHandlers, bindAskModal, buildAskUserPrompt, cancelConfirm, clearAskPresentedKeys, closeAskModal, collapsedWorkspaces, collectAskBlock, collectPlanBlock, deleteSession, hideRightForWelcome, loadAskDismissed, loadAskUserAnswers, onAskModalOptClick, onAskModalOtherInput, openAskModal, openPlanModal, parseChatLines, render, renderAlerts, renderAskBlock, renderAskModalContent, renderAskUserToolIfChanged, renderChat, renderContext, renderGoal, renderLanCardContent, renderMessage, renderPlanBlock, renderRight, renderSessions, renderTodo, renderUserFooter, resetAskDismissed, saveAskDismissed, saveAskUserAnswers, saveCollapsedWorkspaces, sendAskAnswer, setAskUserAnswer, submitAskModal, suppressAskModal, switchSession, wsShortName } from './render.js'
 
 export let slashOpen = false
 export let slashQuery = ''
@@ -455,6 +455,20 @@ export function attachEvents() {
   if (btnAppearance) {
     btnAppearance.addEventListener('click', (e) => {
       e.stopPropagation()
+      // v2 (2026-09-20 webui-manual-audit D3): click now CYCLES the theme
+      //   (toggleTheme — applies data-theme + persists to localStorage
+      //   'webui-theme' + re-syncs the card checkbox/label/icon) AND
+      //   toggles the appearance card open, in that order. Root cause of
+      //   the audit finding "clicking does nothing": the v2026-08-28
+      //   rework made the button ONLY reveal the card (whose theme toggle
+      //   checkbox then needed a second, discoverable-only-by-trial
+      //   interaction) — a click on the button itself had no directly
+      //   observable effect (data-theme never moved, and the card is a
+      //   .lan-card, invisible to any popover probe). Cycling here gives
+      //   immediate feedback; the card still opens so the 套餐用量
+      //   "启用" toggle (the quota master switch) stays reachable, and
+      //   applyTheme() keeps its checkbox in sync with the cycled state.
+      toggleTheme()
       toggleAppearanceCard()
     })
   }
@@ -499,6 +513,47 @@ export function attachEvents() {
   document.getElementById('btn-usage').addEventListener('click', (e) => {
     e.stopPropagation()
     toggleUsagePopover()
+  })
+
+  // ----------------------------------------------------------------
+  // v2 (2026-09-20 webui-manual-audit D1): anomaly-channel bell —
+  //   topbar #btn-alerts toggles #alerts-popover. Opening marks all
+  //   current alerts read (badge drops, list stays); the header's
+  //   清空 button empties the list (state.js clearAlerts keeps the
+  //   seen-id set so a reconnect snapshot can't resurrect the badge).
+  //   Bind-once here, DOM owned by render.js renderAlerts().
+  // ----------------------------------------------------------------
+  const btnAlerts = document.getElementById('btn-alerts')
+  const alertsPopover = document.getElementById('alerts-popover')
+  const alertsClear = document.getElementById('alerts-clear')
+  function setAlertsPopoverOpen(open) {
+    if (!alertsPopover || !btnAlerts) return
+    alertsPopover.hidden = !open
+    btnAlerts.setAttribute('aria-expanded', open ? 'true' : 'false')
+    if (open) {
+      // Marking-read on open — the popover shows the full list either
+      // way; the badge is purely "not yet looked at".
+      markAllAlertsRead()
+      renderAlerts()
+    }
+  }
+  if (btnAlerts) {
+    btnAlerts.addEventListener('click', (e) => {
+      e.stopPropagation()
+      setAlertsPopoverOpen(alertsPopover ? alertsPopover.hidden : false)
+    })
+  }
+  if (alertsClear) {
+    alertsClear.addEventListener('click', (e) => {
+      e.stopPropagation()
+      clearAlerts()
+    })
+  }
+  // Click outside closes (same pattern as the usage popover / lan card).
+  document.addEventListener('click', (e) => {
+    if (!alertsPopover || alertsPopover.hidden) return
+    if (alertsPopover.contains(e.target) || (btnAlerts && btnAlerts.contains(e.target))) return
+    setAlertsPopoverOpen(false)
   })
 
   // v0.5.ak: 模型切换 — btn-model click 弹 model-picker popover
@@ -1826,6 +1881,64 @@ export function attachModalEvents() {
   on('ask-modal', 'click', (e) => {
     if (e.target.id === 'ask-modal') closeAskModal()
   })
+  // v2 (2026-09-20 webui-manual-audit): authorize modal Approve/Deny →
+  // POST /api/auth/decision (state.js submitAuthDecision, which owns the
+  // queue removal on 200/404). One decision per request: both buttons
+  // disable on the first click and stay disabled while the POST is in
+  // flight (render.js respects AUTH_MODAL_STATE.decidingRequestId and
+  // does not re-enable them on re-render); fetch failure shows inside
+  // the modal and re-enables so the user can retry. NEVER auto-approves
+  // on any condition — countdown hitting 00:00 is visual only, the
+  // server's 5-minute fail-closed timeout is the authority.
+  const authApproveBtn = $('auth-modal-approve')
+  const authDenyBtn = $('auth-modal-deny')
+  const authErr = $('auth-modal-error')
+  const decideAuth = async (approve) => {
+    const req = getPendingAuthRequests()[0]
+    if (!req) return
+    // One decision per request: a POST for THIS head request already in
+    // flight → ignore. (Compared by id, not truthiness — a stale id left
+    // over from the previous, already-resolved head must not block the
+    // next request's decision.)
+    if (AUTH_MODAL_STATE.decidingRequestId === req.requestId) return
+    AUTH_MODAL_STATE.decidingRequestId = req.requestId
+    if (authApproveBtn) authApproveBtn.disabled = true
+    if (authDenyBtn) authDenyBtn.disabled = true
+    if (authErr) { authErr.hidden = true; authErr.textContent = '' }
+    let r = null
+    try {
+      r = await submitAuthDecision(req.requestId, approve)
+    } catch (e) {
+      // network error — surface inside the modal + allow retry
+      AUTH_MODAL_STATE.decidingRequestId = null
+      if (authApproveBtn) authApproveBtn.disabled = false
+      if (authDenyBtn) authDenyBtn.disabled = false
+      if (authErr) {
+        authErr.hidden = false
+        authErr.textContent = `${t('auth_decision_failed')}: ${e?.message || String(e)}`
+      }
+      return
+    }
+    if (!(r && (r.ok || r.status === 404))) {
+      // Real failure (400 / 5xx …) — surface + allow retry. 200/404 are
+      // already handled inside submitAuthDecision (local queue removal
+      // + modal re-render closes or advances).
+      AUTH_MODAL_STATE.decidingRequestId = null
+      if (authApproveBtn) authApproveBtn.disabled = false
+      if (authDenyBtn) authDenyBtn.disabled = false
+      if (authErr) {
+        let msg = `${t('auth_decision_failed')}${r && r.status ? ' (HTTP ' + r.status + ')' : ''}`
+        try {
+          const j = await r.json()
+          if (j && j.error) msg += ': ' + j.error
+        } catch {}
+        authErr.hidden = false
+        authErr.textContent = msg
+      }
+    }
+  }
+  if (authApproveBtn) authApproveBtn.addEventListener('click', () => decideAuth(true))
+  if (authDenyBtn) authDenyBtn.addEventListener('click', () => decideAuth(false))
   // Plan
   on('plan-close', 'click', () => {
     fetch('/api/answer' + API_SUFFIX, {

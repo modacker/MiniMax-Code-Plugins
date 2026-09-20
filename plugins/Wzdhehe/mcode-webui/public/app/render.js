@@ -1,10 +1,11 @@
 // webui/public/app/render.js — REFACTORING.md batch 4 step 2
 // Owns: all render* functions, session list + actions, chat message
-// parsing/rendering, ask-modal cluster, collapsed-workspace prefs.
+// parsing/rendering, ask-modal cluster, auth-modal (authorize) cluster,
+// collapsed-workspace prefs.
 
 import { applyI18n, applyTheme, currentLang, setLang, t, toggleTheme } from './i18n.js'
 import { MODE_ICONS, __DBG, escapeHtml, formatNumber, formatResetTime, formatTimeUntil, nextFiveHourReset, nextWeeklyReset, parseMarkdown, showToast } from './util.js'
-import { setLeftOpen, setRightOpen, API_SUFFIX, sidebarReady, CID, CID_QUERY, HEADERS, TOKEN, TOKEN_QUERY, autoRefreshTimer, connect, es, getGeneralQuota, leftOpen, refreshUsage, renderUsage, renderUsagePopover, renderUsageValue, rightOpen, sessionSearchQuery, setSearchQuery, setSidebarReady, setState, state, toggleUsagePopover, tokenParam, urlParams } from './state.js'
+import { setLeftOpen, setRightOpen, API_SUFFIX, sidebarReady, CID, CID_QUERY, HEADERS, TOKEN, TOKEN_QUERY, autoRefreshTimer, connect, es, getAlerts, getAlertsUnread, getGeneralQuota, getPendingAuthRequests, leftOpen, refreshUsage, renderUsage, renderUsagePopover, renderUsageValue, rightOpen, sessionSearchQuery, setSearchQuery, setSidebarReady, setState, state, toggleUsagePopover, tokenParam, urlParams } from './state.js'
 import { SLASH_COMMANDS, SLASH_SKILLS, attachEvents, attachModalEvents, attachedFiles, attachmentList, autoResize, checkModals, fileInput, filterSlash, hideMode, hidePerm, hidePlan, hidePlanMode, hideSettings, hideSlash, isSending, lastShownPermKey, lastShownPlanKey, lastShownPlanModeKey, modeOpen, modePopover, moveSlash, permOpen, planModeOpen, planOpen, planSending, removeAttachment, renderAttachments, renderPerm, renderPlan, selectSlash, send, sendPermAnswer, sendPlanAnswer, sendPlanModeAnswer, setMode, settingsMenu, showPerm, showPlan, showPlanMode, showSlash, slashActiveIdx, slashFiltered, slashInput, slashOpen, slashOverlay, slashQuery, slashResults, stopExec, toggleLang, toggleMode, toggleSettings, uploadFiles } from './events.js'
 // v2 (Lease C04): chat-list virtualization. The pure-logic helpers
 //   (computeVirtualWindow / decideScrollBehavior / isNearBottom /
@@ -197,6 +198,11 @@ export function render() {
 
   // Modals (v0.4.0)
   checkModals()
+  // v2 (2026-09-20 webui-manual-audit): keep the authorize modal fresh
+  // through full re-renders (language toggle / state pushes refresh the
+  // dynamic action + ctx labels through here). Idempotent — closes
+  // itself when the pending queue is empty.
+  renderAuthModal()
 }
 
 export function renderRight() {
@@ -1726,6 +1732,313 @@ export function bindAskModal() {
 }
 // v0.5.bx-13: 立即绑定弹窗 (modal HTML 已在 script 之前, 直接能 getElementById)
 bindAskModal()
+
+// ============================================================
+// v2 (2026-09-20 webui-manual-audit): authorize modal — begin auth-modal
+//
+// Per-request authorization gate UI (server/lib/authorize.js, Lease B03).
+// Follows the ask_user modal pattern: static markup in index.html
+// (#auth-modal), module-level state that survives re-renders, display
+// toggling, bind-once wiring (events.js attachModalEvents).
+//
+// Deliberate difference from the ask_user modal: NO dismiss path (no ×
+// button, no backdrop click, no Esc). Closing without deciding would
+// strand the request until the server's 5-minute timeout with no way to
+// re-open the modal; Deny is the explicit "no" and stays one click away.
+// Fail-closed by design (ANTI-PATTERNS-FIX-PLAN §AP6/§AP10).
+//
+// SECURITY (CodeQL js/xss-through-dom): requestId / action / ctx come
+// off the SSE wire — untrusted. Everything dynamic is built with DOM
+// construction + textContent, never innerHTML with interpolated values
+// (same style as the session-confirm bar, see render-static.test.js).
+// ============================================================
+export const AUTH_MODAL_STATE = {
+  countdownTimer: null,    // setInterval handle for the mm:ss ticking
+  decidingRequestId: null, // v2: requestId with a decision POST in flight —
+                           // a re-render must NOT re-enable its buttons
+                           // (one decision per request)
+}
+
+// The 8 whitelist actions (server/lib/authorize.js AUTHORIZE_ACTIONS)
+// → i18n keys for readable names. Unknown actions fall back to the raw
+// action string (server may add whitelist entries before the UI does).
+const AUTH_ACTION_I18N_KEYS = {
+  'session.delete': 'auth_action_session_delete',
+  'sessions.cleanup-orphans': 'auth_action_sessions_cleanup_orphans',
+  'session.cleanup-all': 'auth_action_session_cleanup_all',
+  'session.export': 'auth_action_session_export',
+  'session.search': 'auth_action_session_search',
+  'token.reset': 'auth_action_token_reset',
+  'slash.clear': 'auth_action_slash_clear',
+  'startup.cleanup': 'auth_action_startup_cleanup',
+}
+export function authActionLabel(action) {
+  const key = AUTH_ACTION_I18N_KEYS[action]
+  if (key) {
+    const s = t(key)
+    if (s && s !== key) return s
+  }
+  return action || ''
+}
+
+// Known ctx fields → friendly labels (fields the server call sites
+// actually send: sessions.js / export.js / slash.js / cleanup.js).
+// Unknown fields render generically with the raw key. `cid` is skipped
+// in buildAuthCtxList — it is SSE routing, not user-facing context.
+const AUTH_CTX_I18N_KEYS = {
+  targetSessionId: 'auth_ctx_targetSessionId',
+  matchKind: 'auth_ctx_matchKind',
+  isMcodeSid: 'auth_ctx_isMcodeSid',
+  isOrphan: 'auth_ctx_isOrphan',
+  chatLen: 'auth_ctx_chatLen',
+  q: 'auth_ctx_q',
+  workspace: 'auth_ctx_workspace',
+  limit: 'auth_ctx_limit',
+  format: 'auth_ctx_format',
+  download: 'auth_ctx_download',
+  orphanCount: 'auth_ctx_orphanCount',
+  orphanIds: 'auth_ctx_orphanIds',
+  cmd: 'auth_ctx_cmd',
+  sessionId: 'auth_ctx_sessionId',
+  mcodeSessionId: 'auth_ctx_mcodeSessionId',
+  source: 'auth_ctx_source',
+}
+function authCtxLabel(key) {
+  const ik = AUTH_CTX_I18N_KEYS[key]
+  if (ik) {
+    const s = t(ik)
+    if (s && s !== ik) return s
+  }
+  return key
+}
+
+// mm:ss, clamped at 00:00. Pure so the mocked check can unit-test the
+// math without a ticking interval.
+export function formatAuthCountdown(msLeft) {
+  const s = Math.max(0, Math.ceil((Number(msLeft) || 0) / 1000))
+  const mm = String(Math.floor(s / 60)).padStart(2, '0')
+  const ss = String(s % 60).padStart(2, '0')
+  return `${mm}:${ss}`
+}
+
+function _stopAuthCountdown() {
+  if (AUTH_MODAL_STATE.countdownTimer) {
+    clearInterval(AUTH_MODAL_STATE.countdownTimer)
+    AUTH_MODAL_STATE.countdownTimer = null
+  }
+}
+
+function _startAuthCountdown(expiresAt) {
+  _stopAuthCountdown()
+  const el = document.getElementById('auth-modal-countdown')
+  if (!el) return
+  const tick = () => {
+    // VISUAL ONLY. Hitting 00:00 here must never decide anything — the
+    // server owns the timeout (fail-closed decline at expiresAt) and
+    // broadcasts authorization_decided when it fires. This tick does
+    // nothing but write textContent.
+    el.textContent = formatAuthCountdown((Number(expiresAt) || 0) - Date.now())
+  }
+  tick()
+  AUTH_MODAL_STATE.countdownTimer = setInterval(tick, 1000)
+}
+
+// Compact key/value list for the request's ctx. DOM construction only —
+// ctx values (session ids, paths, query strings) are untrusted wire
+// data; objects/arrays (orphanIds) are JSON-stringified.
+function buildAuthCtxList(ctx) {
+  const wrap = document.createElement('div')
+  wrap.className = 'auth-modal-ctx'
+  if (!ctx || typeof ctx !== 'object') return wrap
+  for (const key of Object.keys(ctx)) {
+    if (key === 'cid') continue // SSE routing field, not user-facing
+    let val = ctx[key]
+    if (val === null || val === undefined) continue
+    if (typeof val === 'object') {
+      try { val = JSON.stringify(val) } catch { val = String(val) }
+    }
+    const row = document.createElement('div')
+    row.className = 'auth-modal-ctx-row'
+    row.style.display = 'flex'
+    row.style.gap = '8px'
+    row.style.fontSize = '12px'
+    const k = document.createElement('span')
+    k.className = 'auth-modal-ctx-key'
+    k.style.minWidth = '90px'
+    k.style.opacity = '0.7'
+    k.textContent = authCtxLabel(key)
+    const v = document.createElement('span')
+    v.className = 'auth-modal-ctx-value'
+    v.style.wordBreak = 'break-all'
+    v.textContent = String(val)
+    row.appendChild(k)
+    row.appendChild(v)
+    wrap.appendChild(row)
+  }
+  return wrap
+}
+
+export function renderAuthModal() {
+  const modal = document.getElementById('auth-modal')
+  if (!modal) return
+  const pending = getPendingAuthRequests()
+  if (pending.length === 0) {
+    closeAuthModal()
+    return
+  }
+  // Show one request at a time, in arrival (queue) order.
+  const req = pending[0]
+  modal.style.display = 'flex'
+  const pos = document.getElementById('auth-modal-position')
+  if (pos) {
+    pos.textContent = pending.length > 1
+      ? t('auth_queue_pos').replace('{i}', 1).replace('{n}', pending.length)
+      : ''
+  }
+  const actionEl = document.getElementById('auth-modal-action')
+  if (actionEl) actionEl.textContent = authActionLabel(req.action)
+  const ctxEl = document.getElementById('auth-modal-ctx')
+  if (ctxEl) {
+    ctxEl.textContent = ''
+    ctxEl.appendChild(buildAuthCtxList(req.ctx))
+  }
+  // Reset the decision UI for the head request — EXCEPT when a decision
+  // POST is already in flight for it (events.js sets decidingRequestId):
+  // one decision per request, so a re-render must not re-enable those
+  // buttons. Advancing to a different head request re-enables normally;
+  // a decidingRequestId left over from the PREVIOUS (already-resolved)
+  // head is stale and cleared here so it cannot block the next decision.
+  if (AUTH_MODAL_STATE.decidingRequestId && AUTH_MODAL_STATE.decidingRequestId !== req.requestId) {
+    AUTH_MODAL_STATE.decidingRequestId = null
+  }
+  const deciding = AUTH_MODAL_STATE.decidingRequestId === req.requestId
+  const approveBtn = document.getElementById('auth-modal-approve')
+  const denyBtn = document.getElementById('auth-modal-deny')
+  const errEl = document.getElementById('auth-modal-error')
+  if (approveBtn) approveBtn.disabled = deciding
+  if (denyBtn) denyBtn.disabled = deciding
+  if (errEl && !deciding) {
+    errEl.hidden = true
+    errEl.textContent = ''
+  }
+  _startAuthCountdown(req.expiresAt)
+}
+
+export function closeAuthModal() {
+  _stopAuthCountdown()
+  AUTH_MODAL_STATE.decidingRequestId = null
+  const modal = document.getElementById('auth-modal')
+  if (modal) modal.style.display = 'none'
+}
+// v2 (2026-09-20 webui-manual-audit): authorize modal — end auth-modal
+
+// ============================================================
+// v2 (2026-09-20 webui-manual-audit D1): anomaly-channel (alerts)
+// surface — begin alerts-surface
+//
+// The bell half of lease B02 §AP3: server/lib/alerts.js pushes system
+// signals on the independent /api/alerts SSE channel; state.js owns the
+// connection + module-level store (survives full-state re-renders, same
+// rationale as the auth queue); THIS block renders it. The badge is
+// cheap and updated on EVERY call; the list is only rebuilt while the
+// popover is open (closed → skip — render() storms never rebuild it).
+//
+// SECURITY (CodeQL js/xss-through-dom): msg / src / sessionId / id are
+// untrusted SSE wire data (server relays raw error text from the mcode
+// subprocess). Everything dynamic is DOM construction + textContent,
+// never innerHTML — same style as buildAuthCtxList above.
+// ============================================================
+
+// Compact HH:MM for the item meta line. Pure (no Date.now) so the
+// mocked check can pin ts values. Non-finite / non-positive ts (field
+// missing on a malformed frame) renders '' rather than a fake epoch
+// time — _normalizeAlert coerces junk to 0, so 0 means "no timestamp".
+export function formatAlertTime(ts) {
+  const n = Number(ts)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  const d = new Date(n)
+  if (isNaN(d.getTime())) return ''
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `${hh}:${mm}`
+}
+
+// Session hint — sessionId can be a long randomUUID; show the head
+// only (enough to tell WHICH tab/session the alert belongs to).
+export function shortSessionHint(sid) {
+  const s = String(sid || '')
+  return s.length > 12 ? `${s.slice(0, 12)}…` : s
+}
+
+const ALERT_LEVEL_I18N_KEYS = {
+  info: 'alerts_level_info',
+  warn: 'alerts_level_warn',
+  error: 'alerts_level_error',
+}
+export function alertLevelLabel(level) {
+  const key = ALERT_LEVEL_I18N_KEYS[level]
+  if (key) {
+    const s = t(key)
+    if (s && s !== key) return s
+  }
+  return level || 'info'
+}
+
+// One list row: [level glyph] [msg / meta(src · session · ×count · time)]
+function buildAlertItem(a) {
+  const item = document.createElement('div')
+  item.className = `alerts-item level-${a.level}`
+  item.title = alertLevelLabel(a.level)
+  const icon = document.createElement('span')
+  icon.className = 'alerts-item-level'
+  icon.textContent = a.level === 'error' ? '✕' : (a.level === 'warn' ? '!' : 'i')
+  icon.setAttribute('aria-hidden', 'true')
+  const main = document.createElement('div')
+  main.className = 'alerts-item-main'
+  const msg = document.createElement('div')
+  msg.className = 'alerts-item-msg'
+  msg.textContent = a.msg || ''
+  const meta = document.createElement('div')
+  meta.className = 'alerts-item-meta'
+  const parts = [a.src || 'system']
+  if (a.sessionId) parts.push(`${t('alerts_session')} ${shortSessionHint(a.sessionId)}`)
+  if (a.count > 1) parts.push(`×${a.count}`)
+  const timeStr = formatAlertTime(a.ts)
+  if (timeStr) parts.push(timeStr)
+  meta.textContent = parts.join(' · ')
+  main.appendChild(msg)
+  main.appendChild(meta)
+  item.appendChild(icon)
+  item.appendChild(main)
+  return item
+}
+
+export function renderAlerts() {
+  // Badge: unread count, 99+ cap, hidden at zero.
+  const badge = document.getElementById('alerts-badge')
+  if (badge) {
+    const n = getAlertsUnread()
+    badge.textContent = n > 99 ? '99+' : String(n)
+    badge.hidden = n <= 0
+  }
+  // List: only while the popover is open (the static markup holds the
+  // closed state; nothing to rebuild otherwise).
+  const popover = document.getElementById('alerts-popover')
+  if (!popover || popover.hidden) return
+  const body = document.getElementById('alerts-popover-body')
+  if (!body) return
+  body.textContent = ''
+  const alerts = getAlerts()
+  if (alerts.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'alerts-empty'
+    empty.textContent = t('alerts_empty')
+    body.appendChild(empty)
+    return
+  }
+  for (const a of alerts) body.appendChild(buildAlertItem(a))
+}
+// v2 (2026-09-20 webui-manual-audit D1): alerts surface — end alerts-surface
 
 // ============================================================
 // Ask User Tool (v0.5.bx-8: mcode 0.1.4 ask_user 工具 — 内嵌选项 + 跳过)

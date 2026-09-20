@@ -70,6 +70,24 @@ let _saveImpl = (arr) => {
   _sessionsStore = [...arr];
 };
 
+// v2 (2026-09-20 webui-manual-audit): mutable mcode-acp runner mock.
+//   Same dispatch-through pattern as _acpMock above: mock.module()
+//   throws ERR_INVALID_STATE on a second registration for the same
+//   specifier, and chat.js binds its runMcodeAcp import at first
+//   dynamic import — so a per-test "failed send" (ENOENT-style
+//   {status:"failed", error}) can only be injected by mutating the
+//   impl the registered wrapper dispatches to. Default mirrors the
+//   previous fixed success mock byte-for-byte, so existing suites
+//   see no behavior change.
+const _mcodeAcpMock = {
+  runMcodeAcp: async () => ({
+    status: "succeeded",
+    answer: "mocked",
+    sessionId: null,
+  }),
+  streamAcpPrompt: async () => ({ status: "succeeded", answer: "mocked" }),
+};
+
 let _lanBroadcast = false;
 let _readOnly = false;
 let _tokenEnabled = true;
@@ -100,6 +118,14 @@ export const acpMock = _acpMock;
 // (alternative to passing `overrides` to setupMocks at before() time)
 export function registerAcpMock(overrides) {
   Object.assign(_acpMock, overrides);
+}
+// v2 (2026-09-20 webui-manual-audit): imperative mutator for the
+//   mcode-acp runner mock — see the _mcodeAcpMock declaration for why
+//   dispatch-through (rather than a second mock.module) is the only
+//   way to flip runMcodeAcp to a failed result after chat.js has
+//   already been imported.
+export function registerMcodeAcpMock(overrides) {
+  Object.assign(_mcodeAcpMock, overrides);
 }
 export function registerSessionsStore({ initial = [], save } = {}) {
   _sessionsStore = [...initial];
@@ -153,6 +179,8 @@ export function setFileTokenPlanKey(v, p) {
  *   - acp: partial overrides for the acp-client.js mock (named exports)
  *   - sessions: { initial, save } for the lib/sessions.js mock
  *   - mavis: partial overrides for the lib/mavis-usage.js mock
+ *   - mcodeAcp: partial overrides for the lib/mcode-acp.js runner mock
+ *     (runMcodeAcp / streamAcpPrompt) — e.g. a failed-send result
  *   - lanBroadcast: boolean (default false)
  */
 export async function setupMocks(t, overrides = {}) {
@@ -217,6 +245,12 @@ export async function setupMocks(t, overrides = {}) {
       // defaults so handlers that import them don't blow up. Tests that
       // care about these can register their own via setupMocks overrides
       // (we'd need to add similar wrappers — not done yet).
+      // v2 (2026-09-20 webui-manual-audit): mirror the REAL
+      // resetContext claim reset (lib/sessions.js) — it now also drops
+      // cs.running + context.thinkingStatus so a mid-run switch can't
+      // park a permanent 思考中/stop-button claim. Without this parity,
+      // mocked route tests would keep exercising the old "claim
+      // survives the switch" contract and green-light regressions.
       resetContext: (cs) => {
         if (cs && cs.context) {
           cs.context.tokens = 0;
@@ -224,6 +258,19 @@ export async function setupMocks(t, overrides = {}) {
           cs.context.percent = 0;
           cs.context.estimated = true;
           cs.context.usageSource = null;
+          cs.context.thinkingStatus = "Idle";
+        }
+        if (cs) {
+          cs.running = {
+            active: false,
+            prompt: null,
+            pid: null,
+            startedAt: null,
+            model: null,
+            sessionId: null,
+            lastDeltaAt: null,
+            tps: 0,
+          };
         }
       },
       persistCurrentChat: () => {},
@@ -371,14 +418,16 @@ export async function setupMocks(t, overrides = {}) {
   }
 
   // 7. webui/lib/mcode-{acp,exec,rpc}.js — heavy mcode spawners
+  //    mcode-acp dispatches through the mutable _mcodeAcpMock (see its
+  //    declaration block) so failed-send tests can inject
+  //    {status:"failed"} results via overrides.mcodeAcp or
+  //    registerMcodeAcpMock() without a second mock.module call
+  //    (ERR_INVALID_STATE on re-registration).
+  if (overrides.mcodeAcp) Object.assign(_mcodeAcpMock, overrides.mcodeAcp);
   t.mock.module(absPath("lib/mcode-acp.js"), {
     namedExports: {
-      runMcodeAcp: async () => ({
-        status: "succeeded",
-        answer: "mocked",
-        sessionId: null,
-      }),
-      streamAcpPrompt: async () => ({ status: "succeeded", answer: "mocked" }),
+      runMcodeAcp: (...a) => _mcodeAcpMock.runMcodeAcp(...a),
+      streamAcpPrompt: (...a) => _mcodeAcpMock.streamAcpPrompt(...a),
     },
   });
   t.mock.module(absPath("lib/mcode-exec.js"), {

@@ -10,9 +10,15 @@ import { deleteMcodeSessionFromDb } from "../lib/db.js";
 import {
   getMcodeSessionTitle,
   getMcodeSessionsForWorkspace,
+  getMcodeSessionsCacheSync,
+  getMcodeSessionsStaleSync,
   shutdownMcodeAcpSingleton,
   dropMcodeSessionFromCache,
 } from "../lib/acp-client.js";
+// v2 (2026-09-20 webui-manual-audit): switch-path transcript backfill —
+// load mcode session history from the runtime DB so switching to an mvs_
+// session with no webui wrapper shows real chat instead of "No messages yet".
+import { loadTranscriptChatLines } from "../lib/transcript.js";
 import { applyMavisUsageToCs } from "../lib/mavis-usage.js";
 import { getMcodeModelLimit } from "../lib/models.js";
 import { pushStateFor, clients } from "../lib/state-bus.js";
@@ -69,6 +75,42 @@ async function readJson(req) {
   } catch {
     return {};
   }
+}
+
+// v2 (2026-09-20 webui-manual-audit): title fast path — resolve an mvs_
+// session's title from the in-memory walked-session cache (the same cache
+// behind GET /api/acp-sessions via getMcodeSessionsForWorkspace) BEFORE
+// ever awaiting getMcodeSessionTitle. The fallback boots the ACP child;
+// with a missing/broken mcode binary that measured ~2.17s end-to-end AND
+// degraded the title to the "Mcode session" placeholder even though the
+// cache already held the real title. Cache getters are sync and spawn
+// nothing, so a hit keeps the switch hot path at zero ACP cost.
+//
+// Cross-workspace matching within what the module exposes: the cache holds
+// ONE workspace's list, keyed by ws. We probe the client's current ws with
+// both the fresh (30s TTL) and stale (same-ws, TTL-expired) readers, plus
+// the "" key — getMcodeSessionsForWorkspace("") caches the UNFILTERED list,
+// so a cache walked without a workspace still answers. A miss returns null
+// and the caller falls back to getMcodeSessionTitle (original behavior).
+function _lookupCachedMcodeTitle(mcodeSessionId, ws) {
+  if (!mcodeSessionId) return null;
+  const keys = [ws || "", ""];
+  for (const wsKey of keys) {
+    for (const getter of [getMcodeSessionsCacheSync, getMcodeSessionsStaleSync]) {
+      let sessions = null;
+      try {
+        sessions = getter(wsKey);
+      } catch {
+        sessions = null;
+      }
+      if (!Array.isArray(sessions)) continue;
+      const hit = sessions.find(
+        (s) => s && s.sessionId === mcodeSessionId && s.title,
+      );
+      if (hit && hit.title) return hit.title;
+    }
+  }
+  return null;
 }
 
 // GET /api/sessions — list
@@ -167,8 +209,18 @@ export async function handleSwitchSession(req, res, ctx) {
   if (!target) {
     const isMcodeSid = /^mvs_[a-f0-9]{32}$/.test(id);
     if (isMcodeSid) {
-      const title = (await getMcodeSessionTitle(id)) || "Mcode session";
+      // v2 (2026-09-20 webui-manual-audit): cache-first title — the walked
+      // session cache usually already holds the real title (the sidebar just
+      // rendered it). Only a total cache miss pays the getMcodeSessionTitle
+      // cost, which boots the ACP child (~2.17s measured with a broken
+      // mcode binary) and used to degrade every first switch to the
+      // "Mcode session" placeholder.
       const ws = (cs.workspace && cs.workspace.dir) || "";
+      let title = _lookupCachedMcodeTitle(id, ws);
+      let titleSource = title ? "cache" : "acp";
+      if (!title) {
+        title = (await getMcodeSessionTitle(id)) || "Mcode session";
+      }
       target = {
         id: randomUUID(),
         mcodeSessionId: id,
@@ -181,7 +233,7 @@ export async function handleSwitchSession(req, res, ctx) {
       all.unshift(target);
       saveSessions(all);
       console.log(
-        `[switch] cid=${cid} created new webui session ${target.id.substring(0, 8)}… for mcode ${id.substring(0, 12)}… title="${title}"`,
+        `[switch] cid=${cid} created new webui session ${target.id.substring(0, 8)}… for mcode ${id.substring(0, 12)}… title="${title}" titleSource=${titleSource}`,
       );
     } else {
       console.log(
@@ -189,6 +241,64 @@ export async function handleSwitchSession(req, res, ctx) {
       );
       res.writeHead(404, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ ok: false, error: "session not found" }));
+    }
+  } else if (
+    // v2 (2026-09-20 webui-manual-audit): placeholder refresh — wrappers
+    // created by the branch above during the broken-title era carry the
+    // "Mcode session" placeholder forever. If the walked cache now has the
+    // real title, repair the stored wrapper. Cache-only (sync, no ACP
+    // boot): an existing wrapper must never make the hot path slower.
+    target.title === "Mcode session" &&
+    target.mcodeSessionId &&
+    /^mvs_[a-f0-9]{32}$/.test(target.mcodeSessionId)
+  ) {
+    const cachedTitle = _lookupCachedMcodeTitle(
+      target.mcodeSessionId,
+      (cs.workspace && cs.workspace.dir) || "",
+    );
+    if (cachedTitle) {
+      target.title = cachedTitle;
+      target.updatedAt = Date.now();
+      saveSessions(all);
+      console.log(
+        `[switch] cid=${cid} refreshed placeholder title for ${target.id.substring(0, 8)}… → "${cachedTitle}"`,
+      );
+    }
+  }
+  // v2 (2026-09-20 webui-manual-audit): transcript backfill — when the
+  // resolved target has NO webui chat yet but IS a real mvs_ session, load
+  // the mcode transcript from the runtime DB (read-only) and map it into
+  // the webui chat-line grammar BEFORE responding, so response session.chat
+  // and cs.chat carry history. Caps inside (last 400 lines / 200KB) keep
+  // the SSE state push bounded; a 1000+-message session must not balloon
+  // it. FAILURE MUST NOT BREAK SWITCHING: any error logs and continues
+  // with chat: [] — the switch itself always succeeds.
+  if (
+    target.mcodeSessionId &&
+    /^mvs_[a-f0-9]{32}$/.test(target.mcodeSessionId) &&
+    (!Array.isArray(target.chat) || target.chat.length === 0)
+  ) {
+    try {
+      const r = loadTranscriptChatLines(target.mcodeSessionId, {
+        dbPath: MCODE_RUNTIME_DB,
+      });
+      if (r.ok && r.lines.length > 0) {
+        target.chat = r.lines;
+        target.updatedAt = Date.now();
+        saveSessions(all); // persist the populated wrapper (updatedAt bumped)
+        console.log(
+          `[switch] cid=${cid} transcript backfill ${target.id.substring(0, 8)}… mcode=${target.mcodeSessionId.substring(0, 12)}… lines=${r.lines.length} msgs=${r.messageCount} probe=${r.probe}${r.truncated ? " (capped)" : ""}`,
+        );
+      } else if (!r.ok) {
+        console.log(
+          `[switch] cid=${cid} transcript unavailable for ${target.mcodeSessionId.substring(0, 12)}… reason=${r.reason || "unknown"}`,
+        );
+      }
+    } catch (e) {
+      console.warn(
+        `[switch] cid=${cid} transcript backfill failed for ${target.mcodeSessionId.substring(0, 12)}… (continuing with empty chat):`,
+        e && e.message ? e.message : e,
+      );
     }
   }
   const prevSid = cs.sessionId;

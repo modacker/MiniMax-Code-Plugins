@@ -55,6 +55,31 @@
         <span id="chip-lan-link-text">—</span>
       </a>
       <!-- v0.5.by: 顶栏 tok/s 移除 (侧栏 CONTEXT 已有, 重复) — Wzdhehe 反馈 -->
+      <!-- v2 (2026-09-20 webui-manual-audit D1): anomaly-channel bell.
+           server/lib/alerts.js pushes system-level signals (mcode spawn
+           failure, sqlite error, token expiry…) on the INDEPENDENT
+           /api/alerts SSE channel so error text never pollutes chat
+           lines — but public/ had zero surface for them, so a failed
+           chat send was completely invisible. This bell is that
+           surface: unread badge count, popover with recent alerts
+           (level color, msg, src, time, session hint), clear action,
+           marking-read on open. Wire data (msg/src/sessionId) is
+           rendered via DOM construction + textContent in render.js
+           renderAlerts() — never innerHTML (CodeQL js/xss-through-dom). -->
+      <button class="chip chip-alerts" id="btn-alerts" data-i18n-title="alerts_title" title="系统通知" aria-haspopup="true" aria-expanded="false">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+          <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+        </svg>
+        <span class="alerts-badge" id="alerts-badge" hidden></span>
+      </button>
+      <div class="alerts-popover" id="alerts-popover" role="dialog" aria-label="系统通知" hidden>
+        <div class="alerts-popover-header">
+          <span class="alerts-popover-title" data-i18n="alerts_title">系统通知</span>
+          <button class="alerts-popover-clear" id="alerts-clear" type="button" data-i18n="alerts_clear">清空</button>
+        </div>
+        <div class="alerts-popover-body" id="alerts-popover-body"></div>
+      </div>
     </div>
     <button class="btn-mobile-toggle" id="btn-toggle-right" title="详情" style="margin-left:auto">
       <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>
@@ -631,6 +656,40 @@
       <input type="text" id="ask-modal-other" class="ask-modal-other" placeholder="其他 (回车发送)..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" />
       <button class="ask-modal-btn-secondary" id="ask-modal-skip">跳过</button>
       <button class="ask-modal-btn-primary" id="ask-modal-send">发送</button>
+    </div>
+  </div>
+</div>
+
+<!-- v2 (2026-09-20 webui-manual-audit): per-request authorization modal —
+     server/lib/authorize.js gates destructive/sensitive actions (delete /
+     export / cross-workspace search / /clear / /new / token reset) behind a
+     fail-closed 5-min confirmation; this modal is the missing frontend half
+     (gated actions used to hang silently 5 min then decline). Follows the
+     #ask-modal pattern: static markup + display toggle; dynamic parts
+     (action label / ctx list / countdown / position) are set via textContent
+     + DOM construction in render.js (never innerHTML — wire data).
+     Deliberately NO close button / backdrop-click / Esc dismiss: the request
+     must be decided (or left to the server timeout); Deny is the "no". -->
+<div id="auth-modal" class="ask-modal" style="display:none" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
+  <div class="ask-modal-backdrop"></div>
+  <div class="ask-modal-content">
+    <div class="ask-modal-header">
+      <div class="ask-modal-icon">🔐</div>
+      <div class="ask-modal-title" id="auth-modal-title" data-i18n="auth_title">需要授权确认</div>
+      <div class="ask-modal-step-counter" id="auth-modal-position"></div>
+    </div>
+    <div class="ask-modal-body">
+      <div id="auth-modal-action" class="ask-modal-question" style="font-weight:600"></div>
+      <div id="auth-modal-ctx"></div>
+      <div class="auth-modal-countdown" style="margin-top:8px;font-size:12px;opacity:.75">
+        <span data-i18n="auth_expires_in">确认时限</span>
+        <span id="auth-modal-countdown" style="font-variant-numeric:tabular-nums;font-weight:600">--:--</span>
+      </div>
+      <div id="auth-modal-error" class="msg-tool-error" hidden></div>
+    </div>
+    <div class="ask-modal-footer">
+      <button class="ask-modal-btn-secondary" id="auth-modal-deny" data-i18n="auth_deny">拒绝</button>
+      <button class="ask-modal-btn-primary" id="auth-modal-approve" data-i18n="auth_approve">允许</button>
     </div>
   </div>
 </div>

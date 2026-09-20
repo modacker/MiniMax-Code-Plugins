@@ -30,6 +30,50 @@ async function readJson(req) {
   }
 }
 
+// v2 (2026-09-20 webui-manual-audit): resetThinkingClaim — drop every
+//   field by which the pushed state can claim "a run is in progress".
+//   The frontend's 思考中 indicator / send→stop button key off
+//   state.running.active, the footer status off
+//   state.context.thinkingStatus, and the chat virtual list marks a
+//   block as still-streaming when its line ends with the ▍ cursor.
+//   The streaming runners reset all of this in their finalize()
+//   (mcode-acp.js / mcode-exec.js), but a failure BEFORE the stream
+//   starts (acp client.start() ENOENT, session/load throw, exec
+//   resolveMcodeSpawn fail-closed) skips finalize entirely — so
+//   whatever claim cs carried into the turn survives every later
+//   pushStateFor and the panel shows 思考中 forever. Idle shape is
+//   byte-mirrored from finalize() + makeClientState() so the reset
+//   path and the normal end-of-turn path stay symmetric.
+//   lastUsageAt is deliberately NOT cleared: it records "when usage
+//   was last observed", not an active-run claim — finalize() keeps it
+//   too, and zeroing it would erase the context panel's freshness
+//   datum for no gain.
+function resetThinkingClaim(cs) {
+  cs.running = {
+    active: false,
+    prompt: null,
+    pid: null,
+    startedAt: null,
+    model: null,
+    sessionId: null,
+    lastDeltaAt: null,
+    tps: 0,
+  };
+  cs.context.thinkingStatus = "Idle";
+  cs.context.thinkingDuration = null;
+  cs.context.tps = 0;
+  // Strip the streaming cursor (▍) finalize() also strips — a line
+  // left marked "streaming" after a terminal failure keeps the chat
+  // block flickering as if the model were still writing.
+  if (Array.isArray(cs.chat)) {
+    cs.chat = cs.chat.map((line) =>
+      typeof line === "string" && line.endsWith(" ▍")
+        ? line.slice(0, -2)
+        : line,
+    );
+  }
+}
+
 // POST /api/send — main chat entry, fire-and-forget (response = ack; output via /api/events SSE)
 export async function handleSend(req, res, ctx) {
   const cs = ctx.cs;
@@ -159,6 +203,17 @@ export async function handleSend(req, res, ctx) {
     });
     cs.context.assistantLast = `[error] ${oneLine}`;
     cs.context.assistantAt = Date.now();
+    // v2 (2026-09-20 webui-manual-audit): a failed send is a TERMINAL
+    //   turn state — reset the thinking claim so the pushStateFor at
+    //   the end of this handler lands an at-rest state instead of
+    //   re-asserting whatever running/thinkingStatus cs carried in.
+    //   Without this, the context panel's 思考中 indicator never
+    //   clears (start-phase failures never reach the runners'
+    //   finalize()). The success branch needs no equivalent: by the
+    //   time r.status === "succeeded" is observed here, finalize()
+    //   has already run inside runMcodeAcp/collectExecResult and put
+    //   cs into exactly this idle shape.
+    resetThinkingClaim(cs);
   }
   persistCurrentChat(cs);
   pushStateFor(cid);
@@ -217,6 +272,23 @@ export async function handleStop(_req, res, ctx) {
         }
       } catch {}
     }, 2000).unref();
+  }
+  // v2 (2026-09-20 webui-manual-audit): zombie-run claim reset. If no
+  //   active child backs this cid but cs still claims an active run
+  //   (runner died before its finalize ran — e.g. the acp start-phase
+  //   failure path above, or a mid-run crash that lost the child
+  //   registration), nothing will ever push an at-rest state again:
+  //   every pushStateFor re-asserts running.active=true and the panel
+  //   shows 思考中 forever. /api/stop is the user's escape hatch for
+  //   exactly this moment, so answering wasRunning:false without
+  //   clearing the claim strands the UI. Reset + push here; when a
+  //   child IS present (wasRunning=true) we deliberately do NOT touch
+  //   cs — the kill cascade above rejects the in-flight prompt and
+  //   the runner's own finalize() owns the terminal state (including
+  //   its chat-cursor cleanup), so resetting early would only race it.
+  if (!wasRunning && cs && cs.running && cs.running.active) {
+    resetThinkingClaim(cs);
+    pushStateFor(cid);
   }
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
   return res.end(

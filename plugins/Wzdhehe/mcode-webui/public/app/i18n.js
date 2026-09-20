@@ -210,6 +210,64 @@ const I18N = {
     lan_card_token_ack: '我已保存',
     lan_card_token_ack_help: '保存后 token 不会再次显示；下次需要查看可点"重置"',
     lan_card_token_rotated_toast: 'token 已重置，新值已自动同步',
+    // v2 (2026-09-20 webui-manual-audit): per-request authorization modal —
+    //   server/lib/authorize.js gates destructive/sensitive actions behind a
+    //   fail-closed 5-min confirmation; these strings are the missing
+    //   frontend half (modal chrome + 8 whitelist action labels + ctx field
+    //   labels). Both dictionaries must stay complete (zh/en parity).
+    auth_title: '需要授权确认',
+    auth_queue_pos: '待确认 {i}/{n}',
+    auth_expires_in: '确认时限',
+    auth_approve: '允许',
+    auth_deny: '拒绝',
+    auth_decision_failed: '决定提交失败',
+    auth_action_session_delete: '删除会话',
+    auth_action_sessions_cleanup_orphans: '清理孤儿会话',
+    auth_action_session_cleanup_all: '清空全部会话',
+    auth_action_session_export: '导出会话',
+    auth_action_session_search: '跨工作区搜索会话',
+    auth_action_token_reset: '重置访问令牌',
+    auth_action_slash_clear: '清空 / 新建对话',
+    auth_action_startup_cleanup: '启动时清理',
+    auth_ctx_targetSessionId: '目标会话',
+    auth_ctx_matchKind: '匹配方式',
+    auth_ctx_isMcodeSid: 'mcode 会话 ID',
+    auth_ctx_isOrphan: '孤儿会话',
+    auth_ctx_chatLen: '对话行数',
+    auth_ctx_q: '搜索词',
+    auth_ctx_workspace: '工作区',
+    auth_ctx_limit: '数量上限',
+    auth_ctx_format: '格式',
+    auth_ctx_download: '下载',
+    auth_ctx_orphanCount: '孤儿数量',
+    auth_ctx_orphanIds: '孤儿会话列表',
+    auth_ctx_cmd: '命令',
+    auth_ctx_sessionId: '会话 ID',
+    auth_ctx_mcodeSessionId: 'mcode 会话',
+    auth_ctx_source: '来源',
+    // v2 (2026-09-20 webui-manual-audit D1): anomaly-channel bell —
+    //   topbar 铃铛 + 弹层 (render.js renderAlerts / state.js alerts
+    //   store)。alerts_title 同时当按钮 title 和弹层标题用。
+    alerts_title: '系统通知',
+    alerts_empty: '暂无通知',
+    alerts_clear: '清空',
+    alerts_session: '会话',
+    alerts_level_info: '信息',
+    alerts_level_warn: '警告',
+    alerts_level_error: '错误',
+    // v2 (2026-09-20 webui-manual-audit D4): workspace picker 四个漏配
+    //   键 — index.html 有 data-i18n 引用但词典零条目, 中文界面直接
+    //   渲染原始 key (live audit 实测 workspace_sync_tui /
+    //   workspace_recents_title / workspace_browse / workspace_loading
+    //   裸露)。同批补 mode_read (render.js 权限分支引用) 与 en 侧缺失
+    //   的 plan_mode_continue / plan_mode_deny (zh-only 补平)。
+    workspace_sync_tui: '同时更新 mcode TUI 的工作目录（写入 cwd.json）',
+    workspace_recents_title: '最近使用',
+    workspace_browse: '浏览目录…',
+    workspace_loading: '加载中…',
+    mode_read: '只读',
+    plan_mode_continue: '继续 plan',
+    plan_mode_deny: '拒绝',
   },
   en: {
     title: 'Mcode Web UI',
@@ -404,6 +462,56 @@ const I18N = {
     lan_card_token_ack: 'I have saved it',
     lan_card_token_ack_help: 'After saving the token will not be shown again; reset to view again',
     lan_card_token_rotated_toast: 'Token rotated, new value auto-synced',
+    // v2 (2026-09-20 webui-manual-audit): per-request authorization modal —
+    //   en half of the zh block above; keep both dictionaries complete.
+    auth_title: 'Authorization required',
+    auth_queue_pos: 'pending {i}/{n}',
+    auth_expires_in: 'Time limit',
+    auth_approve: 'Approve',
+    auth_deny: 'Deny',
+    auth_decision_failed: 'Failed to submit decision',
+    auth_action_session_delete: 'Delete session',
+    auth_action_sessions_cleanup_orphans: 'Clean up orphan sessions',
+    auth_action_session_cleanup_all: 'Delete all sessions',
+    auth_action_session_export: 'Export session',
+    auth_action_session_search: 'Cross-workspace session search',
+    auth_action_token_reset: 'Reset access token',
+    auth_action_slash_clear: 'Clear / restart chat',
+    auth_action_startup_cleanup: 'Startup cleanup',
+    auth_ctx_targetSessionId: 'target session',
+    auth_ctx_matchKind: 'match kind',
+    auth_ctx_isMcodeSid: 'mcode session id',
+    auth_ctx_isOrphan: 'orphan',
+    auth_ctx_chatLen: 'chat lines',
+    auth_ctx_q: 'query',
+    auth_ctx_workspace: 'workspace',
+    auth_ctx_limit: 'limit',
+    auth_ctx_format: 'format',
+    auth_ctx_download: 'download',
+    auth_ctx_orphanCount: 'orphan count',
+    auth_ctx_orphanIds: 'orphan ids',
+    auth_ctx_cmd: 'command',
+    auth_ctx_sessionId: 'session id',
+    auth_ctx_mcodeSessionId: 'mcode session',
+    auth_ctx_source: 'source',
+    // v2 (2026-09-20 webui-manual-audit D1): en half of the alerts bell
+    //   block above — keep both dictionaries complete.
+    alerts_title: 'System alerts',
+    alerts_empty: 'No alerts',
+    alerts_clear: 'Clear',
+    alerts_session: 'session',
+    alerts_level_info: 'Info',
+    alerts_level_warn: 'Warning',
+    alerts_level_error: 'Error',
+    // v2 (2026-09-20 webui-manual-audit D4): en half of the workspace
+    //   picker / mode_read fill-ins above.
+    workspace_sync_tui: "Also update mcode TUI's cwd (write cwd.json)",
+    workspace_recents_title: 'Recent',
+    workspace_browse: 'Browse directories…',
+    workspace_loading: 'Loading…',
+    mode_read: 'Read-only',
+    plan_mode_continue: 'Continue with plan',
+    plan_mode_deny: 'Deny',
   }
 }
 // v0.5.bh: 首次加载默认英文（用户反馈），有缓存时读缓存
