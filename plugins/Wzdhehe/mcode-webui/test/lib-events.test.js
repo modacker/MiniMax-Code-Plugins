@@ -222,7 +222,15 @@ describe("events — actor / target / cid defaults", () => {
 });
 
 describe("events — error resilience (fail-closed)", () => {
-  test("append THROWS when the events dir is unwritable (fail-closed)", () => {
+  test("append THROWS when the events dir is unwritable (fail-closed)", {
+    // U5 (fork-preview run 35495306680): chmod on a directory is a no-op
+    // on win32 — the dir stays writable, the fail-closed throw never
+    // fires, and the THROWS assertion cannot hold. POSIX runs it in full.
+    skip:
+      process.platform === "win32"
+        ? "skipped: chmod lacks write-permission semantics on win32"
+        : false,
+  }, () => {
     // Point the events path inside a read-only directory. append()
     // must throw (2026-09-20 rigor fix) — the caller aborts the gated
     // action instead of completing it unaudited.

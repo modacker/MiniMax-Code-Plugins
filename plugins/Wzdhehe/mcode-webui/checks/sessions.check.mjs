@@ -10,6 +10,7 @@
 import { test, describe, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,50 @@ import {
   registerAcpMock,
   withDecisions,
 } from "../test/_setup.js";
+
+// U5 honest environment gating (fork-preview run 35495306680, windows-latest):
+// the db-level preview tests below build a fixture db via the sqlite3 CLI
+// AND exercise the real deleteMcodeSessionFromDb, which hard-requires a
+// loadable better-sqlite3 through db.js's own resolver (mcode's bundled
+// native module). Probe both preconditions via the production resolution
+// faces (config.SQLITE3_BIN detection + getMcodeBetterSqlite3) and skip
+// with the concrete reason when either is missing. Neither config.js nor
+// db.js is in setupMocks' mock surface, so importing them here is safe.
+const _sqlite3BinProbe = (await import(absPath("lib/config.js"))).SQLITE3_BIN;
+const _betterSqlite3Probe = (await import(absPath("lib/db.js"))).getMcodeBetterSqlite3;
+const SQLITE3_CLI_OK = (() => {
+  try {
+    const r = spawnSync(_sqlite3BinProbe, ["--version"], {
+      stdio: "ignore",
+      timeout: 2000,
+      windowsHide: true,
+    });
+    return r.status === 0 && !r.error;
+  } catch {
+    return false;
+  }
+})();
+// Truthiness of getMcodeBetterSqlite3() is NOT enough: the package
+// require()s cleanly even when the native binding is ABI-mismatched
+// (the .node loads lazily), so a bare module is a false-positive
+// "loadable". Probe the exact operation deleteMcodeSessionFromDb
+// performs — constructing a Database — before declaring the env ready.
+const BETTER_SQLITE3_OK = (() => {
+  const Mod = _betterSqlite3Probe();
+  if (!Mod) return false;
+  try {
+    const probe = new Mod(":memory:");
+    probe.close();
+    return true;
+  } catch {
+    return false;
+  }
+})();
+const DB_FIXTURE_SKIP = !SQLITE3_CLI_OK
+  ? "skipped: sqlite3 CLI not available on this runner"
+  : BETTER_SQLITE3_OK
+    ? false
+    : "skipped: no loadable better-sqlite3 (mcode not installed / ABI mismatch on this runner)";
 
 // Isolate the audit stream: routes/sessions.js now writes write-ahead
 // intent + outcome events (fail-closed) on every gated delete — these
@@ -395,7 +440,7 @@ describe("handleDeleteSession", () => {
   });
 });
 
-describe("handleDeleteSession — dry-run (db-level preview)", () => {
+describe("handleDeleteSession — dry-run (db-level preview)", { skip: DB_FIXTURE_SKIP }, () => {
   test("deleteMcodeSessionFromDb with dryRun=true returns rows per table without modifying", async () => {
     // Use a temp sqlite db, set MCODE_RUNTIME_DB to it, populate rows,
     // call dryRun, then verify rows are still there.

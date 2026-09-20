@@ -106,12 +106,22 @@ describe("db.js — C01 MCODE_CMD path reverse", () => {
     const saved = process.env.MCODE_BETTER_SQLITE3;
     delete process.env.MCODE_BETTER_SQLITE3;
     try {
+      const fakeCmd = "/usr/local/bin/mcode";
       const list = db._getBetterSqlite3Candidates({
-        mcodeCmd: "/usr/local/bin/mcode",
+        mcodeCmd: fakeCmd,
         home: "/Users/example",
       });
-      const npmStyle = "/usr/local/lib/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
-      const flat = "/usr/local/bin/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
+      // U5 (fork-preview run 35495306680): mirror the resolver's own
+      // construction (host separators) — forward-slash literals only
+      // hold on POSIX.
+      const npmStyle = join(
+        dirname(fakeCmd), "..", "lib",
+        "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+      );
+      const flat = join(
+        dirname(fakeCmd),
+        "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+      );
       assert.ok(
         list.includes(npmStyle),
         `npm-style missing — list: ${JSON.stringify(list)}`,
@@ -129,12 +139,20 @@ describe("db.js — C01 MCODE_CMD path reverse", () => {
     const saved = process.env.MCODE_BETTER_SQLITE3;
     delete process.env.MCODE_BETTER_SQLITE3;
     try {
+      const fakeCmd = "/opt/mcode/bin/mcode";
       const list = db._getBetterSqlite3Candidates({
-        mcodeCmd: "/opt/mcode/bin/mcode",
+        mcodeCmd: fakeCmd,
         home: "/Users/example",
       });
-      const npmStyle = "/opt/mcode/lib/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
-      const flat = "/opt/mcode/bin/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
+      // U5: host-path construction — see the /usr/local/bin test above.
+      const npmStyle = join(
+        dirname(fakeCmd), "..", "lib",
+        "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+      );
+      const flat = join(
+        dirname(fakeCmd),
+        "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+      );
       assert.ok(list.includes(npmStyle));
       assert.ok(list.includes(flat));
     } finally {
@@ -276,8 +294,13 @@ describe("db.js — C01 db-resolver.json 3-state semantics", () => {
       );
       // Index ordering: tier 3 (user resolver) comes BEFORE tier 4 (home layout).
       const idx = list.indexOf("/pinned/user/path/better-sqlite3");
+      // U5: host-path construction — the resolver emits host separators,
+      // so a forward-slash literal misses the tier-4a entry on win32.
       const homeLayoutIdx = list.indexOf(
-        "/Users/example/.minimax-code/lib/node_modules/@minimax-ai/code/node_modules/better-sqlite3",
+        join(
+          "/Users/example", ".minimax-code", "lib",
+          "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+        ),
       );
       assert.ok(idx >= 0 && homeLayoutIdx >= 0 && idx < homeLayoutIdx, "tier 3 must precede tier 4");
     } finally {
@@ -303,7 +326,11 @@ describe("db.js — C01 built-in fallback ordering", () => {
         mcodeCmd: "mcode",
         home: "/Users/example",
       });
-      const expected = "/Users/example/.minimax-code/lib/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
+      // U5: host-path construction — mirrors the resolver's tier-4a join.
+      const expected = join(
+        "/Users/example", ".minimax-code", "lib",
+        "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+      );
       assert.ok(a.includes(expected), `a missing: ${JSON.stringify(a)}`);
       assert.ok(b.includes(expected), `b missing: ${JSON.stringify(b)}`);
     } finally {

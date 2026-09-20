@@ -134,7 +134,13 @@ describe("db.js — better-sqlite3 resolver candidates (v1.0.1 round 4)", () => 
   test("install-layout: mcode binary at <install>/mcode.cmd → candidate is <install>/node_modules/...", () => {
     delete process.env.MCODE_BETTER_SQLITE3;
     const fakeCmd = "/tmp/fake-mcode-install/mcode.cmd";
-    const expected = "/tmp/fake-mcode-install/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
+    // U5 (fork-preview run 35495306680): build the expected candidate with
+    // the host path module — the resolver joins with host separators, so a
+    // forward-slash literal only holds on POSIX.
+    const expected = join(
+      dirname(fakeCmd),
+      "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+    );
     const candidates = _getBetterSqlite3Candidates({ mcodeCmd: fakeCmd });
     assert.ok(
       candidates.includes(expected),
@@ -147,7 +153,11 @@ describe("db.js — better-sqlite3 resolver candidates (v1.0.1 round 4)", () => 
     // expected to sit in the install dir's own node_modules.
     delete process.env.MCODE_BETTER_SQLITE3;
     const fakeCmd = "/usr/local/bin/mcode";
-    const expected = "/usr/local/bin/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
+    // U5: host-path construction — see the mcode.cmd test above.
+    const expected = join(
+      dirname(fakeCmd),
+      "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+    );
     const candidates = _getBetterSqlite3Candidates({ mcodeCmd: fakeCmd });
     assert.ok(
       candidates.includes(expected),
@@ -158,11 +168,23 @@ describe("db.js — better-sqlite3 resolver candidates (v1.0.1 round 4)", () => 
   test("install-layout: MCODE_CMD = 'mcode' (PATH placeholder) does not produce a MCODE_CMD-derived candidate", () => {
     delete process.env.MCODE_BETTER_SQLITE3;
     const candidates = _getBetterSqlite3Candidates({ mcodeCmd: "mcode" });
-    // No candidate should be derived from the placeholder
+    // U5: compare path segments, not forward-slash substrings — the
+    // resolver emits host-separator paths, so a "node_modules/@..."-
+    // substring test misses them on win32 (2 !== 0 in the fork-preview
+    // run). Same semantics: every remaining candidate must be a
+    // layout-shaped better-sqlite3 path, nothing MCODE_CMD-derived.
+    const BSQLITE3_TAIL = [
+      "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+    ];
+    const endsWithSqlite3Tail = (c) => {
+      const segs = c.split(/[\\/]/);
+      const off = segs.length - BSQLITE3_TAIL.length;
+      return off >= 0 && BSQLITE3_TAIL.every((s, i) => segs[off + i] === s);
+    };
     const cmdDerived = candidates.filter(
-      (c) => !c.startsWith("/explicit/") && !c.includes("node_modules/@minimax-ai/code/node_modules/better-sqlite3")
+      (c) => !c.startsWith("/explicit/") && !endsWithSqlite3Tail(c),
     );
-    // Only the dev layout fallback should remain
+    // Only the built-in layout-shaped candidates should remain
     assert.equal(
       cmdDerived.length, 0,
       `MCODE_CMD="mcode" should produce no MCODE_CMD-derived candidate, got: ${JSON.stringify(candidates)}`,
@@ -174,8 +196,13 @@ describe("db.js — better-sqlite3 resolver candidates (v1.0.1 round 4)", () => 
   // holds mcode's bundled deps).
   test("install-layout: standard ~/.minimax-code/lib/node_modules/... is always tried", () => {
     delete process.env.MCODE_BETTER_SQLITE3;
-    const candidates = _getBetterSqlite3Candidates({ home: "/Users/example" });
-    const expected = "/Users/example/.minimax-code/lib/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
+    const home = "/Users/example";
+    const candidates = _getBetterSqlite3Candidates({ home });
+    // U5: host-path construction — mirrors the resolver's own tier-4a join.
+    const expected = join(
+      home, ".minimax-code", "lib",
+      "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+    );
     assert.ok(
       candidates.includes(expected),
       `expected standard install candidate ${expected} in ${JSON.stringify(candidates)}`,
@@ -186,10 +213,18 @@ describe("db.js — better-sqlite3 resolver candidates (v1.0.1 round 4)", () => 
     delete process.env.MCODE_BETTER_SQLITE3;
     const fakeCmd = "/opt/mcode/bin/mcode";
     const candidates = _getBetterSqlite3Candidates({ mcodeCmd: fakeCmd });
+    // U5: mirror the resolver's own construction (host separators) —
+    // forward-slash literals only hold on POSIX.
     // npm-style: <root>/lib/node_modules/...
-    const npmStyle = "/opt/mcode/lib/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
+    const npmStyle = join(
+      dirname(fakeCmd), "..", "lib",
+      "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+    );
     // flat: <root>/node_modules/...
-    const flat = "/opt/mcode/bin/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
+    const flat = join(
+      dirname(fakeCmd),
+      "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+    );
     assert.ok(
       candidates.includes(npmStyle),
       `expected npm-style candidate ${npmStyle} in ${JSON.stringify(candidates)}`,
@@ -276,10 +311,18 @@ describe("db.js — C01 install-layout scenarios (user resolver config + tier or
     delete process.env.MCODE_BETTER_SQLITE3;
     delete process.env.MCODE_WEBUI_RESOLVER_JSON;
     const fakeCmd = "/usr/local/bin/mcode";
+    // U5: mirror the resolver's own construction (host separators) —
+    // forward-slash literals only hold on POSIX.
     // npm-style: dirname(/usr/local/bin/mcode) + .. + lib + ...
-    const npmStyle = "/usr/local/lib/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
+    const npmStyle = join(
+      dirname(fakeCmd), "..", "lib",
+      "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+    );
     // flat: dirname(/usr/local/bin/mcode) + node_modules/...
-    const flat = "/usr/local/bin/node_modules/@minimax-ai/code/node_modules/better-sqlite3";
+    const flat = join(
+      dirname(fakeCmd),
+      "node_modules", "@minimax-ai", "code", "node_modules", "better-sqlite3",
+    );
     const candidates = _getBetterSqlite3Candidates({ mcodeCmd: fakeCmd });
     assert.ok(
       candidates.includes(npmStyle),

@@ -22,7 +22,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, delimiter, isAbsolute, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
@@ -142,9 +142,14 @@ describe("resolveMcodeSpawn — POSIX bare name", () => {
   test("resolves to the PATH file itself, no entry rewriting", () => {
     const root = mkdtempSync(join(tmpdir(), "mcode-exec-posix-"));
     writeFileSync(join(root, "mcode"), "#!/bin/sh\nexec node entry \"$@\"\n");
+    // U5 (fork-preview run 35495306680): resolveMcodeSpawn splits PATH on
+    // the HOST delimiter when the injected platform is not win32, so the
+    // fixture must join entries with node:path's delimiter — a hardcoded
+    // ":" never matches on a win32 host (";" there) and the probe dies
+    // with cannot-resolve before the no-entry-rewriting assertion.
     const r = resolveMcodeSpawn("mcode", {
       platform: "linux",
-      env: { PATH: "/nonexistent-first:" + root },
+      env: { PATH: "/nonexistent-first" + delimiter + root },
     });
     assert.equal(r.command, join(root, "mcode"));
     assert.equal(r.args.length, 0);
