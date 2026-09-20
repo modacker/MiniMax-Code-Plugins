@@ -9,6 +9,21 @@ export const managedEntry = (home = homedir(), platform = process.platform) => j
 async function fileExists(file, executable = false, platform = process.platform) {
   try { await access(file, executable && platform !== 'win32' ? constants.X_OK : constants.F_OK); return (await stat(file)).isFile(); } catch { return false; }
 }
+// A \\?\-namespaced win32 path is fine for fs probing but fatal as node's
+// main entry on every Node line this plugin supports (>=22): node runs
+// fs.realpathSync on argv[1], whose JS implementation probes the namespaced
+// drive root `\\?\C:\`; the fs binding drops the trailing separator, lstat
+// receives the bare drive `C:` and dies with EISDIR (nodejs/node#62446,
+// fixed by nodejs/node#65378 — first shipped in v24.21.0/v26.8.0). Real-
+// Windows evidence: fork preview runs 35491670398 / 35492809510
+// (windows-latest, Node 22) — fs.promises.mkdir(recursive) hands back a
+// namespaced created path, every join below it keeps the prefix, and the
+// spawned entry crashed exactly there. Strip the namespace marker (drive
+// and UNC forms) so a returned entry is always a plain path node can load
+// verbatim; POSIX strings never match and pass through unchanged.
+export function loadableEntry(entry) {
+  return String(entry).replace(/^\\\\\?\\UNC\\/, '\\\\').replace(/^\\\\\?\\([a-zA-Z]:)/, '$1');
+}
 export async function executablePath(command, env = process.env, platform = process.platform) {
   if (typeof command !== 'string' || !command) return null;
   const direct = /[\\/]/.test(command);
@@ -66,7 +81,7 @@ export async function resolveMcode(command = 'mcode', { env = process.env, home 
       // any version arithmetic — the launcher runs what it runs, so we run what
       // it runs, and rollbacks and channel switches are followed for free.
       const active = await launcherEntry(join(dirname(path), '.mcode-launcher.cmd'), dirname(path));
-      if (active) return { command: process.execPath, args: [active], source };
+      if (active) return { command: process.execPath, args: [loadableEntry(active)], source };
       // No launcher pointer: fall back to ranking every coexisting layout by
       // version. When several installs coexist (PATH shim with an old sibling,
       // newer official root) a stale 0.2.x entry lacks current exec flags.
@@ -126,7 +141,7 @@ export async function resolveMcode(command = 'mcode', { env = process.env, home 
         const version = await versionOf(candidate.entry);
         if (!best || cmpSemVer(version, best.version) > 0 || (cmpSemVer(version, best.version) === 0 && candidate.tie > best.tie)) best = { ...candidate, version };
       }
-      if (best) return { command: process.execPath, args: [best.entry], source };
+      if (best) return { command: process.execPath, args: [loadableEntry(best.entry)], source };
       const launcher = join(dirname(path), 'mcode.ps1');
       if (await fileExists(launcher)) {
         // pwsh (PS7) first: PS 5.1 binds flag-shaped argv as its own named parameters
@@ -141,7 +156,7 @@ export async function resolveMcode(command = 'mcode', { env = process.env, home 
   }
   if (command === 'mcode') {
     const entry = managedEntry(home, platform);
-    if (await fileExists(entry)) return { command: process.execPath, args: [entry], source: 'workflow-managed' };
+    if (await fileExists(entry)) return { command: process.execPath, args: [loadableEntry(entry)], source: 'workflow-managed' };
   }
   return null;
 }
