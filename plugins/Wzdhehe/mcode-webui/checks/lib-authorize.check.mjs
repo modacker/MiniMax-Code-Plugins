@@ -231,7 +231,23 @@ describe("authorize — 5-minute default timeout (fail-closed)", () => {
   test("respects custom timeoutMs option and resolves with decidedBy:'timeout'", async () => {
     const p = authorize("session.delete", { cid: "tab-t" }, { timeoutMs: 25 });
     assert.equal(getPendingCount(), 1);
-    const r = await p;
+    // Windows event-loop liveness fix (fork preview run 35493384574):
+    // authorize()'s timeout timer is unref()'d — production-correct,
+    // a pending auth request must never block process exit. But a bare
+    // `await p` leaves the event loop with zero ref'd handles, so on
+    // windows-latest the loop drains before the 25 ms timer can fire
+    // and node:test reports "Promise resolution is still pending but
+    // the event loop has already resolved" (POSIX passed only because
+    // IO/scheduling noise held the loop). Hold the loop open with a
+    // REF'd watchdog and release it the moment authorize settles —
+    // liveness only, zero assertion change.
+    const watchdog = setTimeout(() => {}, 5000);
+    let r;
+    try {
+      r = await p;
+    } finally {
+      clearTimeout(watchdog);
+    }
     assert.equal(r.approved, false);
     assert.equal(r.decidedBy, "timeout");
     // SSE mirror for other tabs
