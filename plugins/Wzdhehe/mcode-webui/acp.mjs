@@ -68,14 +68,27 @@ export class McodeAcpClient extends EventEmitter {
       windowsHide: true,
       shell: false,  // 关键：false 让 cmd.exe 不打印横幅
     })
-    this.child.on('error', (e) => this.emit('error', e))
+    // U4 (2026-09-20): 子进程死亡信号必须在到达时让所有 pending 落定。
+    //   Node 24 对 spawn 失败（mcode 未安装 → ENOENT）只发 error+close，
+    //   不发 exit —— 之前 pending 只在 exit 里 reject，request('initialize')
+    //   永不落定，上层 await 链整体悬空（无 mcode 的 Linux 上 /api/state
+    //   永久无响应；开发机有 mcode 时是环境噪声假绿）。exit/close 双挂 +
+    //   error 兜底，排水幂等，先到者生效。
+    this.child.on('error', (e) => {
+      this._rejectAllPending(new Error(`mcode acp child error: ${e.message}`))
+      // 重发射仅在有人监听时进行 —— 裸 emit('error') 无监听会抛
+      // Unhandled 'error' event，无全局兜底的嵌入方会直接崩溃进程
+      if (this.listenerCount('error') > 0) this.emit('error', e)
+      else console.error(`[acp] mcode acp child error: ${e.message}`)
+    })
     this.child.on('exit', (code, signal) => {
       this.emit('exit', { code, signal })
       // 拒绝所有 pending
-      for (const [id, p] of this.pending) {
-        p.reject(new Error(`mcode acp exited (code=${code} signal=${signal})`))
-      }
-      this.pending.clear()
+      this._rejectAllPending(new Error(`mcode acp exited (code=${code} signal=${signal})`))
+    })
+    this.child.on('close', (code, signal) => {
+      // close 在子进程死亡后必然触发（含 exit 不发的 spawn 失败场景）
+      this._rejectAllPending(new Error(`mcode acp closed (code=${code} signal=${signal})`))
     })
     this.child.stdout.setEncoding('utf8')
     this.child.stdout.on('data', (chunk) => this._onData(chunk))
@@ -95,6 +108,16 @@ export class McodeAcpClient extends EventEmitter {
 
   get cmd() {
     return process.platform === 'win32' ? resolveMcodeCmd() : 'mcode'
+  }
+
+  // U4 (2026-09-20): 排水拒绝全部 pending 请求 — 幂等（pending 清空后再调为
+  //   no-op）。子进程死亡信号（error/exit/close）任何一个到达都必须让等待方
+  //   落定，否则调用方的 await 永久悬空。
+  _rejectAllPending(err) {
+    for (const [, p] of this.pending) {
+      p.reject(err)
+    }
+    this.pending.clear()
   }
 
   // 解析 stdout（每行一条 JSON）

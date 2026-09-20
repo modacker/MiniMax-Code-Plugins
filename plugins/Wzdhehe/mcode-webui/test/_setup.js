@@ -533,19 +533,38 @@ export async function withDecisions(fn, { approve = true } = {}) {
 export function decideNextAuthorization({ port, approve = true, cid, timeoutMs = 3000 }) {
   return new Promise((resolve, reject) => {
     import("node:http").then((http) => {
-      // Once the decision POST is in flight, errors from tearing down
-      // our own SSE subscription ("aborted") must NOT reject the outer
-      // promise — the POST's outcome is the answer.
+      // settled:  outer promise has resolved/rejected.
+      // deciding: a needs_authorization frame was seen and the decision
+      //   POST is in flight — from that point, teardown noise from our own
+      //   SSE destroy() must NOT reject the outer promise; the POST's
+      //   outcome is the answer.
       let settled = false;
+      let deciding = false;
+      let sseReq = null;
+      let postReq = null;
+      // U4 (2026-09-20): settlement guarantee — the bail-out timer now covers
+      // BOTH phases (waiting for the SSE frame AND the decision POST). The
+      // old code cleared it as soon as the frame arrived, so a server that
+      // accepted the POST but never responded left this promise pending
+      // forever with no timeout. On fire, everything is destroyed and the
+      // promise rejects — waiting sides must never depend on the peer (or
+      // incidental event-loop handles) for liveness.
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
-        try { req.destroy(); } catch {}
+        try { if (sseReq) sseReq.destroy(); } catch {}
+        try { if (postReq) postReq.destroy(); } catch {}
         reject(new Error(
-          `decideNextAuthorization: no needs_authorization frame within ${timeoutMs}ms`,
+          `decideNextAuthorization: no completed needs_authorization decision within ${timeoutMs}ms`,
         ));
       }, timeoutMs);
-      const req = http.request(
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn(value);
+      };
+      sseReq = http.request(
         {
           method: "GET",
           host: "127.0.0.1",
@@ -556,6 +575,7 @@ export function decideNextAuthorization({ port, approve = true, cid, timeoutMs =
           let body = "";
           res.setEncoding("utf8");
           res.on("data", (chunk) => {
+            if (deciding) return; // POST already dispatched; ignore trailing data
             body += chunk;
             // Frames arrive as `event: needs_authorization\ndata: {...}\n\n`.
             // Scan the accumulated body each chunk — cheap at test scale.
@@ -569,11 +589,10 @@ export function decideNextAuthorization({ port, approve = true, cid, timeoutMs =
               try { payload = JSON.parse(dataLine.slice("data: ".length)); } catch { continue; }
               const requestId = payload && payload.requestId;
               if (!requestId) continue;
-              clearTimeout(timer);
-              settled = true; // decision POST in flight — ignore teardown noise
-              try { req.destroy(); } catch {}
+              deciding = true; // decision POST in flight — ignore SSE teardown noise
+              try { sseReq.destroy(); } catch {}
               const data = JSON.stringify({ requestId, approve });
-              const post = http.request(
+              postReq = http.request(
                 {
                   method: "POST",
                   host: "127.0.0.1",
@@ -590,32 +609,30 @@ export function decideNextAuthorization({ port, approve = true, cid, timeoutMs =
                   postRes.on("end", () => {
                     let decision;
                     try { decision = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
-                    resolve({ requestId, decision, status: postRes.statusCode });
+                    settle(resolve, { requestId, decision, status: postRes.statusCode });
                   });
                   postRes.on("error", (e) => {
-                    resolve({ requestId, decision: null, status: postRes.statusCode, error: e.message });
+                    settle(resolve, { requestId, decision: null, status: postRes.statusCode, error: e.message });
                   });
                 },
               );
-              post.on("error", (e) => reject(e));
-              post.write(data);
-              post.end();
+              postReq.on("error", (e) => settle(reject, e));
+              postReq.write(data);
+              postReq.end();
               return;
             }
           });
           res.on("error", (e) => {
-            if (settled) return; // our own destroy()
-            clearTimeout(timer);
-            reject(e);
+            if (settled || deciding) return; // our own destroy()
+            settle(reject, e);
           });
         },
       );
-      req.on("error", (e) => {
-        if (settled) return; // our own destroy()
-        clearTimeout(timer);
-        reject(e);
+      sseReq.on("error", (e) => {
+        if (settled || deciding) return; // our own destroy()
+        settle(reject, e);
       });
-      req.end();
+      sseReq.end();
     }).catch(reject);
   });
 }

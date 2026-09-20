@@ -126,14 +126,26 @@ async function stopServer(proc, tmpDir) {
 //   - body is a string (raw); json is set when Content-Type is JSON
 //     AND JSON.parse succeeds (else json stays undefined).
 //   - response body is fully buffered before resolve.
-function httpRequest({ method = "GET", host = "127.0.0.1", port, path }) {
+//   - U4 (2026-09-20): settlement guarantee — the waiting side must have a
+//     timeout bail-out and must NOT rely on the server (or incidental
+//     event-loop handles) keeping the test alive. Before this, a server-side
+//     hang (acp.mjs pending never settling when mcode is absent on Linux)
+//     turned into a permanent 60s suite hang instead of a fast failure.
+function httpRequest({ method = "GET", host = "127.0.0.1", port, path, timeoutMs = 10000 }) {
     return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            req.destroy();
+            reject(new Error(
+                `httpRequest: no response within ${timeoutMs}ms for ${method} ${path}`,
+            ));
+        }, timeoutMs);
         const req = http.request(
             { method, host, port, path, headers: { Connection: "close" } },
             (res) => {
                 const chunks = [];
                 res.on("data", (c) => chunks.push(c));
                 res.on("end", () => {
+                    clearTimeout(timer);
                     const body = Buffer.concat(chunks).toString("utf8");
                     let json;
                     const ct = String(res.headers["content-type"] || "");
@@ -147,10 +159,16 @@ function httpRequest({ method = "GET", host = "127.0.0.1", port, path }) {
                         json,
                     });
                 });
-                res.on("error", reject);
+                res.on("error", (e) => {
+                    clearTimeout(timer);
+                    reject(e);
+                });
             },
         );
-        req.on("error", reject);
+        req.on("error", (e) => {
+            clearTimeout(timer);
+            reject(e);
+        });
         req.end();
     });
 }
