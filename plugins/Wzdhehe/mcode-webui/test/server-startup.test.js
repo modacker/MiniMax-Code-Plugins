@@ -118,6 +118,13 @@ test("server.js bootstrap does not throw ESM load-time error", async () => {
       ...process.env,
       PORT: "18082",
       TOKEN: "",
+      // Redirect upload dir away from MCODE_ROOT — otherwise server.js
+      // mkdirSync(UPLOAD_DIR, {recursive: true}) creates a stray
+      // .webui-uploads/ inside the plugin tree that survives `git status
+      // --ignored` and breaks marketplace validate.mjs on tar+siinfer CI.
+      MCODE_WEBUI_UPLOAD_DIR: "/tmp/mcode-webui-test-uploads",
+      MCODE_WEBUI_SETTINGS_PATH: "/tmp/mcode-webui-test-settings.json",
+      MCODE_WEBUI_EVENTS_PATH: "/tmp/mcode-webui-test-events.ndjson",
     },
   });
 
