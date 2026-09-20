@@ -2,7 +2,7 @@ import test from 'node:test';import assert from 'node:assert/strict';
 import {mkdir,writeFile,rm,readFile,chmod} from 'node:fs/promises';
 import {spawn} from 'node:child_process';
 import {tmpdir} from 'node:os';import {join} from 'node:path';
-import {resolveMcode} from '../src/mcode-location.mjs';
+import {resolveMcode,loadableEntry} from '../src/mcode-location.mjs';
 // Windows launcher resolution is exercised from POSIX by faking the on-disk
 // layout and passing platform:'win32' + a controlled PATH/PATHEXT: resolution
 // is pure filesystem probing, so the real bug (mixed-install layouts) is
@@ -198,4 +198,9 @@ test('last-resort PS hop prefers pwsh (PS7) over powershell (PS5.1 -File is brok
   const r=await resolveMcode('mcode',{env:winEnv(f.shim),home:f.official,platform:'win32'});
   assert.match(r.command,/pwsh\.exe$/i);
  }finally{await f.cleanup();}
+});
+test('namespaced win32 entries are de-namespaced: node >=22 realpathSync dies on a \\\\?\\ main entry with EISDIR lstat C: (real-Windows fork runs 35491670398/35492809510)',()=>{
+ assert.equal(loadableEntry('\\\\?\\C:\\Users\\a\\.minimax-code\\releases\\0.4.12\\node_modules\\@minimax-ai\\code\\cli.js'),'C:\\Users\\a\\.minimax-code\\releases\\0.4.12\\node_modules\\@minimax-ai\\code\\cli.js','drive form loses the namespace marker');
+ assert.equal(loadableEntry('\\\\?\\UNC\\srv\\share\\code\\cli.js'),'\\\\srv\\share\\code\\cli.js','UNC form maps back to \\\\server\\share');
+ assert.equal(loadableEntry('/tmp/wf-winloc/cli.js'),'/tmp/wf-winloc/cli.js','posix passes through untouched');
 });

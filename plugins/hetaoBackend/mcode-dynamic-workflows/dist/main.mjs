@@ -13964,6 +13964,9 @@ async function fileExists(file, executable = false, platform = process.platform)
     return false;
   }
 }
+function loadableEntry(entry) {
+  return String(entry).replace(/^\\\\\?\\UNC\\/, "\\\\").replace(/^\\\\\?\\([a-zA-Z]:)/, "$1");
+}
 async function executablePath(command, env = process.env, platform = process.platform) {
   if (typeof command !== "string" || !command) return null;
   const direct = /[\\/]/.test(command);
@@ -13996,7 +13999,7 @@ async function resolveMcode(command = "mcode", { env = process.env, home = homed
   if (path) {
     if (platform === "win32" && /\.(cmd|bat)$/i.test(path)) {
       const active = await launcherEntry(join2(dirname(path), ".mcode-launcher.cmd"), dirname(path));
-      if (active) return { command: process.execPath, args: [active], source };
+      if (active) return { command: process.execPath, args: [loadableEntry(active)], source };
       const root = officialRoot(home, env);
       const candidates = [
         { entry: join2(dirname(path), "node_modules", "@minimax-ai", "code", "cli.js"), tie: "" },
@@ -14045,7 +14048,7 @@ async function resolveMcode(command = "mcode", { env = process.env, home = homed
         const version3 = await versionOf(candidate.entry);
         if (!best || cmpSemVer(version3, best.version) > 0 || cmpSemVer(version3, best.version) === 0 && candidate.tie > best.tie) best = { ...candidate, version: version3 };
       }
-      if (best) return { command: process.execPath, args: [best.entry], source };
+      if (best) return { command: process.execPath, args: [loadableEntry(best.entry)], source };
       const launcher = join2(dirname(path), "mcode.ps1");
       if (await fileExists(launcher)) {
         const powershell = await executablePath("pwsh.exe", env, platform) ?? await executablePath("powershell.exe", env, platform);
@@ -14058,7 +14061,7 @@ async function resolveMcode(command = "mcode", { env = process.env, home = homed
   }
   if (command === "mcode") {
     const entry = managedEntry(home, platform);
-    if (await fileExists(entry)) return { command: process.execPath, args: [entry], source: "workflow-managed" };
+    if (await fileExists(entry)) return { command: process.execPath, args: [loadableEntry(entry)], source: "workflow-managed" };
   }
   return null;
 }
