@@ -120,9 +120,9 @@ Full disclosure: [`references/SECURITY-NOTES.md`](references/SECURITY-NOTES.md).
 
 ```
 $ npm test
-ℹ tests 832
+ℹ tests 834
 ℹ suites 38
-ℹ pass 826
+ℹ pass 828
 ℹ fail 4            # pre-existing better-sqlite3 NODE_MODULE_VERSION 141↔147
                      # ABI drift on the runner; reproducible across all plugin
                      # releases since v0.5. Repro: `npm rebuild better-sqlite3`.
@@ -164,7 +164,7 @@ rate-limit.js     : 99.20% lines / 87.80% branches
 Test breakdown (selected):
 - `lib-events.test.js` — 27 tests (NDJSON atomic write, monotonic seq, hash chain)
 - `lib-events-hash.test.js` — 8 tests (tamper detection, chain restore)
-- `lib-alerts.test.js` — 18 tests (3 levels, 60s dedup, ring buffer)
+- `lib-alerts.test.js` — 20 tests (3 levels, 60s dedup, ring buffer, **dedup survives ring wrap** + **audit payload survives** — regression coverage added in commit 8f2e86b after V01 review)
 - `routes-alerts.test.js` — 6 tests (SSE replay, heartbeat, close)
 - `lib-authorize.test.js` — 20 tests (whitelist, timeout, per-cid cleanup)
 - `lib-interaction.test.js` — 37 tests (commands parser, permission presets, ask-user modal)
@@ -215,7 +215,7 @@ Full PR suite runs via `npm run check:ci && npm test && npm run sbom && npm audi
 ## Checklist
 
 - [x] `plugin.json` validates against `https://agent-plugins.org/schemas/1.0.0/plugin.schema.json`
-- [x] `npm test` — 826 pass, 4 fail (pre-existing better-sqlite3 ABI), 2 skipped
+- [x] `npm test` — 828 pass, 4 fail (pre-existing better-sqlite3 ABI), 2 skipped
 - [x] `npm run check` — exit 0 (all 6 alignment groups green)
 - [x] `npm run sbom` — CycloneDX 1.5 emitted, 115 components
 - [x] `npm audit` — 0 vulnerabilities
