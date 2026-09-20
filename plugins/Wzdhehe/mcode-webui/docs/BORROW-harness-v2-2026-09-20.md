@@ -31,7 +31,7 @@ Six concrete borrows, ordered by SiHankor-baseline ROI:
 | 1 | Append-only conversation transcript (Codex CLI `~/.codex/sessions/*.jsonl` pattern) | Baseline 4 + prohibition 4 (verifiability + tamper-proof event stream) |
 | 2 | Per-cid permission-policy DSL with rule language (Claude Code `settings.json` `permissions.allow/deny` pattern) | Baseline 1 partial + UX #10 + prohibition 1 |
 | 3 | Hook seam on the acp event stream (Claude Code `PreToolUse` / `PostToolUse` hook pattern) | Baseline 4 + prohibition 4 — enables Borrow 1 + Borrow 4 |
-| 4 | Skills / capability manifest as runtime-discoverable modules (abstract harness "everything is a plugin" pattern) | UX #4, #6, #9 — also closes one TODO in `plugin.json` |
+| 4 | Skills / capability manifest as runtime-discoverable modules (abstract harness "everything is a plugin" pattern) | UX #4, #6, #9 — also closes one outstanding entry in `plugin.json` |
 | 5 | Project-scoped instruction file auto-injected into the prompt (Claude Code `CLAUDE.md` pattern) | UX — onboarding / consistency, no direct baseline |
 | 6 | Subagent fan-out for backend batch ops (Claude Code `Task` tool pattern, server-side only) | UX #7 bulk delete, UX #6 streaming perf |
 
@@ -323,8 +323,8 @@ having to paste them every session.
 Add `server/lib/workspace-instructions.js`:
 
 - On `/api/workspace` change (existing route in `server/routes/workspace.js`):
-  - Walk up from `workspace.dir` looking for `WEBUI.md` (or
-    `webui-instructions.md` — file name is a TODO; pick one in PR)
+  - Walk up from `workspace.dir` looking for `WEBUI.md` (uppercase,
+    conventional — chosen over the lowercase variant `webui-instructions.md`)
   - Read each match; concatenate (with section headers naming the
     source directory)
   - Cache the result; refresh on `/api/workspace/refresh`

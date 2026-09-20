@@ -2,9 +2,9 @@
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
   "version": 1,
-  "serialNumber": "urn:uuid:c3671eef-bc47-4044-8fa3-3466b70c658d",
+  "serialNumber": "urn:uuid:3fad2c2a-3c15-4a05-9e13-0ca984450e42",
   "metadata": {
-    "timestamp": "2026-09-20T00:46:43.590Z",
+    "timestamp": "2026-09-20T01:29:54.260Z",
     "tools": [
       {
         "vendor": "mcode-webui",
