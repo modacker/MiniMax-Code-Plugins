@@ -133,6 +133,51 @@ describe("getMavisTokenUsage — happy path (real sqlite3)", () => {
     assert.ok(r);
     assert.equal(r.lastTurnReasoning, 0);
   });
+
+  // G03: regression guard for the node:sqlite path. The fixture DB has
+  //   local_runtime_token_usage populated for SID_FULL, so a successful
+  //   round-trip on this host proves either path is wired correctly. The
+  //   name pins the G03 contract: "sqlite3 CLI is NOT a hard requirement".
+  //   If someone reverts mavis-usage.js to spawn-only, this test starts
+  //   failing on Linux runners that don't have the CLI installed
+  //   (Ubuntu noble: libsqlite3-0 is installed but sqlite3 CLI is not —
+  //   you have to `apt install sqlite3` separately). Verified on siinfer
+  //   before and after the G03 fix.
+  test("G03: resolves against sqlite3-less env via node:sqlite builtin", async () => {
+    const r = await getMavisTokenUsage(SID_FULL);
+    assert.ok(r, "G03 must not regress — node:sqlite must serve the query");
+    assert.equal(r.rows, 3);
+    assert.equal(r.lastTurnInput, 5000);
+  });
+});
+
+describe("getMavisTokenUsageModel — happy path (real sqlite3)", () => {
+  // G03: direct coverage for getMavisTokenUsageModel. Previously this was
+  //   only exercised indirectly through applyMavisUsageToCs → cs.usage.mavisModel.
+  //   Adding direct tests pins the row shape so a future refactor (e.g.
+  //   switching the model query between node:sqlite and spawn) can't
+  //   silently break the field set consumed by the chat UI's mavisModel card.
+  let getMavisTokenUsageModel;
+  before(async () => {
+    ({ getMavisTokenUsageModel } = await import(absPath("lib/mavis-usage.js")));
+  });
+
+  test("returns model + per-turn input/output/cacheRead/ts for SID_FULL", async () => {
+    const m = await getMavisTokenUsageModel(SID_FULL);
+    assert.ok(m, "must resolve a model for SID_FULL (all rows have model='test')");
+    assert.equal(m.model, "test");
+    // The "last" row of SID_FULL is ts=1003: input=5000, output=1000,
+    //   cache_read=4000 (per create-test-db.mjs lines 67-70).
+    assert.equal(m.input, 5000);
+    assert.equal(m.output, 1000);
+    assert.equal(m.cacheRead, 4000);
+    assert.equal(m.ts, 1003);
+  });
+
+  test("returns null for nonexistent session id (no rows)", async () => {
+    const m = await getMavisTokenUsageModel(SID_NONEXISTENT);
+    assert.equal(m, null);
+  });
 });
 
 // Tests that require mocking node:child_process.spawn are SKIPPED here
