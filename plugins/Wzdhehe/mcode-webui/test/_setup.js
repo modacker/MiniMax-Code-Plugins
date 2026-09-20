@@ -473,6 +473,17 @@ export async function withDecisions(fn, { approve = true } = {}) {
   // belong to someone else — only decide requests created by fn().
   const preExisting = new Set(mod.getPendingRequestIds());
   const decided = new Set();
+  // Windows event-loop liveness fix (fork preview run 35493902383):
+  //   The poll interval MUST stay REF'd. Mock unit tests drive route
+  //   handlers with zero real IO, so while fn() awaits authorize() this
+  //   interval is the only ref'd handle in the loop. The previous
+  //   unref() let the loop drain on windows-latest before the 2 ms poll
+  //   could call _decideForTests, and node:test reported "Promise
+  //   resolution is still pending but the event loop has already
+  //   resolved" + cancelledByParent for the whole routes-export.check
+  //   .mjs file (POSIX passed only because incidental IO happened to
+  //   hold the loop). Same fix shape as lib-authorize's REF'd watchdog
+  //   (run 35493384574) — liveness only, zero assertion change.
   const poll = setInterval(() => {
     for (const id of mod.getPendingRequestIds()) {
       if (decided.has(id) || preExisting.has(id)) continue;
@@ -480,10 +491,25 @@ export async function withDecisions(fn, { approve = true } = {}) {
       mod._decideForTests(id, approve);
     }
   }, 2);
-  if (typeof poll.unref === "function") poll.unref();
+  // Safety self-clear: a REF'd interval that outlives a broken test
+  // would hang the whole run — if fn() never settles (pending auth
+  // requests never decided), release the interval and fail fast at 5 s.
+  let bailOut;
+  const bail = setTimeout(() => {
+    clearInterval(poll);
+    bailOut(new Error(
+      "withDecisions: fn() did not settle within 5000ms — pending auth requests were never decided (poll interval released, failing instead of hanging)",
+    ));
+  }, 5000);
   try {
-    return await fn();
+    return await Promise.race([
+      fn(),
+      new Promise((_, reject) => {
+        bailOut = reject;
+      }),
+    ]);
   } finally {
+    clearTimeout(bail);
     clearInterval(poll);
   }
 }
