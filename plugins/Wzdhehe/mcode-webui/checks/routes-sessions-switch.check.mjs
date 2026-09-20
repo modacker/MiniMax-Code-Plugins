@@ -28,7 +28,7 @@
 import { test, describe, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -77,10 +77,26 @@ let _acpTitleCalls = 0;
 
 // Isolate the audit stream — switch + export append hash-chain events that
 // must never land in the operator's real ~/.mcode-webui/events.ndjson.
+// v2 (2026-09-20 fork-preview fix): ALSO pin MCODE_RUNTIME_DB to a scratch
+//   file this check CREATES. readMcodeTranscript gates on existsSync(dbPath)
+//   BEFORE better-sqlite3 is ever consulted (reason "mcode_db_not_found"),
+//   and sessions.js passes dbPath from config.js's MCODE_RUNTIME_DB — which
+//   defaults to join(homedir(), ".minimax", "v2", "sqlite", "runtime-state
+//   .sqlite"). A windows-latest CI runner has no such file, so the v2 probe
+//   never ran and every backfill test saw [] — the suite was green locally
+//   ONLY because the dev machine happens to have a real runtime DB there.
+//   The placeholder's CONTENT is irrelevant (better-sqlite3 is module-mocked
+//   below; the fake never reads the file) — existsSync just needs it to
+//   exist. Must be set BEFORE the first SUT import: config.js evaluates
+//   MCODE_RUNTIME_DB at module-load time.
 let _tmpEventsDir;
+let _tmpDbDir;
 before(async (t) => {
   _tmpEventsDir = mkdtempSync(join(tmpdir(), "webui-switch-test-events-"));
   process.env.MCODE_WEBUI_EVENTS_PATH = join(_tmpEventsDir, "events.ndjson");
+  _tmpDbDir = mkdtempSync(join(tmpdir(), "webui-switch-test-db-"));
+  process.env.MCODE_RUNTIME_DB = join(_tmpDbDir, "runtime-state.sqlite");
+  writeFileSync(process.env.MCODE_RUNTIME_DB, "");
 
   await setupMocks(t, {
     mavis: { applyMavisUsageToCs: async () => {} }, // no spawn in switch path
@@ -107,8 +123,12 @@ before(async (t) => {
 
 after(() => {
   delete process.env.MCODE_WEBUI_EVENTS_PATH;
+  delete process.env.MCODE_RUNTIME_DB;
   if (_tmpEventsDir) {
     try { rmSync(_tmpEventsDir, { recursive: true, force: true }); } catch {}
+  }
+  if (_tmpDbDir) {
+    try { rmSync(_tmpDbDir, { recursive: true, force: true }); } catch {}
   }
 });
 

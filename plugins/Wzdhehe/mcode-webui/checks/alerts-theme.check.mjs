@@ -491,10 +491,18 @@ describe("alerts render helpers (pure)", () => {
 // ============================================================
 
 describe("static source guards", () => {
-  const RENDER_SRC = readFileSync(resolve(PLUGIN_ROOT, "public", "app", "render.js"), "utf8");
-  const STATE_SRC = readFileSync(resolve(PLUGIN_ROOT, "public", "app", "state.js"), "utf8");
-  const INDEX_SRC = readFileSync(resolve(PLUGIN_ROOT, "public", "index.html"), "utf8");
-  const I18N_SRC = readFileSync(resolve(PLUGIN_ROOT, "public", "app", "i18n.js"), "utf8");
+  // v2 (2026-09-20 webui-manual-audit D1): normalize CRLF at read time —
+  //   windows-latest checks out with git autocrlf, so every source file
+  //   arrives with \r\n line endings and the slice() markers below (which
+  //   embed a literal \n) never match, failing the guard on the ONLY real
+  //   Windows CI we have. Normalizing to LF makes marker slicing checkout-
+  //   agnostic: the sliced block is byte-identical to the LF-checkout run,
+  //   so the innerHTML/regex assertions keep their exact semantics.
+  const readSrc = (p) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
+  const RENDER_SRC = readSrc(resolve(PLUGIN_ROOT, "public", "app", "render.js"));
+  const STATE_SRC = readSrc(resolve(PLUGIN_ROOT, "public", "app", "state.js"));
+  const INDEX_SRC = readSrc(resolve(PLUGIN_ROOT, "public", "index.html"));
+  const I18N_SRC = readSrc(resolve(PLUGIN_ROOT, "public", "app", "i18n.js"));
 
   function slice(src, startMarker, endMarker) {
     const s = src.indexOf(startMarker);
