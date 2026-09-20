@@ -33,6 +33,106 @@ npm run dev               # node server.js
 
 `npm test` and `npm run lint` **must pass** before opening a PR.
 
+## Screenshots
+
+The README references 5 PNGs under `docs/screenshots/` (startup, token
+modal, chat streaming, tool call, session switch). When you make a UI
+change that affects one of those screens:
+
+1. Capture the new screen as PNG (any standard screenshot tool is fine;
+   a 1.5× or 2× DPR capture is preferred for retina display).
+2. Drop the file into `docs/screenshots/` using the existing filename
+   scheme (`NN-<slug>.png`).
+3. Update the alt text and "What it shows" row in
+   [README.md → Screenshots](README.md#screenshots).
+4. Run `npm run check` — the doc-alignment script asserts on the
+   filenames referenced in README; if you rename a file without
+   updating README the check fails.
+
+## Common `npm test` failures
+
+These are the failures that show up most often on PRs. If your
+failure matches one of these, the fix is below — no need to open
+an issue.
+
+### C01. `better_sqlite3_not_loaded` / `Cannot find module 'better-sqlite3'`
+
+`server/lib/db.js` resolves `better-sqlite3` via a hard-coded candidate
+chain (env `MCODE_BETTER_SQLITE3` → `MCODE_CMD` relative → home layout
+→ dev layout). If none of those paths exist on your machine, the
+`server-startup.test.js` and `lib-db.test.js` suites fail with the
+above error.
+
+**Fix**:
+
+1. Find where mcode's bundled `better-sqlite3` actually lives:
+   ```bash
+   find ~/ -path "*/node_modules/better-sqlite3" -type d 2>/dev/null | head -3
+   ```
+2. Point the env at it:
+   ```bash
+   export MCODE_BETTER_SQLITE3=/path/to/better-sqlite3
+   npm test
+   ```
+3. If you can't find any `better-sqlite3` at all, install mcode
+   (npm-global `mcode` or a dev checkout under `~/.minimax-code/`).
+   The test suite skips the sqlite-backed tests when no better-sqlite3
+   is present, so the rest of the suite should still pass.
+
+### C02. Cross-OS path failures (`join` vs `path.posix.join`)
+
+Tests that resolve filesystem paths fail on Windows with
+`TypeError: must be string, not undefined` or
+`EBADF: bad file descriptor`. The cause is usually code that
+calls `path.join` (platform-aware) but the test fixture path was
+built with `path.posix.join` (always `/`), or vice versa.
+
+**Fix**:
+
+- For repo-internal paths (fixtures, temp dirs): use
+  `path.join(import.meta.dirname, ...)` — Node resolves it on both
+  platforms.
+- For user-supplied workspace paths: leave them as the user typed
+  them; let `path.join` do its job.
+- If a test passes on macOS / Linux but fails on Windows AppVeyor,
+  check whether the test does any path comparison (`assert.equal(p, "/tmp/...")`)
+  — replace with `path.normalize(p)` or compare just the basename.
+
+### C03. `mock.module` does not take effect (Node 24.14 pitfall)
+
+Symptom: a test sets up `t.mock.module(...)` for `lib/foo.js` and then
+dynamically imports `lib/foo.js` inside the same `before((t) => ...)` —
+the SUT still imports the real implementation. Only the
+`--experimental-test-module-mocks` flag (`npm test` enables it) makes
+the mock registration take effect.
+
+**Fix**:
+
+- Always run tests via `npm test` (which sets
+  `--experimental-test-module-mocks`). Calling `node --test test/*.test.js`
+  directly **does not** register the flag.
+- If you must call `node` directly, use the same flag list as
+  `package.json#scripts.test`.
+
+### C04. `MCODE_RUNTIME_DB` not set → tests mutate the real mavis sqlite
+
+`server-startup.test.js` exercises `runStartupCleanup()` which can
+touch the user's real `~/.minimax/v2/sqlite/runtime-state.sqlite`.
+If you run the suite without `MCODE_RUNTIME_DB` pointed at a temp
+file, the test may delete mcode sessions from your real DB.
+
+**Fix**:
+
+```bash
+export MCODE_RUNTIME_DB="$(mktemp -d)/runtime-state.sqlite"
+touch "$MCODE_RUNTIME_DB"
+npm test
+rm -rf "$(dirname "$MCODE_RUNTIME_DB")"
+```
+
+The CI matrix sets this env automatically; you only need to set it
+manually for local test runs.
+
 ## Repository layout
 
 This repo has a **dual layout** — both copies are kept in sync:

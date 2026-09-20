@@ -24,6 +24,7 @@ import {
 } from "../lib/settings.js";
 import { setTokenAuthEnabled } from "../lib/auth.js";
 import { broadcastTokenRotated, pushStateFor } from "../lib/state-bus.js";
+import { authorize } from "../lib/authorize.js";
 
 export function handleGetSettings(_req, res) {
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
@@ -74,6 +75,24 @@ export async function handlePostSettings(req, res, ctx) {
 
   // resetToken — generate a new token, broadcast SSE, return the new value
   if (payload.resetToken === true) {
+    // B03: token rotation is destructive — every remote client loses
+    //   its HEADERS / localStorage credential and must re-handshake.
+    //   Gate with authorize('token.reset', ctx) so the operator must
+    //   click a confirmation in the settings card before the rotation
+    //   fires. Decline / timeout leaves the current token intact.
+    const authResult = await authorize("token.reset", {
+      cid: ctx && ctx.cid ? ctx.cid : null,
+      rotationTrigger: "settings_card",
+    });
+    if (!authResult.approved) {
+      res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify({
+        ok: false,
+        error: "authorize declined",
+        decidedBy: authResult.decidedBy,
+        decidedAt: authResult.decidedAt,
+      }));
+    }
     let newToken;
     try {
       newToken = rotateToken();

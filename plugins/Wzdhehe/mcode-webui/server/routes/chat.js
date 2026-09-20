@@ -9,8 +9,8 @@ import {
   saveSessions,
   persistCurrentChat,
 } from "../lib/sessions.js";
-import { pushStateFor, getActiveChild } from "../lib/state-bus.js";
-import { handleLocalSlash, handleCmdCommand } from "../lib/slash.js";
+import { pushStateFor, pushAlert, getActiveChild } from "../lib/state-bus.js";
+import { handleLocalSlash, handleCmdCommand } from "../lib/interaction/commands.js";
 import { runMcodeAcp } from "../lib/mcode-acp.js";
 import { collectExecResult, runMcodeExec } from "../lib/mcode-exec.js";
 import { DEFAULT_MODEL } from "../lib/config.js";
@@ -138,7 +138,20 @@ export async function handleSend(req, res, ctx) {
     } else if (/requires.*input|interactive/i.test(rawMsg)) {
       hint = " (此工具需要交互模式，webui 暂不支持)";
     }
-    cs.chat = [...cs.chat, `! [error] ${oneLine}${hint}`];
+    // v2.0 (lease B02): §AP3 — errors no longer pollute the chat
+    // stream. Surface them via the independent anomaly channel;
+    // cs.context.assistantLast keeps the error in the model context
+    // (so a follow-up turn can reference it) but the user-facing
+    // chat list stays clean. The bell icon (frontend, C batch) shows
+    // the alert with the matching id.
+    pushAlert({
+      level: "error",
+      msg: `[chat.send] ${oneLine}${hint}`,
+      src: "chat.send",
+      cid,
+      sessionId: r.sessionId || null,
+      data: { status: r.status, error: r.error || null },
+    });
     cs.context.assistantLast = `[error] ${oneLine}`;
     cs.context.assistantAt = Date.now();
   }

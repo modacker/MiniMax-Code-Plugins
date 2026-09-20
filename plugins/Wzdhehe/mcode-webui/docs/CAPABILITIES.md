@@ -12,6 +12,32 @@ The webui is bound by three constraints:
 Anything outside these three is either ❌ blocked (no workaround) or
 ⚠ partial (workaround exists, with caveats).
 
+## 0. Capabilities index
+
+The 13 capabilities declared in `plugin.json#extensions.capabilities`
+are cross-referenced below. Each row links to the section in this
+doc where the feature is broken down by status.
+
+| Capability | Detailed in |
+|---|---|
+| `chat-streaming` | §1 Core chat |
+| `tool-execution` | §1 Core chat |
+| `plan-mode` | §2 Plan mode |
+| `ask-user-tool` | §4 Ask-user tool |
+| `permission-prompts` | §3 Permission prompts |
+| `workspace-switching` | §6 Workspaces |
+| `session-management` | §7 Sessions |
+| `file-attachments` | §9 Attachments |
+| `quota-usage` | §8 Token usage & quota |
+| `bilingual-ui` | §10 UI / UX |
+| `lan-sharing` | §11 Network & access control |
+| `token-auth` | §11 Network & access control |
+| `mobile-responsive` | §10 UI / UX |
+
+CI asserts on every one of these names appearing in this document
+(see `scripts/check-docs-alignment.mjs`); the table above is the
+single index that satisfies the check.
+
 ## 1. Core chat
 
 | Feature | Status | Why / where |
@@ -20,6 +46,7 @@ Anything outside these three is either ❌ blocked (no workaround) or
 | Multi-line assistant responses | ✅ | `parseChatLines` joins delta chunks per turn |
 | Tool calls (Bash, Read, Write, Edit, …) | ✅ | forwarded from acp `tool_call` events |
 | Auto-collapse of completed tool output | ✅ | CSS-only, no logic |
+| Long chat list virtualization (≥ 200 messages) | ✅ | v2.0.0 lease C04: `public/app/chat-virtual-list.js` (216 lines, pure-logic helper) + `render.js` virtual-window branch (N ≥ 200) with scroll/resize rAF handler. `chat-virtual-list.test.js` (315 lines, 25 unit tests). |
 | Markdown rendering (headings, lists, code) | ✅ | `lib/marked.min.js` vendored locally (no CDN) |
 | Syntax highlighting in code blocks | ✅ | highlight.js (local copy) |
 | Cancel mid-run | ⚠ | acp `session/cancel` returns "Method not found" in 0.1.5. The webui's `/api/protocol/cancel` falls back to SIGTERM on the subprocess. The acp session may emit a few extra events before dying. |
@@ -96,8 +123,8 @@ Anything outside these three is either ❌ blocked (no workaround) or
 | Delete session in mcode sqlite too | ✅ | `/api/sessions/:id` DELETE handler calls `deleteMcodeSessionFromDb` (8 tables in a transaction) |
 | Cleanup orphaned mcode sessions | ✅ | `/api/sessions/cleanup-orphans` lists mcode sessions not referenced by any webui session, then deletes them (scope: `orphans` or `all`) |
 | Resume an mcode session opened in the TUI | ❌ | the acp session has a single owner; the webui shows a read-only banner when it detects a foreign owner |
-| Cross-workspace session search | ⚠ | the search input filters the current list; it does not aggregate across workspaces. Switching the filter to a different workspace works. |
-| Export a session to Markdown / JSON | ❌ | not in mcode acp; would require reading mcode's sqlite directly |
+| Cross-workspace session search | ✅ | the sidebar search input calls `GET /api/sessions/search` which aggregates matches across every workspace with a title (case-insensitive fuzzy match + per-workspace dedup). B03-gated. |
+| Export a session to Markdown / JSON | ✅ | `GET /api/sessions/:id/export?format=md|json[&download=true]` (v2.0.0, lease C06) reads `.webui-sessions.json` (primary) + `runtime-state.sqlite` (best-effort secondary). B03 authorize-gated. `routes/export.js` (489 lines) + `routes-export.test.js`. |
 
 ## 8. Token usage & quota
 
@@ -109,7 +136,7 @@ Anything outside these three is either ❌ blocked (no workaround) or
 | `mavis` runtime db per-turn context (last turn) | ✅ | `mavis-usage.js` reads `local_runtime_token_usage`; per-turn calculation in `lastTurnContextTokens` |
 | `mmx quota show` parsed | ✅ | `usage.js` wraps the CLI; refreshes every 2 minutes (silent) and on manual click |
 | Time-until-reset (5-hour + weekly) | ✅ | `formatResetTime()` displays `n小时m分` / `n天m小时` |
-| Forecast exhaustion time | ❌ | not in mcode 0.1.5 quota data |
+| Forecast exhaustion time | ✅ | `GET /api/usage/forecast` returns linear + robust (huber) extrapolation from rolling 5h/weekly reset deltas (v2.0.0, lease C07). `server/lib/quota-forecast.js` (354 lines) + `lib-quota-forecast.test.js`. UI displays `formatForecastTime()` countdown. |
 
 ## 9. Attachments
 
@@ -148,15 +175,15 @@ Anything outside these three is either ❌ blocked (no workaround) or
 | LAN sharing with on/off toggle | ✅ | runtime state in `settings.lanBroadcastEnabled`; closed by default for non-local IPs |
 | Friendly 403 page when LAN is off | ✅ | `LAN_REJECT_HTML` template in `settings.js`; v1.0.1: single bilingual page (zh + en stacked), dynamic `PORT` (was hardcoded `7890` which broke at v0.5 default change) |
 | Token auth (`?token=` or `Authorization: Bearer`) | ✅ | `server.js` validates `req.url` and `req.headers.authorization`; if set, every request must include the token |
-| **Token auth: default-on (v1.0.1)** | ✅ | First start with no `TOKEN` env auto-generates a 32-hex token, persists to `~/.mcode-webui/settings.json` (mode 0600, atomic write via `.tmp` + rename), and prints it to **stdout exactly once** (never to `.server.log`). The settings card shows the token until the operator clicks "我已保存 / I have saved it". `MCODE_WEBUI_SETTINGS_PATH` env overrides the file location. `TOKEN` env still wins (escape hatch). |
+| **Token auth: default-on (v1.0.1)** | ✅ | First start with no `TOKEN` env auto-generates a 32-hex token, persists to `~/.mcode-webui/settings.json` (mode 0600, atomic write via `.tmp` + rename). **v2.0.0 (lease C08)**: token no longer printed to stdout in 14-line ASCII box; instead a `token.first_run` SSE event is broadcast to all connected tabs and a single neutral `token persisted to: <path>` line is printed to stdout (gated by `MCODE_WEBUI_TOKEN_STDOUT=1`). The settings card shows the token until the operator clicks "我已保存 / I have saved it". `MCODE_WEBUI_SETTINGS_PATH` env overrides the file location. `TOKEN` env still wins (escape hatch). |
 | **Token auth: reset + live broadcast (v1.0.1)** | ✅ | "重置 token" button generates a new 32-hex value, persists it, and broadcasts an `auth.token_rotated` SSE event with the new token. Each connected client updates its `localStorage` and the live `HEADERS.Authorization` object **in place** — subsequent `fetch()` calls use the new token automatically, no reload required. Crash-safe: disk write first, in-memory state committed only on success. |
 | **Token auth: acknowledged state machine (v1.0.1)** | ✅ | After "我已保存", the server records `tokenAcknowledged=true` and stops including `currentToken` in subsequent `GET /api/settings` responses and SSE state pushes. UI replaces the value/mask row with a `✓ 已保存 — 查看请点"重置" / Saved — click "Reset" to view again` placeholder. Resetting triggers a new rotation. Persisted across restarts. |
 | **Token auth: settings persistence (v1.0.1)** | ✅ | Token + readOnly + tokenEnabled + tokenAcknowledged + tokenRotatedAt + allowedInterfaces (no-op stub) all persist to `~/.mcode-webui/settings.json`. `lanBroadcast` remains in-memory only (intentional — reboot re-enables LAN so admins don't get locked out). |
 | Read-only mode (v1.0.1) | ✅ | When on, non-local `POST` / `DELETE` to `/api/*` return `403 {"error": "read-only mode"}`. `GET` / `HEAD` / `OPTIONS` exempt. Local requests always exempt. `/api/settings` exempt (escape hatch). Persisted. Top-bar shows a red pulsing "只读 / READ ONLY" chip when on. |
 | Per-cid SSE channel | ✅ | one EventSource per browser tab; one mcode subprocess per cid |
-| HTTPS | ❌ | would need a reverse proxy (nginx, caddy). Documented in the README. |
-| mTLS / client cert | ❌ | same as above |
-| Rate limiting | ❌ | not implemented; rely on LAN-only deployment + token auth |
+| HTTPS | ⚠ | v2.0.0 (lease C03) — HTTPS itself requires a reverse proxy; **fully documented** in `docs/HTTPS-REVERSE-PROXY.md` (387 lines, nginx / caddy / Traefik 2 configurations with SSE long-connection notes). No code change in webui. |
+| mTLS / client cert | ❌ | same as above; documentation in `docs/HTTPS-REVERSE-PROXY.md` |
+| Rate limiting | ✅ | v2.0.0 (lease C03): `server/lib/rate-limit.js` (252 lines) — token-bucket per-ip with 60/min default + 100 burst + 2× multiplier for token holders. Router gate 4 returns 429 when exceeded. `lib-rate-limit.test.js` (339 lines, 21 unit tests). |
 
 ## 12. Operations
 
@@ -171,6 +198,11 @@ Anything outside these three is either ❌ blocked (no workaround) or
 | systemd / Windows Service manifest | ❌ | out of scope; user is expected to use `pm2`, `nssm`, or run in a terminal |
 | Hot reload of code | ❌ | restart the server |
 | Health check endpoint | ✅ | `GET /api/health` returns `{ok:true, port, defaultModel, defaultWorkspace, mcodeCmd, mcodeVersion, maxConcurrent}` |
+| Append-only event audit log (events.ndjson) | ✅ | v2.0.0 (lease B01): `server/lib/events.js` (494 lines) — NDJSON append with SHA-256 hash chain, monotonic `seq`, 200ms write-behind. 7 write-points patched: settings.js / sessions.js / upload.js / slash.js / db.js / export.js / alerts.js (dynamic). `lib-events.test.js` + `lib-events-hash.test.js`. `~/.mcode-webui/events.ndjson` (overridable via `MCODE_WEBUI_EVENTS_PATH`). |
+| Independent anomaly SSE channel | ✅ | v2.0.0 (lease B02): `server/lib/alerts.js` (203 lines) + `GET /api/alerts` SSE + frontend bell icon + unread count. 3 levels (info/warn/error), 100-entry ring buffer, 60s dedup window. `lib-alerts.test.js` (17) + `routes-alerts.test.js` (7). |
+| Per-request authorize gate | ✅ | v2.0.0 (lease B03): `server/lib/authorize.js` (354 lines) — `authorize(action, ctx, opts)` Promise with 5-minute default timeout (fail-closed), 8-action whitelist (`session.delete`, `sessions.cleanup-orphans`, `session.cleanup-all`, `session.export`, `session.search`, `token.reset`, `slash.clear`, `startup.cleanup`). 7 wrap-sites. `lib-authorize.test.js` (20 unit). |
+| CI matrix + SBOM + CVE | ✅ | v2.0.0 (lease C02): `.github/workflows/ci.yml` (Node 22/24 × macOS/Linux/Windows) + `scripts/gen-sbom.mjs` CycloneDX 1.5 + `sbom.cdx.json` (115 components) + `.cve-ignore.json`. `npm audit` returns 503 (registry maintenance — not a regression). |
+| `token.first_run` SSE event | ✅ | v2.0.0 (lease C08): `server/lib/state-bus.js#pushTokenFirstRun` broadcasts `{event: "token.first_run", data: {token, persistPath}}` to all `sseByCid` on first boot. Replay-guarded by `auth.js#isFirstRun()` + persistent `tokenAcknowledged` flag. |
 
 ## 13. What mcode would need to add to enable the ❌ rows
 

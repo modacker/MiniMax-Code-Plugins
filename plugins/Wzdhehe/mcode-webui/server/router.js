@@ -5,10 +5,11 @@
 //   1. CORS headers (always)
 //   2. LAN reject (non-local + LAN off)
 //   3. Token auth (non-local + token enabled + token set)
-//   4. Read-only gate (non-local + readOnly + non-GET/OPTIONS)
-//   5. Route dispatch
+//   4. Rate limit (per-{IP,token}; /api/* minus /api/health; OPTIONS exempt)
+//   5. Read-only gate (non-local + readOnly + non-GET/OPTIONS)
+//   6. Route dispatch
 //
-// Local requests (loopback + this host's LAN_IP) bypass (2)(3)(4).
+// Local requests (loopback + this host's LAN_IP) bypass (2)(3)(4)(5).
 // `/api/settings` is exempted from (2) so users can flip the LAN switch
 // back on from a remote device.
 
@@ -21,10 +22,22 @@ import {
 import { getClient, getCidFromReq } from "./lib/state-bus.js";
 import { serveStatic, serveIndex } from "./lib/static.js";
 import { isRequestAuthorized, writeAuthRequired } from "./lib/auth.js";
+// v2.0 (lease C03): per-{IP,token} fixed-window rate limiter. See
+// server/lib/rate-limit.js for the algorithm + tunables.
+import { rateLimitMiddleware } from "./lib/rate-limit.js";
+// v2.0 (reconcile §6.1): POST /api/auth/decision handler. Per-request
+// authorize() in server/lib/authorize.js (B03) needs a route to receive
+// the client's {requestId, approve} reply; without this binding the
+// authorize() Promise hangs forever.
+import * as authorizeRoute from "./lib/authorize.js";
 
 import * as healthRoute from "./routes/health.js";
 import * as stateRoute from "./routes/state.js";
+// v2.0 (lease B02): independent anomaly channel — bell icon data feed
+import * as alertsRoute from "./routes/alerts.js";
 import * as sessionsRoute from "./routes/sessions.js";
+// v2.0 (lease C06): session export (Markdown / JSON)
+import * as exportRoute from "./routes/export.js";
 import * as chatRoute from "./routes/chat.js";
 import * as usageRoute from "./routes/usage.js";
 import * as workspaceRoute from "./routes/workspace.js";
@@ -97,6 +110,13 @@ const ROUTES = [
     handler: stateRoute.handleState,
   },
 
+  // v2.0 (lease B02): anomaly / system-signal SSE channel
+  {
+    method: "GET",
+    match: (p) => p === "/api/alerts",
+    handler: alertsRoute.handleAlerts,
+  },
+
   // ACP session endpoints
   {
     method: "GET",
@@ -124,6 +144,35 @@ const ROUTES = [
     method: "POST",
     match: (p) => p === "/api/sessions/switch",
     handler: sessionsRoute.handleSwitchSession,
+  },
+  // v2.0 (lease C06): GET /api/sessions/:id/export?format=md|json[&download=true]
+  //   Registers before the DELETE match so a future change to that
+  //   catch-all doesn't accidentally swallow GETs for /export. The
+  //   DELETE match is method-gated, so this is defensive — both
+  //   orderings work today.
+  {
+    method: "GET",
+    match: (p) => /^\/api\/sessions\/[^\/]+\/export$/.test(p),
+    handler: exportRoute.handleExport,
+  },
+  // Lease C05: GET /api/sessions/search?q=...&workspace=...&limit=...
+  //   Cross-workspace session search. Registered as an exact match
+  //   before the DELETE catch-all (which is method-gated anyway, so
+  //   order is defensive — same rationale as the export route above).
+  {
+    method: "GET",
+    match: (p) => p === "/api/sessions/search",
+    handler: sessionsRoute.handleSearchSessions,
+  },
+  // v2.0 (reconcile §6.1): wire handleCleanupOrphans. Was exported by
+  // server/routes/sessions.js (B03) but never bound to a route — docs/API.md
+  // has documented POST /api/sessions/cleanup-orphans since v0.5.bx-19 and
+  // check-docs-alignment §6 caught the drift. Method-gated POST + method-only
+  // path match, so it doesn't collide with the DELETE catch-all below.
+  {
+    method: "POST",
+    match: (p) => p === "/api/sessions/cleanup-orphans",
+    handler: sessionsRoute.handleCleanupOrphans,
   },
   {
     method: "DELETE",
@@ -165,6 +214,14 @@ const ROUTES = [
     match: (p) => p === "/api/refresh",
     handler: usageRoute.handleRefresh,
   },
+  // C07: quota exhaustion forecast (linear LS on usage history)
+  //   GET returns { ok: true, forecast: { hoursUntilExhaustion5h, ... } }
+  //   pure read-only endpoint — no quota key required, just history.
+  {
+    method: "GET",
+    match: (p) => p === "/api/usage/forecast",
+    handler: usageRoute.handleForecast,
+  },
 
   // Workspace
   {
@@ -188,6 +245,16 @@ const ROUTES = [
     method: "POST",
     match: (p) => p === "/api/settings",
     handler: settingsRoute.handlePostSettings,
+  },
+  // v2.0 (reconcile §6.1): POST /api/auth/decision — the SSE-driven
+  // authorize gate close path. Was exported by server/lib/authorize.js
+  // (B03) but never bound to a route. Client posts {requestId, approve}
+  // to resolve the per-request authorize() Promise. Method-gated POST,
+  // exact path match, before the catch-all.
+  {
+    method: "POST",
+    match: (p) => p === "/api/auth/decision",
+    handler: authorizeRoute.handleAuthDecision,
   },
 
   // Upload
@@ -311,7 +378,33 @@ export async function handleRequest(req, res) {
     return;
   }
 
-  // Gate 4: read-only mode (v1.0.1)
+  // Gate 4: rate limit (v2.0, lease C03).
+  //   - Loopback requests bypass entirely (isLocalRequest).
+  //   - `/` and `/api/health` are never throttled — health must answer
+  //     for orchestrators (k8s liveness probes), and `/` is a static
+  //     file that goes through serveStatic, not the /api/* tree.
+  //   - OPTIONS preflight bypasses so cross-origin clients can complete
+  //     their handshake before they hit the limiter.
+  //   - Token holders get 2x budget (see rate-limit.js); the multiplier
+  //     is transparent here — we just call middleware().
+  if (
+    !local &&
+    pathname.startsWith("/api/") &&
+    pathname !== "/api/health" &&
+    req.method !== "OPTIONS" &&
+    req.method !== "HEAD"
+  ) {
+    const rl = rateLimitMiddleware(req, res);
+    if (rl.blocked) {
+      if (!res.headersSent) {
+        res.writeHead(rl.status || 429, rl.headers || {});
+        res.end(JSON.stringify(rl.body));
+      }
+      return;
+    }
+  }
+
+  // Gate 5: read-only mode (v1.0.1)
   //   - Local request: always allowed (admin should never get locked out)
   //   - OPTIONS preflight: always allowed
   //   - Non-GET (POST/PUT/DELETE): 403

@@ -34,6 +34,69 @@ node server.js
 | `test/` | `node:test` unit tests |
 | `package.json` | Project metadata + scripts |
 
+## Screenshots
+
+The PNGs in `docs/screenshots/` are **real captures** taken against a
+running v2.0.0 server (`PORT=8123 HOST=127.0.0.1 MCODE_CMD=/Users/moc/.minimax-code/bin/mcode`)
+on 2026-09-20 with the ego-browser skill. The screenshots cover the five
+most informative views of the webui: startup, mid-chat with the prior
+"Greeting" session restored, the left-bottom settings panel (Dark / English
+/ LAN Access), a typed-but-unsent prompt with the chat-input affordances,
+and the post-send state showing the SSE delta stream.
+
+| # | What it shows |
+|---|---|
+| 1 | **Startup** — the empty chat view on first launch: top bar with workspace / model / LAN chips, an empty conversation area, and the prompt input at the bottom. |
+| 2 | **Mid-stream chat** — the webui rendering the "Greeting" session: history loaded, a streaming assistant response in progress over SSE, the in-page tok/s meter, and the per-turn context window chip. |
+| 3 | **Settings panel** — the left-bottom card with Appearance (Dark), Language (English), and LAN Access toggles; clicking LAN Access flips `POST /api/settings` and broadcasts the change via `auth.token_rotated` SSE. |
+| 4 | **Chat with prompt typed** — the input textarea showing a real user prompt ("Can you list the files in this workspace?") with the send/stop affordances, `/` slash-command hint, `@file` injection hint, and the `Enter to send` cue. |
+| 5 | **Post-send + tool call** — the webui after Enter: the user message rendered in the chat, the assistant turn streaming, and (if the model chooses) the Bash / Read / Write tool-call block with structured argument preview and the auto-collapse arrow once the call finishes. |
+
+### Inline previews
+
+The image links below use relative paths to `docs/screenshots/`. They
+resolve on the marketplace plugin tree at `plugins/Wzdhehe/mcode-webui/`.
+
+![Startup screen — empty chat on first launch](docs/screenshots/01-startup.png)
+
+![Mid-stream chat — Greeting session loaded, SSE deltas in flight](docs/screenshots/02-chat-session.png)
+
+![Settings panel — Appearance / Language / LAN Access toggles](docs/screenshots/03-settings-panel.png)
+
+![Chat input — typed prompt with send/stop affordances + slash hint](docs/screenshots/04-chat-typed.png)
+
+![Post-send + tool call — user prompt rendered, assistant SSE deltas streaming, tool-call block unfolded](docs/screenshots/05-tool-call.png)
+
+> Contributing a screenshot? See [CONTRIBUTING.md](CONTRIBUTING.md#screenshots).
+
+## Capabilities
+
+This plugin exposes 13 capabilities, declared in
+[`plugin.json`](plugin.json) under `extensions.capabilities` and
+described in full detail in [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md).
+The names below are the canonical identifiers — keep them stable;
+external registries / IDE integrations match on these strings.
+
+| Capability | One-line |
+|---|---|
+| `chat-streaming` | SSE deltas from `mcode acp` rendered token-by-token |
+| `tool-execution` | Bash / Read / Write / Edit forwarded from acp `tool_call` events |
+| `plan-mode` | Plan review modal with `agree` / `skip` / `add context` options |
+| `ask-user-tool` | 2-4 option question modal with `Other` free-text fallback |
+| `permission-prompts` | `ask` / `auto` / `full` approval modal for tool calls |
+| `workspace-switching` | Workspace picker + recent list + last-used restore |
+| `session-management` | List / create / switch / delete webui sessions |
+| `file-attachments` | Drag-drop / click / paste upload + `@path` injection |
+| `quota-usage` | `mmx quota show` + per-turn context window display |
+| `bilingual-ui` | zh-CN / en locale toggle via `t(key)` lookup tables |
+| `lan-sharing` | Default `0.0.0.0` bind with runtime on/off toggle |
+| `token-auth` | `?token=` / `Authorization: Bearer` for non-local requests |
+| `mobile-responsive` | Drawer at <900px, single column at <600px |
+
+CI asserts on every one of these names being mentioned in this README
+and in [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) (see
+`scripts/check-docs-alignment.mjs`).
+
 ## Configuration
 
 All settings are environment variables. See

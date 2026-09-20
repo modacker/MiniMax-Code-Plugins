@@ -6,6 +6,20 @@ import { applyI18n, applyTheme, currentLang, setLang, t, toggleTheme } from './i
 import { MODE_ICONS, __DBG, escapeHtml, formatNumber, formatResetTime, formatTimeUntil, nextFiveHourReset, nextWeeklyReset, parseMarkdown, showToast } from './util.js'
 import { setLeftOpen, setRightOpen, API_SUFFIX, sidebarReady, CID, CID_QUERY, HEADERS, TOKEN, TOKEN_QUERY, autoRefreshTimer, connect, es, getGeneralQuota, leftOpen, refreshUsage, renderUsage, renderUsagePopover, renderUsageValue, rightOpen, sessionSearchQuery, setSearchQuery, setSidebarReady, setState, state, toggleUsagePopover, tokenParam, urlParams } from './state.js'
 import { SLASH_COMMANDS, SLASH_SKILLS, attachEvents, attachModalEvents, attachedFiles, attachmentList, autoResize, checkModals, fileInput, filterSlash, hideMode, hidePerm, hidePlan, hidePlanMode, hideSettings, hideSlash, isSending, lastShownPermKey, lastShownPlanKey, lastShownPlanModeKey, modeOpen, modePopover, moveSlash, permOpen, planModeOpen, planOpen, planSending, removeAttachment, renderAttachments, renderPerm, renderPlan, selectSlash, send, sendPermAnswer, sendPlanAnswer, sendPlanModeAnswer, setMode, settingsMenu, showPerm, showPlan, showPlanMode, showSlash, slashActiveIdx, slashFiltered, slashInput, slashOpen, slashOverlay, slashQuery, slashResults, stopExec, toggleLang, toggleMode, toggleSettings, uploadFiles } from './events.js'
+// v2 (Lease C04): chat-list virtualization. The pure-logic helpers
+//   (computeVirtualWindow / decideScrollBehavior / isNearBottom /
+//   estimateDomNodeCount) live in chat-virtual-list.js — testable in
+//   Node without jsdom (see test/chat-virtual-list.test.js). This file
+//   wires the DOM side: scroll/resize listeners, spacer divs, slice +
+//   re-render on scroll.
+import {
+    computeVirtualWindow,
+    decideScrollBehavior,
+    isNearBottom,
+    ESTIMATED_MESSAGE_HEIGHT,
+    VIRTUAL_LIST_BUFFER,
+    VIRTUAL_LIST_THRESHOLD,
+} from './chat-virtual-list.js'
 
 // v0.5.ax: 欢迎页时隐藏右侧栏（chat-area 居中铺满）
 export function hideRightForWelcome(isWelcome) {
@@ -524,6 +538,74 @@ export function renderSessions() {
       return title.includes(q) || s.id.toLowerCase().includes(q)
     })
   }
+  // Lease C05: cross-workspace search. When q is set, fetch from
+  //   /api/sessions/search and merge results into the list. The
+  //   fetch is debounced (q changes per keystroke — we only want one
+  //   in flight at a time) and the result is stored in a module-level
+  //   cache so subsequent renderSessions() calls can show it without
+  //   re-fetching.
+  //
+  //   Token-based race guard: _c05SearchToken is bumped on every
+  //   render so an in-flight earlier call cannot overwrite a later
+  //   result.
+  if (q) {
+    const token = (renderSessions._c05SearchToken = (renderSessions._c05SearchToken || 0) + 1)
+    // Schedule the fetch on the next tick so we don't fire on the
+    //   initial empty-list render that runs immediately after setSearchQuery.
+    //   _c05SearchLastQ caches the query we last fired for so we don't
+    //   re-fire identical queries.
+    const lastQ = renderSessions._c05SearchLastQ
+    const lastT = renderSessions._c05SearchLastToken
+    if (typeof fetch === 'function' && (lastQ !== q || lastT !== token - 1 || !renderSessions._c05SearchInFlight)) {
+      // Only fire if the query changed since the last successful
+      //   fetch (avoids refetch on every render). Compare via q.
+      if (lastQ !== q) {
+        renderSessions._c05SearchLastQ = q
+        renderSessions._c05SearchInFlight = true
+        const searchUrl = '/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=20'
+        try {
+          fetch(searchUrl, { headers: HEADERS })
+            .then(r => r.ok ? r.json() : null)
+            .then(data => {
+              renderSessions._c05SearchInFlight = false
+              if (renderSessions._c05SearchToken !== token) return // raced
+              renderSessions._c05SearchResults = (data && data.ok && Array.isArray(data.results)) ? data.results : []
+              renderSessions()
+            })
+            .catch(() => { renderSessions._c05SearchInFlight = false })
+        } catch { renderSessions._c05SearchInFlight = false }
+      }
+    }
+    // Merge cached API results into the local filtered list.
+    //   Each result row carries its workspace so the sidebar shows
+    //   which workspace it came from (workspace prefix on the title
+    //   row, per task spec §"跨 workspace 展示").
+    const cached = Array.isArray(renderSessions._c05SearchResults) ? renderSessions._c05SearchResults : []
+    if (cached.length > 0) {
+      const ids = new Set(filtered.map(s => s.id))
+      for (const r of cached) {
+        if (!r || !r.id || ids.has(r.id)) continue
+        ids.add(r.id)
+        const ws = r.workspace || ''
+        const wsShort = ws ? ws.split(/[\\/]/).filter(Boolean).slice(-1)[0] : ''
+        filtered.push({
+          id: r.id,
+          kind: 'c05-search',
+          title: r.title || '(untitled)',
+          workspace: ws,
+          updatedAt: r.updatedAt || 0,
+          matchScore: r.matchScore || 0,
+          _wsShort: wsShort,
+        })
+      }
+    }
+  } else {
+    // Empty q: clear the cache so a future search starts fresh.
+    if (renderSessions._c05SearchResults && renderSessions._c05SearchResults.length > 0) {
+      renderSessions._c05SearchResults = []
+    }
+    renderSessions._c05SearchLastQ = ''
+  }
   if (filtered.length === 0) {
     const msg = q ? (currentLang === 'zh' ? '没有匹配的会话' : 'No matching sessions') : t('no_sessions')
     list.innerHTML = `<div class="session-title-empty">${msg}</div>`
@@ -568,10 +650,18 @@ export function renderSessions() {
       //   之前 v0.5.bv 写死不显示是因为 webui 没能力删 mcode session; 现在能了
       //   删 mcode session 走 server DELETE → SQL 删 mcode db (8 张表事务), 不依赖 mcode TUI
       const deleteBtn = `<button class="session-delete" data-id="${escapeHtml(s.id)}" title="${t('session_delete')}">×</button>`
+      // Lease C05: cross-workspace search results get a small
+      //   "[ws-short]" prefix on the title row so the user can see
+      //   which workspace each match came from. Only the rows whose
+      //   `kind` is 'c05-search' (i.e. surfaced via /api/sessions/search
+      //   and not already in the in-memory list) get the prefix.
+      const c05Prefix = s.kind === 'c05-search' && s._wsShort
+        ? `<span class="session-c05-prefix">[${escapeHtml(s._wsShort)}]</span> `
+        : ''
       return `<div class="session-item${active}" data-id="${escapeHtml(s.id)}" data-kind="${s.kind}" title="${escapeHtml(title)}">
         <div class="session-dot"></div>
         <div class="session-info">
-          <div class="session-name">${short}</div>
+          <div class="session-name">${c05Prefix}${short}</div>
           <div class="session-id">${idLabel}</div>
         </div>
         ${deleteBtn}
@@ -781,9 +871,124 @@ export function renderUserFooter() {
 // v0.5.ak: User footer 已改为静态 GitHub 链接，renderUserFooter / startUserFooterTicker 不再需要
 // 保留 renderUserFooter 旧定义兼容（CSS 已 hide 其内容），但不再被调用
 
+// ============================================================
+// v2 (Lease C04): chat-list virtualization
+// ============================================================
+//
+// The full chat is held in state.chat (lines from acp event stream).
+// For chats with N ≥ 200 messages, rendering the full list every time
+// state changes (≈ every chat delta / quota refresh / token rotation)
+// becomes a hot spot — DOM creation cost dominates the main thread.
+//
+// The virtual list keeps the DOM bounded: it renders only the slice
+// that's currently visible (plus a ±50 message buffer), with two
+// spacer divs (top + bottom) sized so the scrollbar represents the
+// full chat. The visible window recomputes on scroll / resize via a
+// requestAnimationFrame-coalesced handler.
+//
+// Below the threshold (N < 200) we fall back to the legacy full
+// render — the overhead of setting up virtual (spacers, scroll
+// handler, sliced re-render) isn't worth it for short chats.
+//
+// Pure logic (window computation, scroll-behavior decision, perf
+// estimator) lives in chat-virtual-list.js — see
+// test/chat-virtual-list.test.js for the math contract.
+
+// Module-scoped state for the virtual list. Single-tab process, no
+// need to make this per-cid — each tab renders its own chat via
+// its own render.js instance anyway (per-cid SSE channel).
+let __chatVirtualEnabled = false
+let __chatVirtualRAF = null
+let __chatScrollHandlerInstalled = false
+let __chatScrollState = { scrollTop: 0, clientHeight: 600 }
+// Cache the latest parsed messages + latestAskIdx so the scroll
+// handler can re-render without re-parsing the chat lines on every
+// scroll tick. parseChatLines is O(N) and the scroll handler fires
+// per frame — caching is the difference between 60Hz re-parses and
+// zero re-parses during a scroll gesture.
+let __chatMessagesCache = null
+let __chatLatestAskIdx = -1
+
+function __renderSlicedInto(inner, slice, sliceStartIdx, latestAskIdx) {
+    const msgContainer = inner.querySelector('.chat-virtual-messages')
+    const html = slice
+        .map((m, i) =>
+            renderMessage(m, { isLatestAsk: (sliceStartIdx + i) === latestAskIdx }),
+        )
+        .join('')
+    if (msgContainer) {
+        msgContainer.innerHTML = html
+    } else {
+        inner.innerHTML = html
+    }
+    attachStructuredBlockHandlers(inner)
+}
+
+function __renderVirtualInto(inner, messages, latestAskIdx, scrollEl) {
+    // Capture scroll metrics at the moment of render so the slice
+    // matches what the user is looking at right now.
+    __chatScrollState = {
+        scrollTop: scrollEl.scrollTop,
+        clientHeight: scrollEl.clientHeight,
+    }
+    const w = computeVirtualWindow({
+        totalCount: messages.length,
+        scrollTop: __chatScrollState.scrollTop,
+        clientHeight: __chatScrollState.clientHeight,
+    })
+    const slice = messages.slice(w.startIdx, w.endIdx)
+    // Two spacer divs + a messages container. Re-renders only rewrite
+    // .chat-virtual-messages' innerHTML, preserving the spacers — so
+    // scrollTop stays anchored on the user-visible messages.
+    inner.innerHTML =
+        `<div class="chat-virtual-spacer" data-role="top" style="height:${w.topSpacer}px;flex-shrink:0"></div>` +
+        `<div class="chat-virtual-messages">` +
+        slice.map((m, i) =>
+            renderMessage(m, { isLatestAsk: (w.startIdx + i) === latestAskIdx }),
+        ).join('') +
+        `</div>` +
+        `<div class="chat-virtual-spacer" data-role="bottom" style="height:${w.bottomSpacer}px;flex-shrink:0"></div>`
+    attachStructuredBlockHandlers(inner)
+}
+
+function __installChatScrollHandler(scrollEl, inner) {
+    if (__chatScrollHandlerInstalled) return
+    __chatScrollHandlerInstalled = true
+    // rAF-coalesced scroll handler: per scroll-tick, recompute the
+    // visible window and re-render the message container. rAF caps
+    // re-renders at one per frame even if the browser fires scroll
+    // 100x during a smooth-scroll gesture.
+    scrollEl.addEventListener('scroll', () => {
+        __chatScrollState = {
+            scrollTop: scrollEl.scrollTop,
+            clientHeight: scrollEl.clientHeight,
+        }
+        if (__chatVirtualRAF !== null) return
+        if (typeof requestAnimationFrame !== 'function') return
+        __chatVirtualRAF = requestAnimationFrame(() => {
+            __chatVirtualRAF = null
+            if (!__chatVirtualEnabled || !__chatMessagesCache) return
+            const startIdx = Math.max(0, Math.floor(__chatScrollState.scrollTop / ESTIMATED_MESSAGE_HEIGHT) - VIRTUAL_LIST_BUFFER)
+            const endIdx = Math.min(
+                __chatMessagesCache.length,
+                Math.ceil((__chatScrollState.scrollTop + __chatScrollState.clientHeight) / ESTIMATED_MESSAGE_HEIGHT) + VIRTUAL_LIST_BUFFER,
+            )
+            const slice = __chatMessagesCache.slice(startIdx, endIdx)
+            __renderSlicedInto(inner, slice, startIdx, __chatLatestAskIdx)
+        })
+    }, { passive: true })
+    // Window resize → recompute visible window (clientHeight changed).
+    window.addEventListener('resize', () => {
+        __chatScrollState.clientHeight = scrollEl.clientHeight
+        if (!__chatVirtualEnabled || !__chatMessagesCache) return
+        __renderVirtualInto(inner, __chatMessagesCache, __chatLatestAskIdx, scrollEl)
+    })
+}
+
 export function renderChat() {
   const inner = document.getElementById('chat-inner')
   const empty = document.getElementById('chat-empty')
+  const scroll = document.getElementById('chat-scroll')
   let lines = state?.chat || []
   // 过滤掉 mcode TUI 的 placeholder / 空 prompt 标记（shim 偶尔会误抓）
   lines = lines.filter(l => {
@@ -804,6 +1009,10 @@ export function renderChat() {
     if (empty) empty.style.display = ''
     // v0.5.x: 切到空 chat 的 session 时必须清空 inner，否则会残留上一个 session 的 messages
     if (inner) inner.innerHTML = ''
+    // v2 (Lease C04): drop virtual list state — empty chat renders as welcome page.
+    __chatVirtualEnabled = false
+    __chatMessagesCache = null
+    __chatLatestAskIdx = -1
     // v0.5.ae: 空 chat 时清空 right panel todo
     if (state) { state.todo = []; renderTodo() }
     // v0.5.ax: 欢迎页时隐藏右侧栏
@@ -850,10 +1059,44 @@ export function renderChat() {
       break
     }
   }
-  // 渲染时把 isLatestAsk 透传给 renderMessage
-  inner.innerHTML = messages.map((m, i) => renderMessage(m, { isLatestAsk: i === latestAskIdx })).join('')
-  // v0.5.ab: 绑定 Ask/Plan 块的点击事件（事件委托）
-  attachStructuredBlockHandlers(inner)
+  // Cache for scroll-handler re-renders (avoids re-parseChatLines on
+  // every scroll tick — slice() is O(K) where K ≈ buffer * 2 ≪ N).
+  __chatMessagesCache = messages
+  __chatLatestAskIdx = latestAskIdx
+
+  // v2 (Lease C04): virtual list branch — only when N ≥ threshold.
+  // Below threshold the legacy full-render wins (cheaper + simpler).
+  if (messages.length >= VIRTUAL_LIST_THRESHOLD) {
+    __chatVirtualEnabled = true
+    __installChatScrollHandler(scroll, inner)
+    // Decide scroll behavior BEFORE the spacer rewrite so we can
+    // compare the user's pre-render position to the new bottom.
+    const decision = decideScrollBehavior({
+      scrollTop: scroll.scrollTop,
+      clientHeight: scroll.clientHeight,
+      scrollHeight: scroll.scrollHeight,
+    })
+    __renderVirtualInto(inner, messages, latestAskIdx, scroll)
+    if (decision === 'auto') {
+      // User was near the bottom — keep them there. The new message
+      // (if any) will be visible because the bottom spacer shrank.
+      scroll.scrollTop = scroll.scrollHeight
+    }
+    // 'preserve' branch: do NOT touch scrollTop. The spacer heights
+    // will shift slightly but the user's px position is preserved,
+    // and the user remains anchored to the same approximate message
+    // index. (A perfect "lock onto the same message index" would
+    // require knowing each rendered message's real height — out of
+    // scope for the fixed-row virtual list model.)
+  } else {
+    __chatVirtualEnabled = false
+    // 渲染时把 isLatestAsk 透传给 renderMessage
+    inner.innerHTML = messages.map((m, i) => renderMessage(m, { isLatestAsk: i === latestAskIdx })).join('')
+    // v0.5.ab: 绑定 Ask/Plan 块的点击事件（事件委托）
+    attachStructuredBlockHandlers(inner)
+    // scroll to bottom
+    scroll.scrollTop = scroll.scrollHeight
+  }
   // v0.5.ae: 把 chat 内的 todo block 实时同步到 state.todo（right panel 用）
   // dedup by text：同一个 todo 在多轮里可能重复，最后一次状态生效
   if (state) {
@@ -872,9 +1115,6 @@ export function renderChat() {
     state.todo = todos
     renderTodo()
   }
-  // scroll to bottom
-  const scroll = document.getElementById('chat-scroll')
-  scroll.scrollTop = scroll.scrollHeight
 }
 
 // v0.5.ab: 事件委托 — Ask 选项点击发送 / Plan 选项点击发送 / "查看完整计划" 打开弹窗

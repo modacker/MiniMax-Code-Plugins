@@ -54,6 +54,15 @@ const _acpMock = {
   shutdownMcodeAcpSingleton: () => {},
   dropMcodeSessionFromCache: () => {}, // v1.0: 删除路由防复活用
   getMcodeSessionsStaleSync: () => null, // v1.0: 过期缓存读取 (推送防闪跌用)
+  // B04 patch: interaction/commands.js#bodyHelp uses ensureMcodeCommands
+  //   to list /help contents. Default stub returns an empty payload so
+  //   tests that don't care about /help can ignore this; tests that DO
+  //   care (test/lib-interaction.test.js) override via their own
+  //   t.mock.module registration since setupMocks only allows one
+  //   registration per module path per test context.
+  ensureMcodeCommands: async () => ({
+    mcode: [], webui: [], fetchedAt: 0, source: "test-default",
+  }),
 };
 
 let _sessionsStore = [];
@@ -189,6 +198,9 @@ export async function setupMocks(t, overrides = {}) {
         _acpMock.dropMcodeSessionFromCache(...a),
       getMcodeSessionsStaleSync: (...a) =>
         _acpMock.getMcodeSessionsStaleSync(...a),
+      // B04 patch: ensureMcodeCommands for interaction/commands.js
+      //   #bodyHelp dispatch (see BORROW-dsh-deepseek-harness-2026-08-28 §3).
+      ensureMcodeCommands: (...a) => _acpMock.ensureMcodeCommands(...a),
     },
   });
 

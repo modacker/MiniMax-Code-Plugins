@@ -8,6 +8,7 @@ import {
   setActiveChild,
   clearActiveChild,
   pushStateFor,
+  pushAlert,
   getCidsByMcodeSession,
 } from "./state-bus.js";
 import { applyMavisUsageToCs } from "./mavis-usage.js";
@@ -67,6 +68,17 @@ export async function runMcodeAcp(content, opts = {}) {
     }
     return await streamAcpPrompt(client, sid, content, label, cs, cid);
   } catch (e) {
+    // v2.0 (lease B02): §AP5 — surface subprocess start / session
+    // failures on the anomaly channel instead of swallowing them
+    // into a chat `! [error]` line.
+    pushAlert({
+      level: "error",
+      msg: `[mcode-acp.start] ${e.message}`,
+      src: "mcode-acp",
+      cid: cid || null,
+      sessionId: sid || null,
+      data: { phase: "start-or-load" },
+    });
     return {
       status: "failed",
       error: { message: e.message },
@@ -113,6 +125,17 @@ function streamAcpPrompt(client, sid, content, label, cs, cid) {
       if (r.status === "unknown") {
         r.status = "timeout";
         r.error = { message: "mcode acp prompt did not return in 90s" };
+        // v2.0 (lease B02): §AP5 — surface silent hangs on the
+        // anomaly channel as a `warn` (less severe than a crash
+        // but still actionable).
+        pushAlert({
+          level: "warn",
+          msg: `[mcode-acp.timeout] prompt did not return in 90s`,
+          src: "mcode-acp",
+          cid: cid || null,
+          sessionId: sid || null,
+          data: { phase: "stream" },
+        });
         try {
           client.stop();
         } catch {}
@@ -291,6 +314,19 @@ function streamAcpPrompt(client, sid, content, label, cs, cid) {
         if (c.kind === "error" || c.error) {
           r.error = { message: c.text || c.error || JSON.stringify(c) };
           r.status = "failed";
+          // v2.0 (lease B02): §AP5 — push the protocol-level error to
+          // the anomaly channel. The chat.js handler will also
+          // surface it (since r.status === "failed"), but firing
+          // here gives operators an immediate, low-latency signal
+          // even before the response object resolves.
+          pushAlert({
+            level: "error",
+            msg: `[mcode-acp.protocol] ${r.error.message}`,
+            src: "mcode-acp",
+            cid: cid || null,
+            sessionId: sid || null,
+            data: { kind: c.kind, raw: c.data || null },
+          });
           finalize();
           return;
         }
@@ -496,6 +532,16 @@ function streamAcpPrompt(client, sid, content, label, cs, cid) {
       .catch((e) => {
         r.status = "failed";
         r.error = { message: e.message };
+        // v2.0 (lease B02): §AP5 — final-catch failure (anything
+        // not already caught by the inner error handler).
+        pushAlert({
+          level: "error",
+          msg: `[mcode-acp.stream] ${e.message}`,
+          src: "mcode-acp",
+          cid: cid || null,
+          sessionId: sid || null,
+          data: { phase: "promise-catch" },
+        });
         finalize();
       });
   });

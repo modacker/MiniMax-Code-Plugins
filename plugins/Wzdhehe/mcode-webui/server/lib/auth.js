@@ -150,3 +150,66 @@ export function isAuthEnforced() {
   if (!tokenAuthOn) return false;
   return Boolean(getExpectedToken());
 }
+
+// ============================================================
+// v2 (Lease C08) — First-run notification flag
+//
+// Background (ANTI-PATTERNS-FIX-PLAN §AP1):
+//   server.js used to print a 14-line ASCII box containing the raw
+//   token to stdout on first-ever boot. That leaked into shell
+//   history / Docker logs / systemd journal / screen shares. The fix
+//   pushes the token via SSE `token.first_run` so the UI can show it
+//   in a modal instead. Rotation uses `auth.token_rotated` (already in
+//   state-bus.js since v1.0.1).
+//
+// Surface:
+//   - isFirstRun() — true iff this process has NOT yet pushed a
+//     `token.first_run` SSE event in its lifetime. Used by
+//     state-bus.js#pushTokenFirstRun as a re-send guard.
+//   - markFirstRunNotified(token) — flip the in-memory flag. Called
+//     from the HTTP ack handler after the client closes the modal,
+//     or directly by tests. Async because it lazily imports
+//     settings.js to also persist the canonical `tokenAcknowledged`
+//     field (settings.json).
+//
+// Settings.js owns the persistent `tokenAcknowledged`; auth.js's
+// `_firstRunNotified` is the parallel in-memory mirror used to gate
+// the SSE re-send. The two stay in sync via this helper.
+// ============================================================
+
+let _firstRunNotified = false;
+
+export function isFirstRun() {
+  return !_firstRunNotified;
+}
+
+export async function markFirstRunNotified(token) {
+  _firstRunNotified = true;
+  // Lazy-import settings.js to avoid the static circular dep:
+  //   settings.js  →  auth.js  (setExpectedToken)
+  //   auth.js (this file) must NOT statically import settings.js back.
+  // Dynamic import resolves AFTER both modules finish loading, so this
+  // is safe. settings.js#setTokenAcknowledged persists to disk and
+  // emits an audit event.
+  try {
+    const m = await import("./settings.js");
+    // Sanity check: if caller passed a token, it must match the
+    // currently active one. Stale tokens (e.g. ack from a previous
+    // generation that didn't get a rotation broadcast) should NOT
+    // flip the canonical flag — they'd hide a token the operator
+    // never actually saw.
+    if (typeof token === "string" && token.length > 0) {
+      const current =
+        typeof m.getCurrentToken === "function" ? m.getCurrentToken() : "";
+      if (current && current !== token) return;
+    }
+    if (typeof m.setTokenAcknowledged === "function") {
+      m.setTokenAcknowledged(true);
+    }
+  } catch {
+    // settings.js not yet ready (boot race) or setTokenAcknowledged
+    // missing — silent no-op. The HTTP ack handler in
+    // routes/settings.js calls setTokenAcknowledged directly, so the
+    // canonical flag will still flip on the next user action.
+  }
+}

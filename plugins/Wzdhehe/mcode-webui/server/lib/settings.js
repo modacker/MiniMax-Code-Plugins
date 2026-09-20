@@ -19,6 +19,12 @@ import { PORT, HOST } from "./config.js";
 import { LAN_IP } from "./lan.js";
 import { MCODE_CMD, DEFAULT_WORKSPACE, DEFAULT_MODEL } from "./config.js";
 
+// B01: append-only event stream + sha256 chain. The 7 setters below
+// each call append() to record their state change. Failed appends
+// log + swallow (per events.js#append semantics); they do NOT throw
+// to keep the user-visible action from being aborted by audit issues.
+import { append as _eventsAppend } from "./events.js";
+
 // -----------------------------------------------------------------------
 // Persistent settings file path
 // -----------------------------------------------------------------------
@@ -487,30 +493,66 @@ export function reloadExternalTokenPlanKeys() {
 // -----------------------------------------------------------------------
 
 export function setLanBroadcast(v) {
+  const before = lanBroadcastEnabled;
   lanBroadcastEnabled = !!v;
+  // B01: audit toggle. lanBroadcast is intentionally NOT persisted
+  // (the in-memory state survives only until reboot — reboot re-enables
+  // it for admin lockout safety). But the toggle itself is a state-
+  // changing action and SHOULD be auditable.
+  if (before !== lanBroadcastEnabled) {
+    _eventsAppend("settings.update", {
+      target: "lanBroadcast",
+      actor: "user",
+      payload: { old: before, new: lanBroadcastEnabled },
+    });
+  }
   console.log(
     `[webui] LAN access ${lanBroadcastEnabled ? "enabled" : "disabled"}`,
   );
 }
 
 export function setReadOnly(v) {
+  const before = readOnlyEnabled;
   readOnlyEnabled = !!v;
   console.log(`[webui] read-only mode ${readOnlyEnabled ? "enabled" : "disabled"}`);
   try { persistNow(); } catch (e) { /* logged in persistNow */ }
+  if (before !== readOnlyEnabled) {
+    _eventsAppend("settings.update", {
+      target: "readOnly",
+      actor: "user",
+      payload: { old: before, new: readOnlyEnabled },
+    });
+  }
 }
 
 export function setTokenEnabled(v) {
+  const before = tokenAuthEnabled;
   tokenAuthEnabled = !!v;
   console.log(`[webui] token auth ${tokenAuthEnabled ? "enabled" : "disabled"}`);
   // No persist needed (lanBroadcast isn't persisted either; on the
   // v1.0.1 contract, tokenEnabled survives a restart by defaulting to
   // true). We DO persist it so a power-cycle keeps the user's choice.
   try { persistNow(); } catch {}
+  if (before !== tokenAuthEnabled) {
+    _eventsAppend("settings.update", {
+      target: "tokenEnabled",
+      actor: "user",
+      payload: { old: before, new: tokenAuthEnabled },
+    });
+  }
 }
 
 export function setTokenAcknowledged(v) {
+  const before = tokenAcknowledged;
   tokenAcknowledged = !!v;
   try { persistNow(); } catch {}
+  if (before !== tokenAcknowledged) {
+    _eventsAppend("settings.update", {
+      target: "tokenAcknowledged",
+      actor: "user",
+      payload: { old: before, new: tokenAcknowledged },
+    });
+  }
 }
 
 export function setAllowedInterfaces(_ifaces) {
@@ -533,11 +575,27 @@ export function setAllowedInterfaces(_ifaces) {
 // authoritative at READ time; the underlying disk state is kept
 // in sync regardless of which source is currently in use.
 export function setTokenPlanApiKey(k) {
+  const before = tokenPlanApiKey;
   tokenPlanApiKey = typeof k === "string" ? k : "";
   try { persistNow(); } catch {}
+  // B01: audit key change. We never log the key value itself (security);
+  // we record only "had a key?" / "has a key?" booleans. An operator
+  // auditing the stream can see "the key was set/cleared at seq=N" but
+  // not the key value.
+  if (before !== tokenPlanApiKey) {
+    _eventsAppend("settings.update", {
+      target: "tokenPlanApiKey",
+      actor: "user",
+      payload: {
+        old_present: before.length > 0,
+        new_present: tokenPlanApiKey.length > 0,
+      },
+    });
+  }
 }
 
 export function setQuotaEnabled(v) {
+  const before = quotaEnabled;
   quotaEnabled = !!v;
   // Disabling also clears the settings.json key (don't keep
   // credentials around if the user explicitly turned the feature
@@ -552,6 +610,13 @@ export function setQuotaEnabled(v) {
     tokenPlanApiKey = "";
   }
   try { persistNow(); } catch {}
+  if (before !== quotaEnabled) {
+    _eventsAppend("settings.update", {
+      target: "quotaEnabled",
+      actor: "user",
+      payload: { old: before, new: quotaEnabled },
+    });
+  }
 }
 
 // rotateToken — generate a new token, persist, sync to auth module.
@@ -589,6 +654,18 @@ export function rotateToken() {
     tokenAcknowledged = prevAck;
     throw e;
   }
+  // B01: token rotation is the highest-impact settings change — record
+  // it after persist succeeds (so a rolled-back rotation has no event).
+  // We log only the rotation timestamp, never the token value (security).
+  _eventsAppend("settings.update", {
+    target: "currentToken",
+    actor: "user",
+    payload: {
+      old_present: prevToken.length > 0,
+      new_present: true,
+      rotatedAt: newRotatedAt,
+    },
+  });
   syncAuthToken();
   return currentToken;
 }

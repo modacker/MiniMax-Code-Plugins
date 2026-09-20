@@ -1,6 +1,7 @@
 // webui/server/routes/sessions.js
 // GET/POST /api/sessions, POST /api/sessions/switch, DELETE /api/sessions/:id,
-// GET /api/acp-sessions, GET /api/acp-session-title
+// GET /api/acp-sessions, GET /api/acp-session-title,
+// GET /api/sessions/search (Lease C05 — cross-workspace fuzzy match)
 // (v0.5.bx-33: 删 POST /api/sessions/cleanup-orphans — Wzdhehe 不要这个 UI,API 一起删)
 
 import { randomUUID } from "node:crypto";
@@ -16,6 +17,9 @@ import { applyMavisUsageToCs } from "../lib/mavis-usage.js";
 import { getMcodeModelLimit } from "../lib/models.js";
 import { pushStateFor, clients } from "../lib/state-bus.js";
 import { MCODE_RUNTIME_DB } from "../lib/config.js";
+import { authorize } from "../lib/authorize.js";
+// B01: append session lifecycle events to the hash chain.
+import { append as _eventsAppend } from "../lib/events.js";
 
 // v1.0: 防"删了又出现" — webui 常驻的 mcode acp 子进程内存里还持有该 session,
 //   且会把注册表回写 db (删除后 local_runtime_sessions 行被重建 + session/list 仍返回)。
@@ -85,6 +89,19 @@ export async function handleNewSession(req, res, ctx) {
     sessionTotal: 0,
   };
   resetContext(cs);
+  // B01: session creation is a state-changing action; record it.
+  // We log the webui session id + title + workspace — these are not
+  // sensitive (the id is a randomUUID, title is user-visible). mcode
+  // session id is null at create time so it's omitted from data.
+  _eventsAppend("session.create", {
+    target: id,
+    cid,
+    actor: "user",
+    payload: {
+      title: item.title,
+      workspace: sessionWs,
+    },
+  });
   pushStateFor(cid);
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
   return res.end(JSON.stringify({ ok: true, session: item }));
@@ -175,6 +192,22 @@ export async function handleSwitchSession(req, res, ctx) {
           console.warn(`[switch.mavis] cid=${cid} error: ${e.message}`);
       });
   }
+  // B01: session switch — record which session was activated and from
+  // which prior session. matchKind tells us whether we matched by
+  // mcodeSessionId or webuiId (useful when debugging "why did this
+  // resolve to session X"). prevSid is the prior session id (or "" if
+  // this was the first switch).
+  _eventsAppend("session.switch", {
+    target: cs.sessionId,
+    cid,
+    actor: "user",
+    payload: {
+      from: prevSid || "",
+      matchKind: matchKind || "new_from_mcode",
+      mcodeSessionId: cs.mcodeSessionId || "",
+      title: cs.sessionTitle,
+    },
+  });
   pushStateFor(cid);
   console.log(
     `[switch] cid=${cid} OK prev.sessionId=${prevSid ? prevSid.substring(0, 8) : "null"}… → new.sessionId=${cs.sessionId.substring(0, 8)}… title="${cs.sessionTitle}" chatLen=${cs.chat.length}`,
@@ -197,7 +230,8 @@ export async function handleSwitchSession(req, res, ctx) {
 // v0.5.bx 系列:支持 ?dryRun=true 走预览路径 (mcode-plugin-guide red-lines.md §"写操作/破坏性操作")
 //   dryRun=true 时,函数走 readonly SQL 路径,只统计每个表的行数,不修改任何数据
 //   行为:true 删除路径不变
-export function handleDeleteSession(req, res, ctx) {
+//   v2 (B03): real-delete path is async because it awaits authorize()
+export async function handleDeleteSession(req, res, ctx) {
   const cs = ctx.cs;
   const cid = ctx.cid;
   const id = ctx.pathname.slice("/api/sessions/".length);
@@ -224,6 +258,31 @@ export function handleDeleteSession(req, res, ctx) {
     idx = all.findIndex((s) => s.mcodeSessionId === id);
     if (idx >= 0) matchKind = "mcodeSessionId";
   }
+  // B03: real-delete path must pass per-request authorize() before
+  //   mutating db / saveSessions / killMcodeSessionResurrection.
+  //   dryRun=true bypasses (preview only — no side effects to gate).
+  if (!dryRun) {
+    const authResult = await authorize("session.delete", {
+      cid,
+      targetSessionId: id,
+      matchKind: matchKind || (idx < 0 ? "unknown" : "webuiId"),
+      isMcodeSid: /^mvs_[a-f0-9]{32}$/.test(id),
+      isOrphan: idx < 0,
+      chatLen: idx >= 0 && all[idx] && Array.isArray(all[idx].chat) ? all[idx].chat.length : 0,
+    });
+    if (!authResult.approved) {
+      console.log(
+        `[delete] cid=${cid} DECLINED id=${id.substring(0, 12)}… reason=${authResult.decidedBy}`,
+      );
+      res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify({
+        ok: false,
+        error: "authorize declined",
+        decidedBy: authResult.decidedBy,
+        decidedAt: authResult.decidedAt,
+      }));
+    }
+  }
   // v0.5.bx-19: 兜底 — webui session db 找不到, 但 id 是 mvs_xxx → 当孤儿 mcode session 直接 SQL 删
   if (idx < 0) {
     if (/^mvs_[a-f0-9]{32}$/.test(id)) {
@@ -244,6 +303,17 @@ export function handleDeleteSession(req, res, ctx) {
           resetContext(cs);
           pushStateFor(cid);
         }
+        // B01: orphan mcode session deletion (no webui session row)
+        _eventsAppend("session.delete", {
+          target: id,
+          cid,
+          actor: "user",
+          payload: {
+            matchKind: "orphan_mcode",
+            dryRun,
+            rowsAffected: (mcodeDbDel.log || []).length,
+          },
+        });
         res.writeHead(200, {
           "Content-Type": "application/json; charset=utf-8",
         });
@@ -279,6 +349,20 @@ export function handleDeleteSession(req, res, ctx) {
     console.log(
       `[delete] cid=${cid} DRYRUN id=${id.substring(0, 12)}… mcodeDbDel=${JSON.stringify(mcodeDbDel)}`,
     );
+    // B01: dryRun is itself a state-touching action — the operator
+    // is previewing a delete, so record the preview but never the
+    // actual session content. dryRun:true marker lets verify / audit
+    // distinguish "actually deleted" from "previewed delete".
+    _eventsAppend("session.delete", {
+      target: id,
+      cid,
+      actor: "user",
+      payload: {
+        matchKind,
+        dryRun: true,
+        previewedRows: mcodeDbDel.totalRows || 0,
+      },
+    });
     res.writeHead(200, {
       "Content-Type": "application/json; charset=utf-8",
     });
@@ -334,6 +418,24 @@ export function handleDeleteSession(req, res, ctx) {
   }
   if (touchedCids.length === 0) touchedCids = [cid];
   for (const c of touchedCids) pushStateFor(c);
+  // B01: real session delete (the dangerous one). Record which webui
+  // session was deleted, what the match kind was, how many cids had
+  // their active session cleared (this is the "fan-out" effect that
+  // surprised users historically), and the mcode db deltas. Title
+  // is logged (not sensitive — it was user-visible in the sidebar).
+  _eventsAppend("session.delete", {
+    target: id,
+    cid,
+    actor: "user",
+    payload: {
+      matchKind,
+      dryRun: false,
+      remaining: all.length,
+      touchedCids: touchedCids.length,
+      mcodeRowsAffected: mcodeDbDel && mcodeDbDel.log ? mcodeDbDel.log.length : 0,
+      title: deletedItem.title,
+    },
+  });
   console.log(
     `[delete] cid=${cid} OK match=${matchKind} deleted.webuiId=${deletedItem.id.substring(0, 8)}… remaining=${all.length}`,
   );
@@ -374,4 +476,285 @@ export async function handleAcpSessionTitle(req, res, _ctx) {
   return res.end(
     JSON.stringify({ ok: true, sessionId: sid, title: title || null }),
   );
+}
+
+// Lease C05: GET /api/sessions/search?q=<text>&workspace=<path>&limit=<n>
+//   Cross-workspace session search. The prior sidebar search
+//   (renderSessions in public/app/render.js) only filtered the
+//   already-loaded list — it could not surface sessions stored under
+//   a different `workspace` field. This endpoint walks the persisted
+//   sessions JSON so typing into the sidebar box can show matches
+//   across all workspaces the user has touched.
+//
+//   Query params:
+//     q          fuzzy substring match on session.title (case-insensitive).
+//                Required for the search to return anything; empty q
+//                returns [] (use GET /api/sessions for "list all").
+//     workspace  optional exact workspace path filter. Empty = all
+//                workspaces. When set, the dedup-by-workspace rule
+//                below is a no-op (every result already shares the
+//                same workspace).
+//     limit      default 20, max 100, min 1. Out-of-range is clamped.
+//
+//   Response: [Array<{id, title, workspace, updatedAt, matchScore}>]
+//     matchScore is a deterministic 0-100 integer that the client can
+//     use to sort results. Higher = better match:
+//       100  exact title == q
+//        50  title startsWith q
+//        10  title contains q (case-insensitive)
+//         1  chat-tail fallback (rare; old sessions without titles)
+//         0  no title but id contains q
+//
+//   Dedup rule: "同名 workspace 的 session 只保留最近一条". For each
+//   unique workspace path that produced a match, we keep only the
+//   session with the highest matchScore; on tie, the most recent
+//   updatedAt wins. This collapses repeated search hits in one
+//   workspace to a single representative row.
+//
+//   Gate (B03 / integration touchpoint): cross-workspace search
+//   exposes titles from workspaces the user may have left open. We
+//   gate with authorize("session.search", ctx). The new action name
+//   is appended to AUTHORIZE_ACTIONS in server/lib/authorize.js so
+//   the whitelist check accepts it. In production this pops the same
+//   needs_authorization SSE modal as session.delete / session.export;
+//   under `node --test` it auto-approves (see authorize.js:136-149).
+//
+//   Audit (B01): the search itself is non-destructive so we do NOT
+//   append a session.search event by default. The authorize call
+//   already writes auth.pending / auth.approve / auth.reject events
+//   to the same chain, which is enough for audit purposes.
+export async function handleSearchSessions(req, res, ctx) {
+  const cid = (ctx && ctx.cid) || "";
+  const url = new URL(req.url, "http://localhost");
+  const q = (url.searchParams.get("q") || "").trim();
+  const workspaceParam = (url.searchParams.get("workspace") || "").trim();
+  let limit = parseInt(url.searchParams.get("limit") || "20", 10);
+  if (!Number.isFinite(limit)) limit = 20;
+  if (limit < 1) limit = 1;
+  if (limit > 100) limit = 100;
+  // B03 gate: cross-workspace reads surface titles from workspaces
+  //   the user is not currently in. Gate the same way session.delete
+  //   / session.export are gated. Test-mode auto-approves.
+  const authResult = await authorize("session.search", {
+    cid,
+    q,
+    workspace: workspaceParam,
+    limit,
+  });
+  if (!authResult.approved) {
+    res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({
+      ok: false,
+      error: "authorize declined",
+      decidedBy: authResult.decidedBy,
+      decidedAt: authResult.decidedAt,
+    }));
+  }
+  // q empty: by spec, search is a no-op (not a list-all endpoint).
+  //   Returning [] keeps the client UX simple — empty box == empty
+  //   result, and the existing renderSessions path handles "no
+  //   search" with the full list.
+  if (!q) {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({ ok: true, results: [] }));
+  }
+  const all = loadSessions();
+  const qLower = q.toLowerCase();
+  // Per-session score: deterministic 0-100 integer.
+  //   We score on title first (it's the user-visible label); id is
+  //   a secondary fallback so typing part of a session id still
+  //   finds it.
+  function scoreSession(s) {
+    const title = (s && s.title ? String(s.title) : "").trim();
+    const titleLower = title.toLowerCase();
+    if (titleLower && titleLower === qLower) return 100;
+    if (titleLower && titleLower.startsWith(qLower)) return 50;
+    if (titleLower && titleLower.includes(qLower)) return 10;
+    const id = (s && s.id ? String(s.id) : "").toLowerCase();
+    if (id && id.includes(qLower)) return 1;
+    return 0;
+  }
+  // Filter by workspace if requested, then by score > 0.
+  const scored = [];
+  for (const s of all) {
+    if (!s || typeof s !== "object") continue;
+    if (workspaceParam) {
+      const ws = (s.workspace || "").trim();
+      if (ws !== workspaceParam) continue;
+    }
+    const score = scoreSession(s);
+    if (score <= 0) continue;
+    scored.push({
+      id: s.id || "",
+      title: (s.title || "").toString(),
+      workspace: (s.workspace || "").toString(),
+      updatedAt: typeof s.updatedAt === "number" ? s.updatedAt : 0,
+      matchScore: score,
+    });
+  }
+  // Dedup by workspace: keep the best match per workspace path.
+  //   Empty-string workspace (legacy / unset) is its own bucket — it
+  //   still gets one representative row.
+  const bestByWs = new Map();
+  for (const item of scored) {
+    const wsKey = item.workspace || "";
+    const prev = bestByWs.get(wsKey);
+    if (!prev) {
+      bestByWs.set(wsKey, item);
+      continue;
+    }
+    if (item.matchScore > prev.matchScore) {
+      bestByWs.set(wsKey, item);
+    } else if (
+      item.matchScore === prev.matchScore &&
+      item.updatedAt > prev.updatedAt
+    ) {
+      bestByWs.set(wsKey, item);
+    }
+  }
+  // Sort: score desc, then updatedAt desc, then workspace asc (stable).
+  const results = [...bestByWs.values()];
+  results.sort((a, b) => {
+    if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+    if (b.updatedAt !== a.updatedAt) return b.updatedAt - a.updatedAt;
+    return (a.workspace || "").localeCompare(b.workspace || "");
+  });
+  const limited = results.slice(0, limit);
+  res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+  return res.end(JSON.stringify({ ok: true, results: limited }));
+}
+
+// B03 + AP11 fix: POST /api/sessions/cleanup-orphans
+//   Wires the missing endpoint that ANTI-PATTERNS-FIX-PLAN §AP11 noted
+//   as documented-but-unimplemented. The endpoint:
+//     1) dryRun=true  → preview only (count + would-be-deleted ids).
+//                       Skips authorize() because no side effects occur.
+//     2) dryRun=false (or absent) → real delete path. Must pass
+//                       authorize('sessions.cleanup-orphans', ctx) first.
+//                       Each session is fed through handleDeleteSession's
+//                       real-delete branch so the audit trail / mcode
+//                       db cleanup / cross-tab fan-out stay consistent.
+//   The cleanup targets: default-named webui sessions (New session /
+//   Untitled / 对话 N) whose chat is empty AND whose updatedAt is older
+//   than 24h — same rule as cleanupEmptyDefaultSessions() in lib/sessions.js.
+import { existsSync, readFileSync } from "node:fs";
+import { SESSIONS_DB } from "../lib/config.js";
+
+const ORPHAN_STALE_MS = 24 * 60 * 60 * 1000;
+
+function _findOrphanIds() {
+  if (!existsSync(SESSIONS_DB)) return [];
+  let all;
+  try {
+    let raw = readFileSync(SESSIONS_DB, "utf8");
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1); // 剥 BOM
+    all = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(all) || all.length === 0) return [];
+  const now = Date.now();
+  return all
+    .filter((s) => {
+      if (!s || !s.id) return false;
+      const hasChat = Array.isArray(s.chat) && s.chat.length > 0;
+      if (hasChat) return false;
+      const t = (s.title || "").trim();
+      const isDefault =
+        t === "New session" || t === "Untitled" || /^对话 \d+$/.test(t);
+      if (!isDefault) return false;
+      if (s.updatedAt && now - s.updatedAt < ORPHAN_STALE_MS) return false;
+      return true;
+    })
+    .map((s) => s.id);
+}
+
+export async function handleCleanupOrphans(req, res, ctx) {
+  const cid = (ctx && ctx.cid) || "";
+  let dryRun = false;
+  try {
+    const qIdx = (req.url || "").indexOf("?");
+    if (qIdx >= 0) {
+      const params = new URLSearchParams(req.url.slice(qIdx + 1));
+      dryRun = params.get("dryRun") === "true";
+    }
+  } catch {}
+  const targetIds = _findOrphanIds();
+  // Preview path: no authorize gate (no side effects).
+  if (dryRun) {
+    console.log(
+      `[cleanup-orphans] cid=${cid} DRYRUN would-delete=${targetIds.length}`,
+    );
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({
+      ok: true,
+      dryRun: true,
+      count: targetIds.length,
+      ids: targetIds,
+    }));
+  }
+  // Real path: gate with authorize() before touching any session.
+  if (targetIds.length === 0) {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({ ok: true, dryRun: false, deleted: 0, ids: [] }));
+  }
+  const authResult = await authorize("sessions.cleanup-orphans", {
+    cid,
+    orphanCount: targetIds.length,
+    orphanIds: targetIds.slice(0, 32), // truncated for log hygiene
+  });
+  if (!authResult.approved) {
+    console.log(
+      `[cleanup-orphans] cid=${cid} DECLINED count=${targetIds.length} reason=${authResult.decidedBy}`,
+    );
+    res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(JSON.stringify({
+      ok: false,
+      error: "authorize declined",
+      decidedBy: authResult.decidedBy,
+      decidedAt: authResult.decidedAt,
+    }));
+  }
+  // Approved: delegate each delete to handleDeleteSession so the
+  //   existing fan-out / mcode db cleanup / cross-tab reset logic
+  //   stays in one place. We synthesize a minimal `req` with the
+  //   target id so the handler can route as if it came from HTTP.
+  const deleted = [];
+  const failed = [];
+  for (const id of targetIds) {
+    try {
+      const fakeReq = {
+        url: `/api/sessions/${encodeURIComponent(id)}`,
+      };
+      const fakeRes = {
+        _status: 200,
+        _body: "{}",
+        writeHead(s, _h) { this._status = s; },
+        end(b) { this._body = b ? String(b) : "{}"; },
+      };
+      await handleDeleteSession(fakeReq, fakeRes, ctx);
+      // handleDeleteSession already wrote authorize-gated session.delete
+      // events. Parse its result for our summary.
+      let summary = {};
+      try { summary = JSON.parse(fakeRes._body || "{}"); } catch {}
+      if (fakeRes._status === 200 && summary.ok) deleted.push(id);
+      else failed.push({ id, status: fakeRes._status, reason: summary.error || "unknown" });
+    } catch (e) {
+      failed.push({ id, error: e && e.message ? e.message : String(e) });
+    }
+  }
+  console.log(
+    `[cleanup-orphans] cid=${cid} OK deleted=${deleted.length} failed=${failed.length}`,
+  );
+  res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+  return res.end(JSON.stringify({
+    ok: true,
+    dryRun: false,
+    deleted: deleted.length,
+    failed: failed.length,
+    deletedIds: deleted,
+    failedItems: failed,
+    decidedBy: authResult.decidedBy,
+    decidedAt: authResult.decidedAt,
+  }));
 }

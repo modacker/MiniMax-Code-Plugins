@@ -18,13 +18,14 @@
 import http from 'node:http'
 import { existsSync, mkdirSync } from 'node:fs'
 
-import { installGlobalErrorHandlers, MCODE_CMD, UPLOAD_DIR, PORT, HOST, DEFAULT_MODEL, DEFAULT_WORKSPACE, SESSIONS_DB } from './server/lib/config.js'
+import { installGlobalErrorHandlers, MCODE_CMD, UPLOAD_DIR, PORT, HOST, DEFAULT_MODEL, DEFAULT_WORKSPACE, SESSIONS_DB, TOKEN_STDOUT } from './server/lib/config.js'
 import { LAN_IP } from './server/lib/lan.js'
 import { handleRequest } from './server/router.js'
 import { runStartupCleanup } from './server/cleanup.js'
 import { shutdownMcodeAcpSingleton } from './server/lib/acp-client.js'
 import { init as initSettings, getPersistPath, getTokenEnabled } from './server/lib/settings.js'
 import { setTokenAuthEnabled as setAuthTokenEnabled } from './server/lib/auth.js'
+import { pushTokenFirstRun } from './server/lib/state-bus.js'
 
 installGlobalErrorHandlers()
 
@@ -44,27 +45,28 @@ runStartupCleanup()
 //   value lives only in the settings file; if the operator rotates via
 //   the settings card, the new value is broadcast over SSE and shown in
 //   the settings card until acknowledged.
+// v2 (Lease C08, ANTI-PATTERNS-FIX-PLAN §AP1): the raw token is NO LONGER
+//   echoed to stdout. Instead we push `token.first_run` over SSE so the
+//   web UI can show the onboarding modal. The raw token never leaves the
+//   controlled channel (SSE → already-authenticated local UI) and never
+//   touches shell history / Docker logs / systemd journal / screen shares.
+//
+//   TOKEN_STDOUT=1 keeps a single NEUTRAL line ("token persisted to: <path>")
+//   for docker / no-UI environments where no SSE client will connect to
+//   receive the modal. The token value itself is NEVER printed.
 let _printedFirstToken = false
 initSettings({
   printToken: (token) => {
     if (_printedFirstToken) return
     _printedFirstToken = true
-    // Print to stdout, NOT to .server.log — operators running interactively
-    // can copy/paste; headless / service-mode users can `cat` the settings
-    // file at the path printed below.
-    const url = `http://${LAN_IP}:${PORT}/?token=${token}`
-    console.log('')
-    console.log('==============================================================')
-    console.log('  webui 首次启动 — 已生成新的鉴权 token')
-    console.log('==============================================================')
-    console.log(`  token:   ${token}`)
-    console.log(`  远程 URL: ${url}`)
-    console.log('')
-    console.log(`  提示: token 已持久化到 ${getPersistPath()}`)
-    console.log('         远程设备必须通过该 URL (含 ?token=) 访问')
-    console.log('         本机访问 (127.0.0.1) 无需 token')
-    console.log('==============================================================')
-    console.log('')
+    const persistPath = getPersistPath()
+    // Push to any connected SSE client (the UI modal lives here).
+    // No-op if sseByCid is empty (e.g. server started headlessly).
+    pushTokenFirstRun({ token, persistPath })
+    if (TOKEN_STDOUT) {
+      // docker / no-UI fallback — single neutral line, NEVER raw token.
+      console.log(`token persisted to: ${persistPath}`)
+    }
   },
 })
 // Sync tokenAuth master switch from settings → auth module
