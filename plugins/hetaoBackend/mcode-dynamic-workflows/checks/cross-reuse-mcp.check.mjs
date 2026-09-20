@@ -1,4 +1,6 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {Client} from '@modelcontextprotocol/sdk/client/index.js';import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';import {mkdtemp,rm,writeFile} from 'node:fs/promises';import {tmpdir} from 'node:os';import {join,resolve} from 'node:path';
+// win32 EBUSY race in tmpdir cleanup: StdioClientTransport.close() resolving does not mean the spawned server process has exited, so the child can still hold the dataDir handle when rm() runs and win32 refuses to rmdir a busy directory (fork preview run 35506090983, first full windows-latest pass; Linux/darwin unlink open files, so this only bites on Windows). Retry the transient lock with exponential backoff, then fail loud — a cleanup failure stays visible, we only give the OS time to release handles.
+const rmWithRetry=async(dir)=>{for(let i=0;;i++){try{return await rm(dir,{recursive:true,force:true})}catch(e){if(!['EBUSY','ENOTEMPTY','EPERM'].includes(e?.code)||i>=5)throw e;await new Promise(res=>setTimeout(res,200*2**i))}}};
 test('packaged MCP advertises reuseAcrossRuns and accepts it through the public tool surface',async()=>{
  const dir=await mkdtemp(join(tmpdir(),'wf-cross-mcp-'));await writeFile(join(dir,'settings.json'),JSON.stringify({workspace:dir,dataDir:dir}));
  const client=new Client({name:'cross-reuse-mcp-test',version:'1'});const transport=new StdioClientTransport({command:process.execPath,args:[resolve('dist/main.mjs'),'--stdio','--settings',join(dir,'settings.json')],stderr:'pipe'});
@@ -10,5 +12,5 @@ test('packaged MCP advertises reuseAcrossRuns and accepts it through the public 
   assert.equal(run.reuseAcrossRuns,true,'the flag must survive the public tool surface');
   const rejected=await client.callTool({name:'workflow_start',arguments:{requestId:'cross-mcp-bad',name:'Bad flag type',executor:'demo',reuseAcrossRuns:'yes',script:'return 1;'}});
   assert.ok(rejected.isError,'a non-boolean flag must be rejected by the public surface');
- }finally{await client.close();await transport.close();await rm(dir,{recursive:true,force:true});}
+ }finally{let closeErr;try{await client.close();await transport.close();}catch(e){closeErr=e}await rmWithRetry(dir);if(closeErr)throw closeErr;}
 });
