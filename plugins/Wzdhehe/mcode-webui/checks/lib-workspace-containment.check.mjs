@@ -32,7 +32,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { join, basename, delimiter } from "node:path";
-import { setupMocks, absPath } from "./_setup.js";
+import { setupMocks, absPath } from "../test/_setup.js";
 
 let ws;
 let config;
