@@ -66,6 +66,34 @@ export class Store {
   listTrash() {return this.db.prepare("SELECT body FROM runs WHERE json_extract(body,'$.deletedAt') IS NOT NULL ORDER BY json_extract(body,'$.deletedAt') DESC LIMIT 100").all().map(r=>JSON.parse(r.body));}
   restampTrashPurge(days) {this.transaction(()=>{for(const row of this.db.prepare("SELECT id,body FROM runs WHERE json_extract(body,'$.deletedAt') IS NOT NULL").all()){const run=JSON.parse(row.body);this.db.prepare('UPDATE runs SET body=? WHERE id=?').run(JSON.stringify({...run,purgeAfter:run.deletedAt+days*86400000}),row.id);}});}
   tombstoneCount() {return Number(this.db.prepare("SELECT COUNT(*) AS n FROM runs WHERE json_extract(body,'$.deletedAt') IS NOT NULL").get().n);}
+ // Lineage face: every family member of a root still in the live library.
+ // Tombstoned members are included on purpose — trash hides runs from the
+ // live listings but never breaks a family.
+ lineageMembers(root) {return this.db.prepare("SELECT body FROM runs WHERE id=? OR json_extract(body,'$.lineageRoot')=? ORDER BY COALESCE(json_extract(body,'$.rerunSeq'),0),rowid").all(root,root).map(r=>JSON.parse(r.body));}
+ // Family members that exist only in the sidecar archive (rotated away, not
+ // yet restored): latest archive copy per runId, never including runs that
+ // are live again, so a restored member is never listed twice.
+ archivedLineageMembers(root) {
+  if(!existsSync(this.archivePath))return [];
+  const live=new Set(this.db.prepare('SELECT id FROM runs').all().map(r=>r.id));
+  const latest=new Map();
+  for(const row of this.archive().prepare("SELECT a.runId AS runId,a.rotationId AS rotationId,a.body AS body FROM archive_runs a JOIN rotations r ON r.rotationId=a.rotationId WHERE a.runId=? OR json_extract(a.body,'$.lineageRoot')=? ORDER BY r.rotatedAt,a.rotationId").all(root,root))
+   if(!live.has(row.runId))latest.set(row.runId,{run:JSON.parse(row.body),rotationId:row.rotationId});
+  return [...latest.values()];
+ }
+ // One archived run's latest copy, or null. Read-only; does not create the
+ // archive database just to answer negatively.
+ archivedRun(runId) {
+  if(!existsSync(this.archivePath))return null;
+  const row=this.archive().prepare('SELECT a.rotationId AS rotationId,a.body AS body FROM archive_runs a JOIN rotations r ON r.rotationId=a.rotationId WHERE a.runId=? ORDER BY r.rotatedAt DESC,a.rotationId DESC LIMIT 1').get(runId);
+  return row?{run:JSON.parse(row.body),rotationId:row.rotationId}:null;
+ }
+ // First run.started / last run.finished timestamps from the events ledger.
+ // Events never leave the live database (rotation only moves runs/steps), so
+ // archived family members keep resolving through this face.
+ runTimes(runId) {return {
+  startedAt:this.db.prepare("SELECT json_extract(body,'$.time') AS t FROM events WHERE runId=? AND json_extract(body,'$.type')='run.started' ORDER BY seq LIMIT 1").get(runId)?.t??null,
+  finishedAt:this.db.prepare("SELECT json_extract(body,'$.time') AS t FROM events WHERE runId=? AND json_extract(body,'$.type')='run.finished' ORDER BY seq DESC LIMIT 1").get(runId)?.t??null};}
   // Size proxy for the runs table: body bytes plus a fixed per-row overhead
   // allowance (row header, id/request columns). SQLite exposes no exact
   // per-table page accounting; a proxy is sufficient for a coarse trigger.

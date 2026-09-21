@@ -1852,7 +1852,9 @@ Object.assign(messages.zh, { "reviewCompact": "\u7B49\u5F85\u5BA1\u6838", "revie
 Object.assign(messages.en, { "reviewCompact": "Ready for review", "reviewCompactHelp": "Check the flow below, then start.", "reviewDetails": "Task details & execution settings", "reviewBudgets": "Concurrency {concurrency} \xB7 Up to {calls} calls \xB7 {steps} steps / {minutes} min per agent", "status.awaiting": "Not started", "status.blocked": "Dependency blocked", "status.not_run": "Not executed", "awaitingHelp": "This planned node has not been dispatched. Its status will update here when it starts.", "blockedHelp": "A declared upstream node did not succeed; this node has not executed.", "notRunHelp": "This run ended without triggering this planned node.", "dynamicHelp": "The number of nodes depends on runtime results. Created nodes expand within this group." });
 Object.assign(messages.zh, { "trash": "\u56DE\u6536\u7AD9", "trashHelp": "\u5220\u9664\u7684\u5DE5\u4F5C\u6D41\u5148\u8FDB\u5165\u56DE\u6536\u7AD9\uFF1A\u4E8B\u4EF6\u3001\u8282\u70B9\u4E0E\u7ED3\u679C\u5168\u90E8\u4FDD\u7559\uFF0C\u53EF\u968F\u65F6\u6062\u590D\u3002\u5230\u671F\u540E\u7531\u5F52\u6863\u8F6E\u8F6C\u56DE\u6536\u5B58\u50A8\uFF1B\u5BA1\u8BA1\u4E8B\u4EF6\u6C38\u4E0D\u5220\u9664\u3002", "trashEmpty": "\u56DE\u6536\u7AD9\u4E3A\u7A7A\u3002", "trashRestore": "\u6062\u590D", "trashRemaining": "\u4FDD\u7559\u5269\u4F59 {days} \u5929", "trashExpired": "\u5DF2\u5230\u671F\uFF0C\u7B49\u5F85\u5F52\u6863\u8F6E\u8F6C", "trashDeleted": "\u5220\u9664\u4E8E {date}", "trashRetention": "\u56DE\u6536\u7AD9\u4FDD\u7559\u671F\uFF08\u5929\uFF09", "trashRetentionHelp": "\u9ED8\u8BA4 30 \u5929\uFF1B0 \u8868\u793A\u4E0D\u5230\u671F\uFF0C\u4EC5\u624B\u52A8\u8F6E\u8F6C\u5F52\u6863\u3002\u4FEE\u6539\u4F1A\u540C\u6B65\u66F4\u65B0\u56DE\u6536\u7AD9\u4E2D\u5DF2\u6709\u6761\u76EE\u7684\u5230\u671F\u65F6\u95F4\u3002", "event.run.deleted": "\u5DF2\u5220\u9664\u5230\u56DE\u6536\u7AD9", "event.run.restored": "\u5DF2\u6062\u590D" });
 Object.assign(messages.en, { "trash": "Trash", "trashHelp": "Deleted workflows move to the trash first: events, nodes, and results are all kept and restorable at any time. Expired entries are rotated into the local archive to reclaim storage; audit events are never deleted.", "trashEmpty": "Trash is empty.", "trashRestore": "Restore", "trashRemaining": "{days} days left", "trashExpired": "Expired; waiting for archive rotation", "trashDeleted": "Deleted {date}", "trashRetention": "Trash retention (days)", "trashRetentionHelp": "Default 30 days; 0 disables expiry, leaving only manual archive rotation. Changes restamp entries already in the trash.", "event.run.deleted": "Moved to trash", "event.run.restored": "Restored" });
+Object.assign(messages.zh, { "lineage": "\u590D\u8DD1\u8C31\u7CFB", "lineageCount": "{count} \u6B21\u8FD0\u884C", "lineageRootRun": "\u539F\u59CB\u8FD0\u884C", "lineageRerun": "\u590D\u8DD1 \u7B2C {seq} \u6B21", "lineageOpen": "\u6253\u5F00", "lineageMemberDeleted": "\u5DF2\u5220\u9664\uFF08\u56DE\u6536\u7AD9\uFF09", "lineageMemberArchived": "\u5DF2\u5F52\u6863", "lineageCompareHint": "\u540C\u8C31\u7CFB\u5386\u6B21\u8FD0\u884C", "lineageCompare": "\u5BF9\u6BD4\u7ED3\u679C", "lineageCompareLeft": "\u5BF9\u6BD4\u5DE6\u4FA7\u8FD0\u884C", "lineageCompareRight": "\u5BF9\u6BD4\u53F3\u4FA7\u8FD0\u884C", "lineageVersus": "\u5BF9\u6BD4", "lineageNoResult": "\u6682\u65E0\u7ED3\u679C" });
 Object.assign(messages.zh, { "event.archive.rotated": "\u56DE\u6536\u7AD9\u5F52\u6863\u8F6E\u8F6C" });
+Object.assign(messages.en, { "lineage": "Rerun lineage", "lineageCount": "{count} runs", "lineageRootRun": "Original run", "lineageRerun": "Rerun #{seq}", "lineageOpen": "Open", "lineageMemberDeleted": "Deleted (in trash)", "lineageMemberArchived": "Archived", "lineageCompareHint": "Every rerun of this workflow", "lineageCompare": "Compare results", "lineageCompareLeft": "Left run to compare", "lineageCompareRight": "Right run to compare", "lineageVersus": "vs", "lineageNoResult": "No result yet" });
 Object.assign(messages.en, { "event.archive.rotated": "Archive rotation" });
 var LANGUAGE_KEY = "workflow-language";
 function normalizePreference(value) {
@@ -1908,6 +1910,7 @@ var zoom = 0;
 var zoomAuto = true;
 var tab = "output";
 var busy = false;
+var lineage = null;
 var defaults = { maxSteps: 120, stepTimeoutMs: 18e5, runTimeoutMs: 72e5 };
 var ns = "http://www.w3.org/2000/svg";
 var labels = new Proxy({}, { get: (_2, key) => {
@@ -2000,9 +2003,11 @@ async function selectRun(id) {
     after = 0;
     zoom = 0;
     zoomAuto = true;
+    lineage = null;
     error("");
     renderList();
     renderRun();
+    void loadLineage(id, version);
     await loadEvents(id, version);
   } catch (e) {
     if (version === selectionVersion) throw e;
@@ -2037,12 +2042,12 @@ function renderRun() {
   renderBrief();
   const r = current;
   $2("#repair-run").hidden = !r || !["failed", "paused", "interrupted", "cancelled", "completed_with_gaps", "succeeded"].includes(r.status);
-  const lineage = $2("#repair-lineage");
-  lineage.hidden = !r?.repair;
-  lineage.replaceChildren();
+  const lineage2 = $2("#repair-lineage");
+  lineage2.hidden = !r?.repair;
+  lineage2.replaceChildren();
   if (r?.repair) {
     const link = el("a", { href: "?run=" + encodeURIComponent(r.repair.sourceRunId) }, t("repairSource"));
-    lineage.append(link, document.createTextNode(" \xB7 " + r.repair.reason + " \xB7 " + t("repairCandidates", { count: r.repair.reuseStepIds.length })));
+    lineage2.append(link, document.createTextNode(" \xB7 " + r.repair.reason + " \xB7 " + t("repairCandidates", { count: r.repair.reuseStepIds.length })));
   }
   const review = r?.status === "pending_review";
   document.querySelector("main").classList.toggle("is-review", review);
@@ -2089,6 +2094,7 @@ function renderRun() {
   renderGraph();
   renderNode();
   renderRead();
+  renderLineage();
 }
 function graphSteps() {
   return workflowGraph(current, { planOnly: showPlan }).nodes;
@@ -2249,6 +2255,83 @@ function renderEvents() {
   if (nearBottom) list.scrollTop = list.scrollHeight;
   renderNode();
 }
+async function loadLineage(id, version = selectionVersion) {
+  try {
+    const data = await api(`/runs/${id}/lineage`);
+    if (viewing(id, version)) {
+      lineage = data;
+      renderLineage();
+    }
+  } catch {
+    if (viewing(id, version)) {
+      lineage = null;
+      renderLineage();
+    }
+  }
+}
+function lineageLabel(m2) {
+  return `${m2.rerunSeq > 0 ? t("lineageRerun", { seq: m2.rerunSeq }) : t("lineageRootRun")} \xB7 ${m2.name}`;
+}
+function renderLineage() {
+  const panel = $2("#lineage-panel"), members = lineage?.members ?? [];
+  const show = !!current && (members.length > 1 || !!current.rerunOf);
+  panel.hidden = !show;
+  if (!show) return;
+  $2("#lineage-count").textContent = t("lineageCount", { count: members.length });
+  const list = $2("#lineage-members");
+  list.replaceChildren();
+  for (const m2 of members) {
+    const row2 = el("article", { class: `lineage-member${m2.id === current.id ? " current" : ""}` }), text = el("div");
+    text.append(el("h3", {}, lineageLabel(m2)), el("p", {}, `${labels[m2.status] ?? m2.status} \xB7 ${new Date(m2.createdAt).toLocaleString(language === "zh" ? "zh-CN" : "en-US")}${m2.durationMs != null ? ` \xB7 ${(m2.durationMs / 1e3).toFixed(1)}s` : ""}`));
+    if (m2.resultPreview) text.append(el("p", { class: "lineage-preview" }, m2.resultPreview));
+    const flags = [m2.deleted ? t("lineageMemberDeleted") : null, m2.archived ? t("lineageMemberArchived") : null].filter(Boolean).join(" \xB7 ");
+    if (flags) text.append(el("p", { class: "lineage-flag" }, flags));
+    const open = el("button", { type: "button" }, t("lineageOpen"));
+    open.disabled = !!(m2.deleted || m2.archived);
+    open.onclick = () => selectRun(m2.id).catch((e) => error(e.message));
+    const actions = el("div", { class: "template-actions" });
+    actions.append(open);
+    row2.append(text, actions);
+    list.append(row2);
+  }
+  const row = $2("#lineage-compare-row"), left = $2("#lineage-left"), right = $2("#lineage-right"), compare = $2("#lineage-compare");
+  row.hidden = members.length < 2;
+  compare.disabled = members.length < 2;
+  $2("#lineage-diff").hidden = true;
+  if (members.length < 2) {
+    left.replaceChildren();
+    right.replaceChildren();
+    return;
+  }
+  const ids = members.map((m2) => m2.id), keep = (value) => ids.includes(value) ? value : null;
+  left.replaceChildren(...members.map((m2) => el("option", { value: m2.id }, lineageLabel(m2))));
+  right.replaceChildren(...members.map((m2) => el("option", { value: m2.id }, lineageLabel(m2))));
+  left.value = keep(left.value) ?? members[0].id;
+  right.value = keep(right.value) && keep(right.value) !== left.value ? keep(right.value) : (members.find((m2) => m2.id !== left.value) ?? members[0]).id;
+}
+$2("#lineage-compare").onclick = async () => {
+  if (!current || !lineage) return;
+  const button = $2("#lineage-compare");
+  button.disabled = true;
+  try {
+    const data = await api(`/runs/${current.id}/lineage?results=1`);
+    const column = (id) => {
+      const member = data.members.find((m2) => m2.id === id), pane = el("div", { class: "lineage-column" });
+      pane.append(el("h3", {}, member ? lineageLabel(member) : ""), el("pre", {}, member ? member.result == null ? t("lineageNoResult") : JSON.stringify(member.result, null, 2) : ""));
+      return pane;
+    };
+    const box = $2("#lineage-diff");
+    box.replaceChildren(column($2("#lineage-left").value), column($2("#lineage-right").value));
+    box.hidden = false;
+  } catch (e) {
+    error(e.message);
+  } finally {
+    button.disabled = false;
+  }
+};
+$2("#lineage-panel").addEventListener("toggle", () => {
+  if ($2("#lineage-panel").open && current) void loadLineage(current.id);
+});
 function showCreate() {
   const f2 = $2("#create-form");
   f2.reset();
@@ -2651,6 +2734,7 @@ function applyLanguage() {
   renderRun();
   renderEvents();
   renderRead();
+  renderLineage();
   if (!current) error(lastAlert);
   if (lastFormMessage) $2("#form-error").textContent = lastFormMessage.key ? t(lastFormMessage.key) : apiMessage(lastFormMessage.error);
   if ($2("#resume-dialog").open && current) $2("#resume-note").textContent = t("resumeNote", { used: current.attempts, max: current.maxCalls }) + (current.legacyLimits ? " " + t("legacyNote") : "");

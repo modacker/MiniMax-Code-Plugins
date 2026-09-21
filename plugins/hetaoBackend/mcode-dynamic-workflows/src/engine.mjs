@@ -39,7 +39,7 @@ export class Engine extends EventEmitter {
     }finally{await file.close();}
    }return out;
  }
- async start(request,repair=null,candidates=[]) {
+ async start(request,repair=null,candidates=[],lineage=null) {
    check(!this.closing,'服务正在关闭');validateScript(request.script);boundedJSON(request.input??{});
    check(typeof request.requestId==='string'&&request.requestId.length<=150&&request.requestId.length>0,'必须提供 requestId');
    check(request.input===undefined||(request.input&&typeof request.input==='object'&&!Array.isArray(request.input)),'input 必须为 JSON object');
@@ -55,8 +55,8 @@ export class Engine extends EventEmitter {
    const existing=this.store.byRequest(request.requestId);if(existing){check(!existing.deletedAt,'requestId 已用于已删除的工作流：请先在回收站恢复它，或更换 requestId');const legacyDefinition={...definition};for(const key of Object.keys(DEFAULT_LIMITS))delete legacyDefinition[key];check(existing.requestHash===requestHash||(existing.maxSteps===undefined&&Object.keys(DEFAULT_LIMITS).every(k=>request[k]===undefined)&&existing.requestHash===hash(legacyDefinition)),'requestId 已用于不同参数');return this.snapshot(existing.id);}
    const fingerprints={};const topology=assertValidDependencies(previewTopology(request.script,request.input??{}));
    check(!this.closing,'服务正在关闭');
-   const run={...(repair?{repair}:{}),id:randomUUID(),requestId:request.requestId,requestHash,...definition,scriptHash:hash(request.script),fingerprints,workspace:this.options.workspace,revision:1,topology,status:'pending_review',createdAt:Date.now(),updatedAt:Date.now(),attempts:0,phases:[],result:null,error:null};
-   this.store.transaction(()=>{this.store.save(run);for(const step of candidates)this.store.saveRepairCandidate(run.id,step);this.store.event(run.id,'run.created',{name:run.name});});return this.snapshot(run.id);
+   const run={...(repair?{repair}:{}),...(lineage?{rerunOf:lineage.rerunOf,lineageRoot:lineage.lineageRoot,rerunSeq:lineage.rerunSeq}:{}),id:randomUUID(),requestId:request.requestId,requestHash,...definition,scriptHash:hash(request.script),fingerprints,workspace:this.options.workspace,revision:1,topology,status:'pending_review',createdAt:Date.now(),updatedAt:Date.now(),attempts:0,phases:[],result:null,error:null};
+   this.store.transaction(()=>{this.store.save(run);for(const step of candidates)this.store.saveRepairCandidate(run.id,step);this.store.event(run.id,'run.created',{name:run.name,...(lineage?{rerunOf:lineage.rerunOf,lineageRoot:lineage.lineageRoot,rerunSeq:lineage.rerunSeq}:{})});});return this.snapshot(run.id);
  }
  async repair(id,request) {
    check(!this.closing,'服务正在关闭');const source=this.store.get(id);check(source,'工作流不存在');
@@ -173,6 +173,60 @@ export class Engine extends EventEmitter {
    const archived=this.store.restoreArchived(id,{by});
    check(archived,'工作流不存在或未归档');
    return this.snapshot(id);
+ }
+ // Rerun: start a NEW pending_review run from the source's script+input. The
+ // source is never modified — the child only carries rerunOf/lineageRoot/
+ // rerunSeq so the family stays queryable and comparable. The synthesized
+ // requestId is `<root>#rerun-<n>` (n = highest existing seq + 1, tombstoned
+ // AND archived members counted so a seq is never reused); a collision with
+ // an already-claimed requestId retries with a numeric suffix.
+ async rerun(id,{input,reuseAcrossRuns,name}={}) {
+  check(!this.closing,'服务正在关闭');
+  check(input===undefined||(input&&typeof input==='object'&&!Array.isArray(input)),'input 必须为 JSON object');
+  check(reuseAcrossRuns===undefined||typeof reuseAcrossRuns==='boolean','reuseAcrossRuns 必须为布尔');
+  check(name===undefined||(typeof name==='string'&&name.trim().length>0&&name.length<=120),'名称须为 1–120 字符');
+  const source=this.store.get(id);
+  if(!source){
+   const archived=this.store.archivedRun(id);
+   check(archived,'工作流不存在');
+   check(false,'工作流已轮转归档，请先从归档恢复后再复跑');
+  }
+  check(!source.deletedAt,'源工作流已删除，请先在回收站恢复后再复跑');
+  check(source.workspace===this.options.workspace,'工作区不匹配');
+  const rootId=source.lineageRoot??source.id;
+  const live=this.store.lineageMembers(rootId),archived=this.store.archivedLineageMembers(rootId);
+  const seq=Math.max(0,...live.map(m=>m.rerunSeq??0),...archived.map(({run})=>run.rerunSeq??0))+1;
+  const root=live.find(m=>m.id===rootId)?.requestId??archived.find(({run})=>run.id===rootId)?.run.requestId??source.requestId;
+  const suffix=`#rerun-${seq}`;
+  const base=(root.length+suffix.length<=150?root:root.slice(0,150-suffix.length))+suffix;
+  let requestId=base;
+  for(let attempt=2;this.store.byRequest(requestId);attempt++)requestId=`${base}-${attempt}`.slice(0,150);
+  // reuseAcrossRuns defaults to false on reruns: silently adopting the source's
+  // nodes would turn the rerun into a fake execution and poison comparison.
+  return this.start({...templateDefinition(source),...(input!==undefined?{input}:{}),...(name!==undefined?{name}:{}),...(reuseAcrossRuns===undefined?{}:{reuseAcrossRuns}),requestId},null,[],{rerunOf:source.id,lineageRoot:rootId,rerunSeq:seq});
+ }
+ // Family face: the lineage root plus every member (live, tombstoned and
+ // archived), ordered by rerunSeq. Deleting or rotating a member never removes
+ // it from the family — it is only annotated. Resolvable from any member id,
+ // including tombstoned and archived ones. `results` adds each member's full
+ // result for the read-only compare face (summaries otherwise).
+ lineage(id,{results=false}={}) {
+  const liveHit=this.store.get(id);
+  let rootId;
+  if(liveHit)rootId=liveHit.lineageRoot??liveHit.id;
+  else{const archived=this.store.archivedRun(id);check(archived,'工作流不存在');rootId=archived.run.lineageRoot??archived.run.id;}
+  const entry=(run,rotationId)=>{
+   const times=this.store.runTimes(run.id);
+   return {id:run.id,requestId:run.requestId,name:run.name,rerunOf:run.rerunOf??null,rerunSeq:run.rerunSeq??0,status:run.status,executor:run.executor,
+    createdAt:run.createdAt,updatedAt:run.updatedAt,startedAt:times.startedAt,finishedAt:times.finishedAt,
+    durationMs:times.startedAt!=null&&times.finishedAt!=null?times.finishedAt-times.startedAt:null,
+    resultPreview:run.result==null?null:String(typeof run.result==='string'?run.result:JSON.stringify(run.result)).slice(0,200),
+    ...(results?{result:run.result??null}:{}),
+    deleted:run.deletedAt?{deletedAt:run.deletedAt,deletedBy:run.deletedBy,purgeAfter:run.purgeAfter}:null,
+    archived:rotationId?{rotationId}:null};};
+  const members=[...this.store.lineageMembers(rootId).map(run=>entry(run,null)),...this.store.archivedLineageMembers(rootId).map(({run,rotationId})=>entry(run,rotationId))];
+  members.sort((a,b)=>a.rerunSeq-b.rerunSeq||(a.createdAt??0)-(b.createdAt??0)||(a.id<b.id?-1:1));
+  return {lineageRoot:rootId,members};
  }
  // Manual rotation face: rotate due tombstones now, optionally returning the
  // archive and integrity verdicts alongside the rotation summary.

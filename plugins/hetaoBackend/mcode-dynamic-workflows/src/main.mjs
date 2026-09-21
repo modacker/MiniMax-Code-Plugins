@@ -71,7 +71,8 @@ if(values.stdio&&process.env.MCODE_WORKFLOW_CHILD==='1'){
   }
   const mcp=await startStdio(async(name,args)=>{
    if(((name==='workflow_repair'||(name==='workflow_results'&&args?.includeDefinition))&&!service.config.features?.workflowRepair)
-    ||((name==='workflow_delete'||name==='workflow_restore')&&!service.config.features?.trashManagement))throw Error('WORKFLOW_SERVICE_UPGRADE_REQUIRED: 当前后台服务版本不支持此操作。退出聊天不会重启服务。请先暂停或取消活动工作流，使用新版插件的 --stop-service（相同 --workspace 和 --data-dir）停止此项目服务，再重新连接 MCP；端口和历史会保留。data-dir: '+dataDir);
+    ||((name==='workflow_delete'||name==='workflow_restore')&&!service.config.features?.trashManagement)
+    ||(name==='workflow_rerun'&&!service.config.features?.rerunLineage))throw Error('WORKFLOW_SERVICE_UPGRADE_REQUIRED: 当前后台服务版本不支持此操作。退出聊天不会重启服务。请先暂停或取消活动工作流，使用新版插件的 --stop-service（相同 --workspace 和 --data-dir）停止此项目服务，再重新连接 MCP；端口和历史会保留。data-dir: '+dataDir);
    const res=await fetch(service.u.origin+'/api/tools',{method:'POST',headers:headersFor(service.u),body:JSON.stringify({name,arguments:args}),signal:AbortSignal.timeout(65000)});
    const v=await res.json();if(!res.ok)throw Error(v.error);return v;
   });

@@ -19,7 +19,7 @@ export async function startHTTP(engine,{port=0,webRoot=new URL('../web/',import.
     if(url.pathname.startsWith('/api/')){
       // A custom header forces cross-origin browser requests through a denied CORS preflight.
       if(req.headers['x-workflow-client']!=='1'||['cross-site','same-site'].includes(req.headers['sec-fetch-site']))return json({error:'请从本地 Workflow Studio 面板访问。'},403);
-      if(req.method==='GET'&&url.pathname==='/api/config')return json({serviceProtocol:2,features:{workflowRepair:true,trashManagement:true},pid:process.pid,workspace:engine.options.workspace,executor:engine.options.command,defaults:engine.defaults,scheduler:engine.schedulerStatus(),mcodeAvailable:!!(await resolveMcode(engine.options.command??'mcode')),example:await readFile(new URL('audit.js',exampleRoot),'utf8')});
+      if(req.method==='GET'&&url.pathname==='/api/config')return json({serviceProtocol:2,features:{workflowRepair:true,trashManagement:true,rerunLineage:true},pid:process.pid,workspace:engine.options.workspace,executor:engine.options.command,defaults:engine.defaults,scheduler:engine.schedulerStatus(),mcodeAvailable:!!(await resolveMcode(engine.options.command??'mcode')),example:await readFile(new URL('audit.js',exampleRoot),'utf8')});
       if(req.method==='GET'&&url.pathname==='/api/templates')return json(engine.store.templates().map(({definition,...t})=>({...t,objective:definition.metadata?.objective??''})));
       const template=url.pathname.match(/^\/api\/templates\/([a-f0-9-]+)$/);
       if(template&&req.method==='GET'){const value=engine.store.template(template[1]);check(value,'模板不存在');return json(value);}
@@ -28,8 +28,8 @@ export async function startHTTP(engine,{port=0,webRoot=new URL('../web/',import.
       if(req.method==='GET'&&url.pathname==='/api/scheduler')return json(engine.schedulerStatus());
       if(req.method==='GET'&&url.pathname==='/api/trash')return json({trashRetentionDays:engine.trashRetentionDays()});
       if(req.method==='GET'&&url.pathname==='/api/runs'){if(url.searchParams.get('trash')==='1')return json(engine.store.listTrash().map(({script,input,result,fingerprints,...r})=>r));return json(engine.store.list().map(({script,input,result,fingerprints,...r})=>r));}
-      const match=url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)(?:\/(wait|pause|cancel|resume|edit|approve|repair|restore))?$/);
-      if(match&&req.method==='GET'){if(match[2]==='wait')return json(await waitEvents(engine,match[1],Math.max(0,Number(url.searchParams.get('after'))||0),20000));return json(engine.snapshot(match[1]));}
+      const match=url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)(?:\/(wait|pause|cancel|resume|edit|approve|repair|restore|lineage))?$/);
+      if(match&&req.method==='GET'){if(match[2]==='wait')return json(await waitEvents(engine,match[1],Math.max(0,Number(url.searchParams.get('after'))||0),20000));if(match[2]==='lineage')return json(engine.lineage(match[1],{results:url.searchParams.get('results')==='1'}));return json(engine.snapshot(match[1]));}
       if(match&&req.method==='DELETE')return json(await engine.deleteRun(match[1],{by:url.searchParams.get('by')??'studio'}));
       if(req.method==='POST'){
        check(req.headers['content-type']?.startsWith('application/json'),'需要 application/json');req.setEncoding('utf8');let body='';for await(const chunk of req){body+=chunk;check(Buffer.byteLength(body)<=700_000,'请求过大');}const data=JSON.parse(body||'{}');

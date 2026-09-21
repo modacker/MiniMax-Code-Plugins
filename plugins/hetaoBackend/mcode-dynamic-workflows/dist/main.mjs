@@ -13576,6 +13576,39 @@ var Store = class {
   tombstoneCount() {
     return Number(this.db.prepare("SELECT COUNT(*) AS n FROM runs WHERE json_extract(body,'$.deletedAt') IS NOT NULL").get().n);
   }
+  // Lineage face: every family member of a root still in the live library.
+  // Tombstoned members are included on purpose — trash hides runs from the
+  // live listings but never breaks a family.
+  lineageMembers(root) {
+    return this.db.prepare("SELECT body FROM runs WHERE id=? OR json_extract(body,'$.lineageRoot')=? ORDER BY COALESCE(json_extract(body,'$.rerunSeq'),0),rowid").all(root, root).map((r) => JSON.parse(r.body));
+  }
+  // Family members that exist only in the sidecar archive (rotated away, not
+  // yet restored): latest archive copy per runId, never including runs that
+  // are live again, so a restored member is never listed twice.
+  archivedLineageMembers(root) {
+    if (!existsSync(this.archivePath)) return [];
+    const live = new Set(this.db.prepare("SELECT id FROM runs").all().map((r) => r.id));
+    const latest = /* @__PURE__ */ new Map();
+    for (const row of this.archive().prepare("SELECT a.runId AS runId,a.rotationId AS rotationId,a.body AS body FROM archive_runs a JOIN rotations r ON r.rotationId=a.rotationId WHERE a.runId=? OR json_extract(a.body,'$.lineageRoot')=? ORDER BY r.rotatedAt,a.rotationId").all(root, root))
+      if (!live.has(row.runId)) latest.set(row.runId, { run: JSON.parse(row.body), rotationId: row.rotationId });
+    return [...latest.values()];
+  }
+  // One archived run's latest copy, or null. Read-only; does not create the
+  // archive database just to answer negatively.
+  archivedRun(runId) {
+    if (!existsSync(this.archivePath)) return null;
+    const row = this.archive().prepare("SELECT a.rotationId AS rotationId,a.body AS body FROM archive_runs a JOIN rotations r ON r.rotationId=a.rotationId WHERE a.runId=? ORDER BY r.rotatedAt DESC,a.rotationId DESC LIMIT 1").get(runId);
+    return row ? { run: JSON.parse(row.body), rotationId: row.rotationId } : null;
+  }
+  // First run.started / last run.finished timestamps from the events ledger.
+  // Events never leave the live database (rotation only moves runs/steps), so
+  // archived family members keep resolving through this face.
+  runTimes(runId) {
+    return {
+      startedAt: this.db.prepare("SELECT json_extract(body,'$.time') AS t FROM events WHERE runId=? AND json_extract(body,'$.type')='run.started' ORDER BY seq LIMIT 1").get(runId)?.t ?? null,
+      finishedAt: this.db.prepare("SELECT json_extract(body,'$.time') AS t FROM events WHERE runId=? AND json_extract(body,'$.type')='run.finished' ORDER BY seq DESC LIMIT 1").get(runId)?.t ?? null
+    };
+  }
   // Size proxy for the runs table: body bytes plus a fixed per-row overhead
   // allowance (row header, id/request columns). SQLite exposes no exact
   // per-table page accounting; a proxy is sufficient for a coarse trigger.
@@ -14448,7 +14481,7 @@ var Engine = class extends EventEmitter {
     }
     return out;
   }
-  async start(request, repair = null, candidates = []) {
+  async start(request, repair = null, candidates = [], lineage = null) {
     check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
     validateScript(request.script);
     boundedJSON(request.input ?? {});
@@ -14475,11 +14508,11 @@ var Engine = class extends EventEmitter {
     const fingerprints = {};
     const topology = assertValidDependencies(previewTopology(request.script, request.input ?? {}));
     check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
-    const run = { ...repair ? { repair } : {}, id: randomUUID2(), requestId: request.requestId, requestHash, ...definition, scriptHash: hash(request.script), fingerprints, workspace: this.options.workspace, revision: 1, topology, status: "pending_review", createdAt: Date.now(), updatedAt: Date.now(), attempts: 0, phases: [], result: null, error: null };
+    const run = { ...repair ? { repair } : {}, ...lineage ? { rerunOf: lineage.rerunOf, lineageRoot: lineage.lineageRoot, rerunSeq: lineage.rerunSeq } : {}, id: randomUUID2(), requestId: request.requestId, requestHash, ...definition, scriptHash: hash(request.script), fingerprints, workspace: this.options.workspace, revision: 1, topology, status: "pending_review", createdAt: Date.now(), updatedAt: Date.now(), attempts: 0, phases: [], result: null, error: null };
     this.store.transaction(() => {
       this.store.save(run);
       for (const step of candidates) this.store.saveRepairCandidate(run.id, step);
-      this.store.event(run.id, "run.created", { name: run.name });
+      this.store.event(run.id, "run.created", { name: run.name, ...lineage ? { rerunOf: lineage.rerunOf, lineageRoot: lineage.lineageRoot, rerunSeq: lineage.rerunSeq } : {} });
     });
     return this.snapshot(run.id);
   }
@@ -14685,6 +14718,74 @@ var Engine = class extends EventEmitter {
     const archived = this.store.restoreArchived(id2, { by });
     check(archived, "\u5DE5\u4F5C\u6D41\u4E0D\u5B58\u5728\u6216\u672A\u5F52\u6863");
     return this.snapshot(id2);
+  }
+  // Rerun: start a NEW pending_review run from the source's script+input. The
+  // source is never modified — the child only carries rerunOf/lineageRoot/
+  // rerunSeq so the family stays queryable and comparable. The synthesized
+  // requestId is `<root>#rerun-<n>` (n = highest existing seq + 1, tombstoned
+  // AND archived members counted so a seq is never reused); a collision with
+  // an already-claimed requestId retries with a numeric suffix.
+  async rerun(id2, { input, reuseAcrossRuns, name } = {}) {
+    check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
+    check(input === void 0 || input && typeof input === "object" && !Array.isArray(input), "input \u5FC5\u987B\u4E3A JSON object");
+    check(reuseAcrossRuns === void 0 || typeof reuseAcrossRuns === "boolean", "reuseAcrossRuns \u5FC5\u987B\u4E3A\u5E03\u5C14");
+    check(name === void 0 || typeof name === "string" && name.trim().length > 0 && name.length <= 120, "\u540D\u79F0\u987B\u4E3A 1\u2013120 \u5B57\u7B26");
+    const source = this.store.get(id2);
+    if (!source) {
+      const archived2 = this.store.archivedRun(id2);
+      check(archived2, "\u5DE5\u4F5C\u6D41\u4E0D\u5B58\u5728");
+      check(false, "\u5DE5\u4F5C\u6D41\u5DF2\u8F6E\u8F6C\u5F52\u6863\uFF0C\u8BF7\u5148\u4ECE\u5F52\u6863\u6062\u590D\u540E\u518D\u590D\u8DD1");
+    }
+    check(!source.deletedAt, "\u6E90\u5DE5\u4F5C\u6D41\u5DF2\u5220\u9664\uFF0C\u8BF7\u5148\u5728\u56DE\u6536\u7AD9\u6062\u590D\u540E\u518D\u590D\u8DD1");
+    check(source.workspace === this.options.workspace, "\u5DE5\u4F5C\u533A\u4E0D\u5339\u914D");
+    const rootId = source.lineageRoot ?? source.id;
+    const live = this.store.lineageMembers(rootId), archived = this.store.archivedLineageMembers(rootId);
+    const seq = Math.max(0, ...live.map((m2) => m2.rerunSeq ?? 0), ...archived.map(({ run }) => run.rerunSeq ?? 0)) + 1;
+    const root = live.find((m2) => m2.id === rootId)?.requestId ?? archived.find(({ run }) => run.id === rootId)?.run.requestId ?? source.requestId;
+    const suffix = `#rerun-${seq}`;
+    const base = (root.length + suffix.length <= 150 ? root : root.slice(0, 150 - suffix.length)) + suffix;
+    let requestId = base;
+    for (let attempt = 2; this.store.byRequest(requestId); attempt++) requestId = `${base}-${attempt}`.slice(0, 150);
+    return this.start({ ...templateDefinition(source), ...input !== void 0 ? { input } : {}, ...name !== void 0 ? { name } : {}, ...reuseAcrossRuns === void 0 ? {} : { reuseAcrossRuns }, requestId }, null, [], { rerunOf: source.id, lineageRoot: rootId, rerunSeq: seq });
+  }
+  // Family face: the lineage root plus every member (live, tombstoned and
+  // archived), ordered by rerunSeq. Deleting or rotating a member never removes
+  // it from the family — it is only annotated. Resolvable from any member id,
+  // including tombstoned and archived ones. `results` adds each member's full
+  // result for the read-only compare face (summaries otherwise).
+  lineage(id2, { results = false } = {}) {
+    const liveHit = this.store.get(id2);
+    let rootId;
+    if (liveHit) rootId = liveHit.lineageRoot ?? liveHit.id;
+    else {
+      const archived = this.store.archivedRun(id2);
+      check(archived, "\u5DE5\u4F5C\u6D41\u4E0D\u5B58\u5728");
+      rootId = archived.run.lineageRoot ?? archived.run.id;
+    }
+    const entry = (run, rotationId) => {
+      const times = this.store.runTimes(run.id);
+      return {
+        id: run.id,
+        requestId: run.requestId,
+        name: run.name,
+        rerunOf: run.rerunOf ?? null,
+        rerunSeq: run.rerunSeq ?? 0,
+        status: run.status,
+        executor: run.executor,
+        createdAt: run.createdAt,
+        updatedAt: run.updatedAt,
+        startedAt: times.startedAt,
+        finishedAt: times.finishedAt,
+        durationMs: times.startedAt != null && times.finishedAt != null ? times.finishedAt - times.startedAt : null,
+        resultPreview: run.result == null ? null : String(typeof run.result === "string" ? run.result : JSON.stringify(run.result)).slice(0, 200),
+        ...results ? { result: run.result ?? null } : {},
+        deleted: run.deletedAt ? { deletedAt: run.deletedAt, deletedBy: run.deletedBy, purgeAfter: run.purgeAfter } : null,
+        archived: rotationId ? { rotationId } : null
+      };
+    };
+    const members2 = [...this.store.lineageMembers(rootId).map((run) => entry(run, null)), ...this.store.archivedLineageMembers(rootId).map(({ run, rotationId }) => entry(run, rotationId))];
+    members2.sort((a, b2) => a.rerunSeq - b2.rerunSeq || (a.createdAt ?? 0) - (b2.createdAt ?? 0) || (a.id < b2.id ? -1 : 1));
+    return { lineageRoot: rootId, members: members2 };
   }
   // Manual rotation face: rotate due tombstones now, optionally returning the
   // archive and integrity verdicts alongside the rotation summary.
@@ -15559,7 +15660,9 @@ Object.assign(messages.zh, { "reviewCompact": "\u7B49\u5F85\u5BA1\u6838", "revie
 Object.assign(messages.en, { "reviewCompact": "Ready for review", "reviewCompactHelp": "Check the flow below, then start.", "reviewDetails": "Task details & execution settings", "reviewBudgets": "Concurrency {concurrency} \xB7 Up to {calls} calls \xB7 {steps} steps / {minutes} min per agent", "status.awaiting": "Not started", "status.blocked": "Dependency blocked", "status.not_run": "Not executed", "awaitingHelp": "This planned node has not been dispatched. Its status will update here when it starts.", "blockedHelp": "A declared upstream node did not succeed; this node has not executed.", "notRunHelp": "This run ended without triggering this planned node.", "dynamicHelp": "The number of nodes depends on runtime results. Created nodes expand within this group." });
 Object.assign(messages.zh, { "trash": "\u56DE\u6536\u7AD9", "trashHelp": "\u5220\u9664\u7684\u5DE5\u4F5C\u6D41\u5148\u8FDB\u5165\u56DE\u6536\u7AD9\uFF1A\u4E8B\u4EF6\u3001\u8282\u70B9\u4E0E\u7ED3\u679C\u5168\u90E8\u4FDD\u7559\uFF0C\u53EF\u968F\u65F6\u6062\u590D\u3002\u5230\u671F\u540E\u7531\u5F52\u6863\u8F6E\u8F6C\u56DE\u6536\u5B58\u50A8\uFF1B\u5BA1\u8BA1\u4E8B\u4EF6\u6C38\u4E0D\u5220\u9664\u3002", "trashEmpty": "\u56DE\u6536\u7AD9\u4E3A\u7A7A\u3002", "trashRestore": "\u6062\u590D", "trashRemaining": "\u4FDD\u7559\u5269\u4F59 {days} \u5929", "trashExpired": "\u5DF2\u5230\u671F\uFF0C\u7B49\u5F85\u5F52\u6863\u8F6E\u8F6C", "trashDeleted": "\u5220\u9664\u4E8E {date}", "trashRetention": "\u56DE\u6536\u7AD9\u4FDD\u7559\u671F\uFF08\u5929\uFF09", "trashRetentionHelp": "\u9ED8\u8BA4 30 \u5929\uFF1B0 \u8868\u793A\u4E0D\u5230\u671F\uFF0C\u4EC5\u624B\u52A8\u8F6E\u8F6C\u5F52\u6863\u3002\u4FEE\u6539\u4F1A\u540C\u6B65\u66F4\u65B0\u56DE\u6536\u7AD9\u4E2D\u5DF2\u6709\u6761\u76EE\u7684\u5230\u671F\u65F6\u95F4\u3002", "event.run.deleted": "\u5DF2\u5220\u9664\u5230\u56DE\u6536\u7AD9", "event.run.restored": "\u5DF2\u6062\u590D" });
 Object.assign(messages.en, { "trash": "Trash", "trashHelp": "Deleted workflows move to the trash first: events, nodes, and results are all kept and restorable at any time. Expired entries are rotated into the local archive to reclaim storage; audit events are never deleted.", "trashEmpty": "Trash is empty.", "trashRestore": "Restore", "trashRemaining": "{days} days left", "trashExpired": "Expired; waiting for archive rotation", "trashDeleted": "Deleted {date}", "trashRetention": "Trash retention (days)", "trashRetentionHelp": "Default 30 days; 0 disables expiry, leaving only manual archive rotation. Changes restamp entries already in the trash.", "event.run.deleted": "Moved to trash", "event.run.restored": "Restored" });
+Object.assign(messages.zh, { "lineage": "\u590D\u8DD1\u8C31\u7CFB", "lineageCount": "{count} \u6B21\u8FD0\u884C", "lineageRootRun": "\u539F\u59CB\u8FD0\u884C", "lineageRerun": "\u590D\u8DD1 \u7B2C {seq} \u6B21", "lineageOpen": "\u6253\u5F00", "lineageMemberDeleted": "\u5DF2\u5220\u9664\uFF08\u56DE\u6536\u7AD9\uFF09", "lineageMemberArchived": "\u5DF2\u5F52\u6863", "lineageCompareHint": "\u540C\u8C31\u7CFB\u5386\u6B21\u8FD0\u884C", "lineageCompare": "\u5BF9\u6BD4\u7ED3\u679C", "lineageCompareLeft": "\u5BF9\u6BD4\u5DE6\u4FA7\u8FD0\u884C", "lineageCompareRight": "\u5BF9\u6BD4\u53F3\u4FA7\u8FD0\u884C", "lineageVersus": "\u5BF9\u6BD4", "lineageNoResult": "\u6682\u65E0\u7ED3\u679C" });
 Object.assign(messages.zh, { "event.archive.rotated": "\u56DE\u6536\u7AD9\u5F52\u6863\u8F6E\u8F6C" });
+Object.assign(messages.en, { "lineage": "Rerun lineage", "lineageCount": "{count} runs", "lineageRootRun": "Original run", "lineageRerun": "Rerun #{seq}", "lineageOpen": "Open", "lineageMemberDeleted": "Deleted (in trash)", "lineageMemberArchived": "Archived", "lineageCompareHint": "Every rerun of this workflow", "lineageCompare": "Compare results", "lineageCompareLeft": "Left run to compare", "lineageCompareRight": "Right run to compare", "lineageVersus": "vs", "lineageNoResult": "No result yet" });
 Object.assign(messages.en, { "event.archive.rotated": "Archive rotation" });
 function translate(language, key, vars = {}) {
   if (language === "en" && vars.count === 1 && ["tasks", "eventsCount"].includes(key)) return key === "tasks" ? "1 task" : "1 event";
@@ -26795,6 +26898,7 @@ var TOOLS = [
   { name: "workflow_resume", description: "\u539F\u811A\u672C\u4E0E\u539F\u8F93\u5165\u6062\u590D\uFF0C\u590D\u7528\u5DF2\u6210\u529F\u8282\u70B9\u3002\u53EF\u8C03\u6574 maxSteps/stepTimeoutMs/runTimeoutMs/maxCalls \u540E\u91CD\u8BD5\uFF0C\u6210\u529F\u8282\u70B9\u590D\u7528\uFF0C\u5931\u8D25\u8282\u70B9\u4ECE\u5934\u6267\u884C\u3002\u5F02\u5E38\u9000\u51FA\u9700\u8981\u7528\u6237\u5148\u786E\u8BA4\u65E7 Agent \u5DF2\u505C\u6B62\u3002", inputSchema: obj({ ...id, confirmStopped: { type: "boolean" }, ...LIMIT_SCHEMAS, maxCalls: { type: "integer", minimum: 1, maximum: 100 } }, ["runId"]) },
   { name: "workflow_delete", description: "\u5220\u9664\u5DF2\u5B8C\u6210\u7684\u5DE5\u4F5C\u6D41\u5230\u56DE\u6536\u7AD9\uFF08\u5893\u7891\u8F6F\u5220\uFF09\uFF1A\u4E8B\u4EF6\u3001\u8282\u70B9\u4E0E\u7ED3\u679C\u5168\u90E8\u4FDD\u7559\uFF0C\u53EF\u968F\u65F6\u6062\u590D\uFF1B\u8FD0\u884C\u4E2D\u6216\u5F85\u5BA1\u6838\u7684\u5DE5\u4F5C\u6D41\u62D2\u7EDD\u5220\u9664\uFF1B\u91CD\u590D\u5220\u9664\u5E42\u7B49\u3002\u5230\u671F\u540E\u7531\u5F52\u6863\u8F6E\u8F6C\u56DE\u6536\u5B58\u50A8\uFF0C\u4E8B\u4EF6\u94FE\u6C38\u4E0D\u5220\u9664\u3002", inputSchema: obj({ ...id, by: { type: "string", description: "\u5220\u9664\u6765\u6E90\uFF08studio/cli/mcp\uFF09\uFF0C\u9ED8\u8BA4 mcp" } }, ["runId"]) },
   { name: "workflow_restore", description: "\u4ECE\u56DE\u6536\u7AD9\u6216\u5F52\u6863\u6062\u590D\u5DE5\u4F5C\u6D41\uFF1A\u56DE\u6536\u7AD9\u6062\u590D\u6E05\u9664\u5893\u7891\uFF1B\u5DF2\u8F6E\u8F6C\u5F52\u6863\u7684\u4ECE\u672C\u673A\u5F52\u6863\u5E93\u5BFC\u56DE\u8282\u70B9\u6570\u636E\u3002\u8FD4\u56DE\u6062\u590D\u540E\u7684\u8FD0\u884C\u72B6\u6001\uFF1B\u5DF2\u5F52\u6863\u672A\u6062\u590D\u524D workflow_status \u4E0D\u8FD4\u56DE\u8BE5\u8FD0\u884C\u3002", inputSchema: obj({ ...id, by: { type: "string", description: "\u6062\u590D\u6765\u6E90\uFF08studio/cli/mcp\uFF09\uFF0C\u9ED8\u8BA4 mcp" } }, ["runId"]) },
+  { name: "workflow_rerun", description: "\u590D\u8DD1\u5DE5\u4F5C\u6D41\uFF1A\u4EE5\u539F\u8FD0\u884C\u7684\u811A\u672C\u4E0E\u8F93\u5165\u521B\u5EFA\u65B0\u7684\u5F85\u5BA1\u6838\u8FD0\u884C\uFF0C\u539F\u8FD0\u884C\u6C38\u4E0D\u6539\u5199\u3002\u65B0\u8FD0\u884C\u5E26 rerunOf/lineageRoot/rerunSeq \u5F52\u5165\u540C\u4E00\u8C31\u7CFB\uFF0C\u53EF\u65E0\u9650\u6B21\u590D\u8DD1\uFF0C\u65CF\u8C31\u7ECF GET /api/runs/:id/lineage \u67E5\u8BE2\u3002\u65B0\u8FD0\u884C\u987B\u9762\u677F\u5BA1\u6838\u540E\u624D\u4F1A\u6267\u884C\u3002\u9ED8\u8BA4\u4E0D\u590D\u7528\u8DE8\u8FD0\u884C\u7ED3\u679C\uFF08\u4FDD\u8BC1\u771F\u5B9E\u91CD\u8DD1\u4E0E\u7ED3\u679C\u5BF9\u6BD4\uFF09\uFF1B\u663E\u5F0F reuseAcrossRuns:true \u624D\u590D\u7528\u3002\u6E90\u8FD0\u884C\u5728\u56DE\u6536\u7AD9\u6216\u5DF2\u5F52\u6863\u65F6\u5148\u6062\u590D\u3002", inputSchema: obj({ ...id, input: { type: "object", description: "\u53EF\u9009\uFF1A\u66FF\u6362\u539F\u8FD0\u884C\u7684 input" }, reuseAcrossRuns: { type: "boolean", description: "Opt-in: adopt succeeded nodes from prior runs when context and spec hashes match; default false so reruns execute for real" } }, ["runId"]) },
   { name: "workflow_dashboard", description: "\u8FD4\u56DE\u53EF\u6536\u85CF\u7684\u672C\u673A\u53EF\u89C6\u5316\u9762\u677F\u5730\u5740\uFF0C\u65E0\u9700 token\u3002\u670D\u52A1\u72EC\u7ACB\u4E8E\u804A\u5929\u4F1A\u8BDD\uFF0C\u91CD\u542F\u540E\u590D\u7528\u7AEF\u53E3\u3002", inputSchema: obj({}) }
 ];
 function summary(snapshot) {
@@ -26854,6 +26958,8 @@ function createToolHandler(engine, getURL) {
         return await engine.deleteRun(args.runId, { by: args.by ?? "mcp" });
       case "workflow_restore":
         return await engine.restoreRun(args.runId, { by: args.by ?? "mcp" });
+      case "workflow_rerun":
+        return summary(await engine.rerun(args.runId, args));
       case "workflow_resume":
         return summary(await engine.resume(args.runId, args));
       case "workflow_dashboard":
@@ -26894,7 +27000,7 @@ async function startHTTP(engine, { port = 0, webRoot = new URL("../web/", import
       const url = new URL(req.url, origin);
       if (url.pathname.startsWith("/api/")) {
         if (req.headers["x-workflow-client"] !== "1" || ["cross-site", "same-site"].includes(req.headers["sec-fetch-site"])) return json({ error: "\u8BF7\u4ECE\u672C\u5730 Workflow Studio \u9762\u677F\u8BBF\u95EE\u3002" }, 403);
-        if (req.method === "GET" && url.pathname === "/api/config") return json({ serviceProtocol: 2, features: { workflowRepair: true, trashManagement: true }, pid: process.pid, workspace: engine.options.workspace, executor: engine.options.command, defaults: engine.defaults, scheduler: engine.schedulerStatus(), mcodeAvailable: !!await resolveMcode(engine.options.command ?? "mcode"), example: await readFile(new URL("audit.js", exampleRoot), "utf8") });
+        if (req.method === "GET" && url.pathname === "/api/config") return json({ serviceProtocol: 2, features: { workflowRepair: true, trashManagement: true, rerunLineage: true }, pid: process.pid, workspace: engine.options.workspace, executor: engine.options.command, defaults: engine.defaults, scheduler: engine.schedulerStatus(), mcodeAvailable: !!await resolveMcode(engine.options.command ?? "mcode"), example: await readFile(new URL("audit.js", exampleRoot), "utf8") });
         if (req.method === "GET" && url.pathname === "/api/templates") return json(engine.store.templates().map(({ definition, ...t }) => ({ ...t, objective: definition.metadata?.objective ?? "" })));
         const template = url.pathname.match(/^\/api\/templates\/([a-f0-9-]+)$/);
         if (template && req.method === "GET") {
@@ -26914,9 +27020,10 @@ async function startHTTP(engine, { port = 0, webRoot = new URL("../web/", import
           if (url.searchParams.get("trash") === "1") return json(engine.store.listTrash().map(({ script, input, result, fingerprints, ...r }) => r));
           return json(engine.store.list().map(({ script, input, result, fingerprints, ...r }) => r));
         }
-        const match = url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)(?:\/(wait|pause|cancel|resume|edit|approve|repair|restore))?$/);
+        const match = url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)(?:\/(wait|pause|cancel|resume|edit|approve|repair|restore|lineage))?$/);
         if (match && req.method === "GET") {
           if (match[2] === "wait") return json(await waitEvents(engine, match[1], Math.max(0, Number(url.searchParams.get("after")) || 0), 2e4));
+          if (match[2] === "lineage") return json(engine.lineage(match[1], { results: url.searchParams.get("results") === "1" }));
           return json(engine.snapshot(match[1]));
         }
         if (match && req.method === "DELETE") return json(await engine.deleteRun(match[1], { by: url.searchParams.get("by") ?? "studio" }));
@@ -27993,7 +28100,7 @@ if (values.stdio && process.env.MCODE_WORKFLOW_CHILD === "1") {
       if (!service) throw Error(`\u672C\u5730\u670D\u52A1\u542F\u52A8\u5931\u8D25\u3002\u4E0A\u6B21\u7AEF\u53E3\u53EF\u80FD\u88AB\u5360\u7528\uFF1B\u4E0D\u4F1A\u81EA\u52A8\u66F4\u6362\u5730\u5740\u3002\u8BF7\u67E5\u770B ${join4(dataDir, "service.log")}`);
     }
     const mcp = await startStdio(async (name, args) => {
-      if ((name === "workflow_repair" || name === "workflow_results" && args?.includeDefinition) && !service.config.features?.workflowRepair || (name === "workflow_delete" || name === "workflow_restore") && !service.config.features?.trashManagement) throw Error("WORKFLOW_SERVICE_UPGRADE_REQUIRED: \u5F53\u524D\u540E\u53F0\u670D\u52A1\u7248\u672C\u4E0D\u652F\u6301\u6B64\u64CD\u4F5C\u3002\u9000\u51FA\u804A\u5929\u4E0D\u4F1A\u91CD\u542F\u670D\u52A1\u3002\u8BF7\u5148\u6682\u505C\u6216\u53D6\u6D88\u6D3B\u52A8\u5DE5\u4F5C\u6D41\uFF0C\u4F7F\u7528\u65B0\u7248\u63D2\u4EF6\u7684 --stop-service\uFF08\u76F8\u540C --workspace \u548C --data-dir\uFF09\u505C\u6B62\u6B64\u9879\u76EE\u670D\u52A1\uFF0C\u518D\u91CD\u65B0\u8FDE\u63A5 MCP\uFF1B\u7AEF\u53E3\u548C\u5386\u53F2\u4F1A\u4FDD\u7559\u3002data-dir: " + dataDir);
+      if ((name === "workflow_repair" || name === "workflow_results" && args?.includeDefinition) && !service.config.features?.workflowRepair || (name === "workflow_delete" || name === "workflow_restore") && !service.config.features?.trashManagement || name === "workflow_rerun" && !service.config.features?.rerunLineage) throw Error("WORKFLOW_SERVICE_UPGRADE_REQUIRED: \u5F53\u524D\u540E\u53F0\u670D\u52A1\u7248\u672C\u4E0D\u652F\u6301\u6B64\u64CD\u4F5C\u3002\u9000\u51FA\u804A\u5929\u4E0D\u4F1A\u91CD\u542F\u670D\u52A1\u3002\u8BF7\u5148\u6682\u505C\u6216\u53D6\u6D88\u6D3B\u52A8\u5DE5\u4F5C\u6D41\uFF0C\u4F7F\u7528\u65B0\u7248\u63D2\u4EF6\u7684 --stop-service\uFF08\u76F8\u540C --workspace \u548C --data-dir\uFF09\u505C\u6B62\u6B64\u9879\u76EE\u670D\u52A1\uFF0C\u518D\u91CD\u65B0\u8FDE\u63A5 MCP\uFF1B\u7AEF\u53E3\u548C\u5386\u53F2\u4F1A\u4FDD\u7559\u3002data-dir: " + dataDir);
       const res = await fetch(service.u.origin + "/api/tools", { method: "POST", headers: headersFor(service.u), body: JSON.stringify({ name, arguments: args }), signal: AbortSignal.timeout(65e3) });
       const v2 = await res.json();
       if (!res.ok) throw Error(v2.error);

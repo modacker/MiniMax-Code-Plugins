@@ -82,6 +82,6 @@ Verification covers isolated demo execution, approval gating, selective reuse an
 
 ## MCP tools
 
-`workflow_validate`, `workflow_start`, `workflow_update`, `workflow_repair`, `workflow_status`, `workflow_results`, `workflow_wait`, `workflow_pause`, `workflow_cancel`, `workflow_resume`, `workflow_delete`, `workflow_restore`, `workflow_dashboard`.
+`workflow_validate`, `workflow_start`, `workflow_update`, `workflow_repair`, `workflow_status`, `workflow_results`, `workflow_wait`, `workflow_pause`, `workflow_cancel`, `workflow_resume`, `workflow_delete`, `workflow_restore`, `workflow_rerun`, `workflow_dashboard`.
 
 Read the [Skill](skills/dynamic-workflow/SKILL.md), [English example](examples/audit-en.js) and [Chinese example](examples/audit.js). The dashboard is a local web page, not a native Mini App or TUI extension.
