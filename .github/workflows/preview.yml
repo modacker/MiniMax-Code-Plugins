@@ -1,0 +1,46 @@
+# preview.yml — fork-side pre-push preview gate (CodeQL + Windows).
+# Lives on mirror branches (preview/**) in the modacker fork ONLY; never part
+# of any upstream PR diff. Trigger: push to preview/** branches.
+# This variant targets the mcode-dynamic-workflows plugin (fail-loud +
+# structured-output batch, branch community/fail-loud @ 1af672c).
+name: preview
+on:
+  push:
+    branches: ['preview/**']
+  workflow_dispatch:
+jobs:
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:javascript'
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Plugin suite (fail-loud + structured-output + launcher checks)
+        working-directory: plugins/hetaoBackend/mcode-dynamic-workflows
+        shell: bash
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run test:package
+      - name: Build idempotence (dist must match committed artifacts)
+        working-directory: plugins/hetaoBackend/mcode-dynamic-workflows
+        shell: bash
+        run: |
+          npm run build
+          git diff --exit-code -- dist
