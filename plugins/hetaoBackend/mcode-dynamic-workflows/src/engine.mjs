@@ -97,7 +97,11 @@ export class Engine extends EventEmitter {
  // readable `preflight` field surfaced by workflow_status.
  async preflightExecutor(run) {
    if(run.executor!=='mcode'||this.options.execute)return null;
-   return preflightMcode(this.options.command??'mcode',{args:this.options.args??[]});
+   // Injectable probe budget for the tree-cleanup regressions only; the
+   // default (20000, inside availability.mjs) and the CLI flag surface are
+   // unchanged.
+   const {preflightTimeoutMs}=this.options;
+   return preflightMcode(this.options.command??'mcode',{args:this.options.args??[],...(preflightTimeoutMs===undefined?{}:{timeoutMs:preflightTimeoutMs})});
  }
  async approve(id,{revision}={}) {
    check(!this.closing,'服务正在关闭');let run=this.store.get(id);check(run?.status==='pending_review','工作流不在待审核状态');

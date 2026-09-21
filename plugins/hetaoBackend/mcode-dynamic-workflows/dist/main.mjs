@@ -14109,82 +14109,6 @@ async function resolveMcode(command = "mcode", { env = process.env, home = homed
   return null;
 }
 
-// src/availability.mjs
-async function preflightMcode(command = "mcode", { args = [], env = process.env, timeoutMs = 2e4 } = {}) {
-  let cli = null;
-  try {
-    cli = await resolveMcode(command, { env });
-  } catch (e) {
-    return {
-      ok: false,
-      code: "MCODE_PREFLIGHT_FAILED",
-      executor: "mcode",
-      probe: null,
-      message: `MCode CLI \u89E3\u6790\u5931\u8D25\uFF1A${safeDetail(e.message)}`,
-      suggestion: "\u4FEE\u590D\u8BE5 CLI \u5B89\u88C5\u540E\u91CD\u8BD5\uFF1B\u672C\u6B21\u8FD0\u884C\u672A\u6267\u884C\u4EFB\u4F55 Agent\u3002"
-    };
-  }
-  if (!cli) {
-    return {
-      ok: false,
-      code: "MCODE_PREFLIGHT_FAILED",
-      executor: "mcode",
-      probe: null,
-      message: "\u627E\u4E0D\u5230 MCode CLI\uFF0C\u8BF7\u901A\u8FC7\u5B98\u65B9\u6E20\u9053\u5B89\u88C5\u5E76\u767B\u5F55\uFF0C\u518D\u6309 Skill \u7684 CLI preflight \u68C0\u67E5 mcode --version \u548C mcode exec --help\u3002",
-      suggestion: "\u5B89\u88C5\u6216\u4FEE\u590D mcode \u540E\u91CD\u8BD5\uFF1B\u672C\u6B21\u8FD0\u884C\u672A\u6267\u884C\u4EFB\u4F55 Agent\u3002"
-    };
-  }
-  const probe = await new Promise((resolve4) => {
-    const captured = { stdout: "", stderr: "" };
-    let timedOut = false;
-    const child = spawn(cli.command, [...cli.args, ...args, "--version"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
-    timer.unref();
-    for (const [stream, key] of [[child.stdout, "stdout"], [child.stderr, "stderr"]]) {
-      stream.setEncoding("utf8");
-      stream.on("data", (chunk) => {
-        const text = captured[key];
-        captured[key] = text.length + chunk.length > 8e3 ? text : text + chunk;
-      });
-    }
-    const finish = (result) => {
-      clearTimeout(timer);
-      resolve4(result);
-    };
-    child.on("error", (e) => finish({ exitCode: null, spawnError: e.code ?? safeDetail(e.message), ...captured, timedOut }));
-    child.on("close", (exitCode) => finish({ exitCode, spawnError: null, ...captured, timedOut }));
-  });
-  if (probe.exitCode === 0 && !probe.spawnError && !probe.timedOut) {
-    return {
-      ok: true,
-      executor: "mcode",
-      probe: "--version",
-      source: cli.source,
-      checkedAt: Date.now(),
-      version: probe.stdout.trim().split("\n").pop()?.slice(0, 120) || null
-    };
-  }
-  const cause = probe.timedOut ? `\u63A2\u6D4B\u8D85\u65F6\uFF08\u8D85\u8FC7 ${Math.round(timeoutMs / 1e3)} \u79D2\u672A\u9000\u51FA\uFF09` : probe.spawnError ? `\u65E0\u6CD5\u542F\u52A8\uFF08${probe.spawnError}\uFF09` : `mcode --version \u9000\u51FA\u7801 ${probe.exitCode ?? "\u672A\u77E5"}`;
-  const tail = safeDetail(probe.stderr.trim() || probe.stdout.trim()).slice(-300);
-  return {
-    ok: false,
-    code: "MCODE_PREFLIGHT_FAILED",
-    executor: "mcode",
-    probe: "--version",
-    exitCode: probe.exitCode,
-    spawnError: probe.spawnError,
-    ...tail ? { stderr: tail } : {},
-    message: `MCode CLI \u4E0D\u53EF\u7528\uFF1A${cause}${tail ? `\uFF1A${tail}` : ""}\u3002\u672C\u6B21\u8FD0\u884C\u5DF2\u6309\u5931\u8D25\u5904\u7406\uFF0C\u672A\u6267\u884C\u4EFB\u4F55 Agent\u3002`,
-    suggestion: "\u5148\u5728\u7EC8\u7AEF\u8FD0\u884C mcode --version \u786E\u8BA4\u53EF\u7528\uFF1A\u68C0\u67E5 mcode \u5B89\u88C5\u4E0E\u5347\u7EA7\uFF08\u7248\u672C\u635F\u574F\u6216\u539F\u751F\u6A21\u5757\u4E0D\u5339\u914D\u65F6\u91CD\u88C5\uFF09\u3001\u767B\u5F55\u72B6\u6001\u4E0E\u7F51\u7EDC\uFF0C\u4FEE\u590D\u540E\u6062\u590D\u8FD0\u884C\u3002"
-  };
-}
-
-// src/executor.mjs
-import { spawn as spawn2 } from "node:child_process";
-
 // src/process-tree.mjs
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -14254,7 +14178,124 @@ async function stopProcessTree(child, {
   }
 }
 
+// src/availability.mjs
+var CLEANUP_BUDGET_MS = 5e3;
+async function preflightMcode(command = "mcode", { args = [], env = process.env, timeoutMs = 2e4, stopTree = stopProcessTree } = {}) {
+  check(Number.isInteger(timeoutMs) && timeoutMs >= 100 && timeoutMs <= 6e5, "preflightTimeoutMs \u5FC5\u987B\u662F 100\u2013600000 \u8303\u56F4\u5185\u7684\u6574\u6570\u6BEB\u79D2\u503C");
+  let cli = null;
+  try {
+    cli = await resolveMcode(command, { env });
+  } catch (e) {
+    return {
+      ok: false,
+      code: "MCODE_PREFLIGHT_FAILED",
+      executor: "mcode",
+      probe: null,
+      message: `MCode CLI \u89E3\u6790\u5931\u8D25\uFF1A${safeDetail(e.message)}`,
+      suggestion: "\u4FEE\u590D\u8BE5 CLI \u5B89\u88C5\u540E\u91CD\u8BD5\uFF1B\u672C\u6B21\u8FD0\u884C\u672A\u6267\u884C\u4EFB\u4F55 Agent\u3002"
+    };
+  }
+  if (!cli) {
+    return {
+      ok: false,
+      code: "MCODE_PREFLIGHT_FAILED",
+      executor: "mcode",
+      probe: null,
+      message: "\u627E\u4E0D\u5230 MCode CLI\uFF0C\u8BF7\u901A\u8FC7\u5B98\u65B9\u6E20\u9053\u5B89\u88C5\u5E76\u767B\u5F55\uFF0C\u518D\u6309 Skill \u7684 CLI preflight \u68C0\u67E5 mcode --version \u548C mcode exec --help\u3002",
+      suggestion: "\u5B89\u88C5\u6216\u4FEE\u590D mcode \u540E\u91CD\u8BD5\uFF1B\u672C\u6B21\u8FD0\u884C\u672A\u6267\u884C\u4EFB\u4F55 Agent\u3002"
+    };
+  }
+  const probe = await new Promise((resolve4) => {
+    const captured = { stdout: "", stderr: "" };
+    let timedOut = false, settled = false;
+    const child = spawn(cli.command, [...cli.args, ...args, "--version"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32" });
+    let timer = null, cleanupTimer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(cleanupTimer);
+      resolve4(result);
+    };
+    for (const [stream, key] of [[child.stdout, "stdout"], [child.stderr, "stderr"]]) {
+      stream.setEncoding("utf8");
+      stream.on("data", (chunk) => {
+        const text = captured[key];
+        captured[key] = text.length + chunk.length > 8e3 ? text : text + chunk;
+      });
+    }
+    child.on("error", (e) => {
+      if (timedOut) return;
+      finish({ exitCode: null, spawnError: e.code ?? safeDetail(e.message), ...captured, timedOut });
+    });
+    child.on("close", (exitCode) => {
+      if (timedOut) return;
+      finish({ exitCode, spawnError: null, ...captured, timedOut });
+    });
+    timer = setTimeout(() => {
+      timedOut = true;
+      const cleanup = stopTree(child);
+      const settle2 = (cleanupConfirmed, reason) => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish({ exitCode: child.exitCode, spawnError: null, ...captured, timedOut, cleanupConfirmed, ...reason ? { cleanupReason: reason } : {} });
+      };
+      void cleanup.then(
+        (result) => {
+          clearTimeout(cleanupTimer);
+          settle2(result.confirmed, result.confirmed ? null : safeDetail(result.reason));
+        },
+        // stopProcessTree never rejects by construction; guard injected fakes.
+        () => settle2(false, "\u6E05\u7406\u64CD\u4F5C\u81EA\u8EAB\u5931\u8D25")
+      );
+      cleanupTimer = setTimeout(() => settle2(false, `\u505C\u6B62\u786E\u8BA4\u672A\u5728\u6E05\u7406\u9884\u7B97\uFF08${CLEANUP_BUDGET_MS}ms\uFF09\u5185\u843D\u5B9A`), CLEANUP_BUDGET_MS);
+      cleanupTimer.unref();
+    }, timeoutMs);
+    timer.unref();
+  });
+  if (probe.exitCode === 0 && !probe.spawnError && !probe.timedOut) {
+    return {
+      ok: true,
+      executor: "mcode",
+      probe: "--version",
+      source: cli.source,
+      checkedAt: Date.now(),
+      version: probe.stdout.trim().split("\n").pop()?.slice(0, 120) || null
+    };
+  }
+  const tail = safeDetail(probe.stderr.trim() || probe.stdout.trim()).slice(-300);
+  if (probe.timedOut && !probe.cleanupConfirmed) {
+    return {
+      ok: false,
+      code: "MCODE_PREFLIGHT_FAILED",
+      executor: "mcode",
+      probe: "--version",
+      exitCode: probe.exitCode,
+      spawnError: probe.spawnError,
+      cleanupConfirmed: false,
+      cleanupReason: probe.cleanupReason ?? null,
+      ...tail ? { stderr: tail } : {},
+      message: `MCode CLI \u4E0D\u53EF\u7528\uFF1A\u63A2\u6D4B\u8D85\u65F6\uFF08\u8D85\u8FC7 ${Math.round(timeoutMs / 1e3)} \u79D2\u672A\u9000\u51FA\uFF09\uFF0C\u4E14\u65E0\u6CD5\u786E\u8BA4\u8FDB\u7A0B\u6811\u5DF2\u505C\u6B62\uFF08${probe.cleanupReason ?? "\u539F\u56E0\u672A\u77E5"}\uFF09\u3002\u8BF7\u68C0\u67E5\u5E76\u7ED3\u675F\u540E\u6B8B\u7559\u7684 mcode \u53CA\u5176\u5B50\u8FDB\u7A0B\u540E\u91CD\u8BD5\u3002\u672C\u6B21\u8FD0\u884C\u5DF2\u6309\u5931\u8D25\u5904\u7406\uFF0C\u672A\u6267\u884C\u4EFB\u4F55 Agent\u3002`,
+      suggestion: "\u5148\u5728\u7EC8\u7AEF\u8FD0\u884C mcode --version \u786E\u8BA4\u72B6\u6001\uFF1B\u82E5\u547D\u4EE4\u5361\u6B7B\uFF0C\u5148\u7ED3\u675F\u6B8B\u7559\u7684 mcode \u53CA\u5176\u5B50\u8FDB\u7A0B\uFF0C\u4FEE\u590D\u5B89\u88C5\u540E\u91CD\u8BD5\u3002"
+    };
+  }
+  const cause = probe.timedOut ? `\u63A2\u6D4B\u8D85\u65F6\uFF08\u8D85\u8FC7 ${Math.round(timeoutMs / 1e3)} \u79D2\u672A\u9000\u51FA\uFF0C\u8FDB\u7A0B\u6811\u5DF2\u786E\u8BA4\u505C\u6B62\uFF09` : probe.spawnError ? `\u65E0\u6CD5\u542F\u52A8\uFF08${probe.spawnError}\uFF09` : `mcode --version \u9000\u51FA\u7801 ${probe.exitCode ?? "\u672A\u77E5"}`;
+  return {
+    ok: false,
+    code: "MCODE_PREFLIGHT_FAILED",
+    executor: "mcode",
+    probe: "--version",
+    exitCode: probe.exitCode,
+    spawnError: probe.spawnError,
+    ...probe.timedOut ? { cleanupConfirmed: probe.cleanupConfirmed } : {},
+    ...tail ? { stderr: tail } : {},
+    message: `MCode CLI \u4E0D\u53EF\u7528\uFF1A${cause}${tail ? `\uFF1A${tail}` : ""}\u3002\u672C\u6B21\u8FD0\u884C\u5DF2\u6309\u5931\u8D25\u5904\u7406\uFF0C\u672A\u6267\u884C\u4EFB\u4F55 Agent\u3002`,
+    suggestion: "\u5148\u5728\u7EC8\u7AEF\u8FD0\u884C mcode --version \u786E\u8BA4\u53EF\u7528\uFF1A\u68C0\u67E5 mcode \u5B89\u88C5\u4E0E\u5347\u7EA7\uFF08\u7248\u672C\u635F\u574F\u6216\u539F\u751F\u6A21\u5757\u4E0D\u5339\u914D\u65F6\u91CD\u88C5\uFF09\u3001\u767B\u5F55\u72B6\u6001\u4E0E\u7F51\u7EDC\uFF0C\u4FEE\u590D\u540E\u6062\u590D\u8FD0\u884C\u3002"
+  };
+}
+
 // src/executor.mjs
+import { spawn as spawn2 } from "node:child_process";
 import { setTimeout as delay2 } from "node:timers/promises";
 async function demoExecute(spec, { signal, onEvent }) {
   await delay2(500 + spec.id.length % 4 * 220, void 0, { signal });
@@ -14521,7 +14562,8 @@ var Engine = class extends EventEmitter {
   // readable `preflight` field surfaced by workflow_status.
   async preflightExecutor(run) {
     if (run.executor !== "mcode" || this.options.execute) return null;
-    return preflightMcode(this.options.command ?? "mcode", { args: this.options.args ?? [] });
+    const { preflightTimeoutMs } = this.options;
+    return preflightMcode(this.options.command ?? "mcode", { args: this.options.args ?? [], ...preflightTimeoutMs === void 0 ? {} : { timeoutMs: preflightTimeoutMs } });
   }
   async approve(id2, { revision } = {}) {
     check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
