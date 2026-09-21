@@ -7813,8 +7813,21 @@ var Store = class {
     const r = this.db.prepare("SELECT body FROM runs WHERE requestId=?").get(id2);
     return r ? JSON.parse(r.body) : null;
   }
+  // Tombstoned runs (deletedAt stamped) never appear in the live list; the
+  // trash listing below is their only index face.
   list() {
-    return this.db.prepare("SELECT body FROM runs ORDER BY CASE WHEN json_extract(body,'$.status') IN ('running','queued','stopping','pausing') THEN 0 WHEN json_extract(body,'$.status')='needs_attention' THEN 1 ELSE 2 END, rowid DESC LIMIT 100").all().map((r) => JSON.parse(r.body));
+    return this.db.prepare("SELECT body FROM runs WHERE json_extract(body,'$.deletedAt') IS NULL ORDER BY CASE WHEN json_extract(body,'$.status') IN ('running','queued','stopping','pausing') THEN 0 WHEN json_extract(body,'$.status')='needs_attention' THEN 1 ELSE 2 END, rowid DESC LIMIT 100").all().map((r) => JSON.parse(r.body));
+  }
+  listTrash() {
+    return this.db.prepare("SELECT body FROM runs WHERE json_extract(body,'$.deletedAt') IS NOT NULL ORDER BY json_extract(body,'$.deletedAt') DESC LIMIT 100").all().map((r) => JSON.parse(r.body));
+  }
+  restampTrashPurge(days) {
+    this.transaction(() => {
+      for (const row of this.db.prepare("SELECT id,body FROM runs WHERE json_extract(body,'$.deletedAt') IS NOT NULL").all()) {
+        const run = JSON.parse(row.body);
+        this.db.prepare("UPDATE runs SET body=? WHERE id=?").run(JSON.stringify({ ...run, purgeAfter: run.deletedAt + days * 864e5 }), row.id);
+      }
+    });
   }
   step(runId, id2) {
     const r = this.db.prepare("SELECT body FROM steps WHERE runId=? AND id=?").get(runId, id2);
@@ -7826,9 +7839,11 @@ var Store = class {
   // All match keys (contextHash, lineageHash) are stamped on the step body at
   // creation, so filtering happens in SQL and LIMIT applies after the full match.
   // Rows without the stamped hashes (legacy runs) never match: cross-run reuse is
-  // an opt-in feature and older steps are not candidates.
+  // an opt-in feature and older steps are not candidates. Tombstoned source runs
+  // are excluded here too: a trashed run's steps must not resurface as reuse
+  // candidates (ghost data) until the run is restored.
   findCrossRunReuse({ contextHash, requestHash, lineageHash, excludeRunId, limit = 20 }) {
-    return this.db.prepare("SELECT runId,body AS stepBody FROM steps WHERE runId<>? AND json_extract(body,'$.kind')='agent' AND json_extract(body,'$.status')='succeeded' AND json_extract(body,'$.requestHash')=? AND json_extract(body,'$.contextHash')=? AND json_extract(body,'$.lineageHash')=? ORDER BY rowid DESC LIMIT ?").all(excludeRunId, requestHash, contextHash, lineageHash, limit).map((r) => {
+    return this.db.prepare("SELECT runId,body AS stepBody FROM steps WHERE runId<>? AND json_extract(body,'$.kind')='agent' AND json_extract(body,'$.status')='succeeded' AND json_extract(body,'$.requestHash')=? AND json_extract(body,'$.contextHash')=? AND json_extract(body,'$.lineageHash')=? AND NOT EXISTS(SELECT 1 FROM runs WHERE runs.id=steps.runId AND json_extract(runs.body,'$.deletedAt') IS NOT NULL) ORDER BY rowid DESC LIMIT ?").all(excludeRunId, requestHash, contextHash, lineageHash, limit).map((r) => {
       const step = JSON.parse(r.stepBody);
       return { runId: r.runId, stepId: step.id, step };
     });
@@ -14256,6 +14271,8 @@ ${JSON.stringify(spec.input ?? {})}`);
 }
 
 // src/engine.mjs
+var DELETABLE = /* @__PURE__ */ new Set(["succeeded", "failed", "completed_with_gaps", "cancelled", "interrupted"]);
+var TRASH_SOURCES = /* @__PURE__ */ new Set(["studio", "cli", "mcp"]);
 var Engine = class extends EventEmitter {
   constructor(store, options) {
     super();
@@ -14316,6 +14333,7 @@ var Engine = class extends EventEmitter {
     const requestHash = hash(repair ? { ...definition, repair } : definition);
     const existing = this.store.byRequest(request.requestId);
     if (existing) {
+      check(!existing.deletedAt, "requestId \u5DF2\u7528\u4E8E\u5DF2\u5220\u9664\u7684\u5DE5\u4F5C\u6D41\uFF1A\u8BF7\u5148\u5728\u56DE\u6536\u7AD9\u6062\u590D\u5B83\uFF0C\u6216\u66F4\u6362 requestId");
       const legacyDefinition = { ...definition };
       for (const key of Object.keys(DEFAULT_LIMITS)) delete legacyDefinition[key];
       check(existing.requestHash === requestHash || existing.maxSteps === void 0 && Object.keys(DEFAULT_LIMITS).every((k) => request[k] === void 0) && existing.requestHash === hash(legacyDefinition), "requestId \u5DF2\u7528\u4E8E\u4E0D\u540C\u53C2\u6570");
@@ -14336,6 +14354,7 @@ var Engine = class extends EventEmitter {
     check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
     const source = this.store.get(id2);
     check(source, "\u5DE5\u4F5C\u6D41\u4E0D\u5B58\u5728");
+    check(!source.deletedAt, "\u5DE5\u4F5C\u6D41\u5DF2\u5220\u9664\uFF0C\u8BF7\u5148\u5728\u56DE\u6536\u7AD9\u6062\u590D\u540E\u518D\u4FEE\u590D");
     check(!this.active.has(id2) && ["failed", "paused", "interrupted", "cancelled", "completed_with_gaps", "succeeded"].includes(source.status), "\u8BF7\u5148\u505C\u6B62\u8FD0\u884C\uFF1B\u5F02\u5E38\u9000\u51FA\u987B\u5148\u786E\u8BA4\u65E7 Agent \u5DF2\u505C\u6B62\u5E76\u6062\u590D\u6216\u6682\u505C");
     check(source.workspace === this.options.workspace, "\u5DE5\u4F5C\u533A\u4E0D\u5339\u914D");
     check(request.sourceUpdatedAt === source.updatedAt, "\u6E90\u8FD0\u884C\u5DF2\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u540E\u518D\u4FEE\u590D");
@@ -14427,6 +14446,7 @@ var Engine = class extends EventEmitter {
   snapshot(id2) {
     const run = this.store.get(id2);
     check(run, "\u5DE5\u4F5C\u6D41\u4E0D\u5B58\u5728");
+    check(!run.deletedAt, "\u5DE5\u4F5C\u6D41\u5DF2\u5220\u9664\uFF0C\u53EF\u5728\u56DE\u6536\u7AD9\u6062\u590D\u540E\u67E5\u770B");
     const limits = runLimits(run), topology = run.topology?.version === 3 ? run.topology : previewTopology(run.script, run.input);
     return { ...run, topology, ...historicalFailure(run, topology), ...limits, legacyLimits: run.maxSteps === void 0, scheduler: this.schedulerStatus(), steps: this.store.steps(id2).map((stored) => {
       const s = stored.kind === "agent" ? { ...stored, maxSteps: stored.maxSteps ?? LEGACY_LIMITS.maxSteps, timeoutMs: stored.timeoutMs ?? LEGACY_LIMITS.stepTimeoutMs } : stored;
@@ -14475,6 +14495,57 @@ var Engine = class extends EventEmitter {
     this.globalConcurrency = globalConcurrency;
     this.drain();
     return this.schedulerStatus();
+  }
+  // Trash retention in days. Default 30; 0 disables the expiry clock entirely
+  // (tombstones then leave only through explicit manual rotation). A corrupted
+  // stored value falls back to the default instead of poisoning purge stamps.
+  trashRetentionDays() {
+    const value = this.store.setting("trashRetentionDays");
+    return Number.isInteger(value) && value >= 0 && value <= 3650 ? value : 30;
+  }
+  configureTrash({ trashRetentionDays }) {
+    check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
+    check(Number.isInteger(trashRetentionDays) && trashRetentionDays >= 0 && trashRetentionDays <= 3650, "\u56DE\u6536\u7AD9\u4FDD\u7559\u671F\u987B\u4E3A 0\u20133650 \u7684\u6574\u6570\u5929\uFF080 \u8868\u793A\u4EC5\u624B\u52A8\u8F6E\u8F6C\uFF09");
+    this.store.saveSetting("trashRetentionDays", trashRetentionDays);
+    this.store.restampTrashPurge(trashRetentionDays);
+    return { trashRetentionDays };
+  }
+  // Tombstone soft delete. Steps, events, result and the integrity ledger all
+  // stay untouched — only the run body gains deletedAt/deletedBy/purgeAfter and
+  // one append-only run.deleted audit event. Repeat deletes are idempotent and
+  // never append a second event.
+  async deleteRun(id2, { by = "studio" } = {}) {
+    check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
+    check(TRASH_SOURCES.has(by), "\u65E0\u6548\u7684\u5220\u9664\u6765\u6E90");
+    const run = this.store.get(id2);
+    check(run, "\u5DE5\u4F5C\u6D41\u4E0D\u5B58\u5728");
+    if (run.deletedAt) return { id: id2, deleted: true, alreadyDeleted: true, deletedAt: run.deletedAt, deletedBy: run.deletedBy, purgeAfter: run.purgeAfter };
+    check(!this.active.has(id2), "\u5DE5\u4F5C\u6D41\u4ECD\u5728\u8FD0\u884C\uFF0C\u8BF7\u5148\u6682\u505C\u6216\u53D6\u6D88\u540E\u518D\u5220\u9664");
+    check(DELETABLE.has(run.status), "\u4EC5\u5DF2\u5B8C\u6210\u7684\u5DE5\u4F5C\u6D41\u53EF\u5220\u9664\uFF08\u8FD0\u884C\u4E2D\u6216\u5F85\u5BA1\u6838\u4E0D\u53EF\u5220\u9664\uFF09");
+    const days = this.trashRetentionDays();
+    run.deletedAt = Date.now();
+    run.deletedBy = by;
+    run.purgeAfter = run.deletedAt + days * 864e5;
+    this.save(run);
+    this.emitEvent(id2, "run.deleted", { by, purgeAfter: run.purgeAfter });
+    return { id: id2, deleted: true, alreadyDeleted: false, deletedAt: run.deletedAt, purgeAfter: run.purgeAfter };
+  }
+  // Restore clears the tombstone and appends run.restored. Everything else was
+  // never removed, so the run reappears byte-identical on every query face.
+  async restoreRun(id2, { by = "studio" } = {}) {
+    check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
+    check(TRASH_SOURCES.has(by), "\u65E0\u6548\u7684\u6062\u590D\u6765\u6E90");
+    const run = this.store.get(id2);
+    if (run) {
+      check(run.deletedAt, "\u5DE5\u4F5C\u6D41\u672A\u5220\u9664\uFF0C\u65E0\u9700\u6062\u590D");
+      delete run.deletedAt;
+      delete run.deletedBy;
+      delete run.purgeAfter;
+      this.save(run);
+      this.emitEvent(id2, "run.restored", { by, origin: "trash" });
+      return this.snapshot(id2);
+    }
+    check(false, "\u5DE5\u4F5C\u6D41\u4E0D\u5B58\u5728");
   }
   drain() {
     while (this.slots < this.globalConcurrency) {
@@ -14819,6 +14890,7 @@ var Engine = class extends EventEmitter {
     check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
     const run = this.store.get(id2);
     check(run, "\u5DE5\u4F5C\u6D41\u4E0D\u5B58\u5728");
+    check(!run.deletedAt, "\u5DE5\u4F5C\u6D41\u5DF2\u5220\u9664\uFF0C\u8BF7\u5148\u5728\u56DE\u6536\u7AD9\u6062\u590D");
     check(!this.active.has(id2), "\u5DE5\u4F5C\u6D41\u4ECD\u5728\u8FD0\u884C");
     check(run.workspace === this.options.workspace, "\u5DE5\u4F5C\u533A\u5DF2\u6539\u53D8\uFF0C\u8BF7\u521B\u5EFA\u65B0\u5DE5\u4F5C\u6D41");
     check(!run.revision || run.approvedRevision === run.revision, "\u672A\u5BA1\u6838\u5DE5\u4F5C\u6D41\u4E0D\u80FD\u6062\u590D\uFF0C\u8BF7\u521B\u5EFA\u65B0\u8349\u7A3F");
@@ -15328,6 +15400,8 @@ Object.assign(messages.zh, { "templates": "\u6A21\u677F\u5E93", "saveTemplate": 
 Object.assign(messages.en, { "templates": "Templates", "saveTemplate": "Save as template", "latestProgress": "Latest progress", "taskBrief": "Task brief", "objective": "Objective", "inputDescription": "Input description", "deliverables": "Expected deliverables", "deliverablesHelp": "One per line, up to 12 items of 300 characters each.", "downloadHTML": "Download HTML report", "downloadMD": "Download Markdown report", "reportExportHelp": "Export saved results with run status, node outputs, and failures. Execution does not prove factual accuracy.", "templatesHelp": "Local templates include the script, current input, brief, and budgets, but no run results. Using a template opens an editable form; saving still requires review.", "templateName": "Template name", "saveCurrentTemplate": "Save current workflow as template", "useTemplate": "Use template", "deleteTemplate": "Delete", "emptyTemplates": "No templates yet. Open a workflow to save one.", "templateSaved": "Template saved", "deleteTemplateConfirm": "Delete this local template? Run history is unaffected.", "exportUnavailable": "Reports can be downloaded after completion or pause.", "demoReportNotice": "Demo results: no model was called. These are not real task findings.", "reportCoverage": "{done}/{total} agents succeeded; failed or incomplete: {failed}.", "reportResult": "Result", "reportFailures": "Failed or incomplete nodes", "defaultObjective": "Review material from several perspectives, verify each independently, and synthesize findings.", "defaultInputDescription": "Provide the code or material to review in the JSON material field.", "defaultDeliverables": "Review and verification results\nA synthesis report with coverage gaps" });
 Object.assign(messages.zh, { "reviewCompact": "\u7B49\u5F85\u5BA1\u6838", "reviewCompactHelp": "\u68C0\u67E5\u4E0B\u65B9\u6D41\u7A0B\uFF0C\u786E\u8BA4\u540E\u5F00\u59CB\u3002", "reviewDetails": "\u4EFB\u52A1\u8BE6\u60C5\u4E0E\u6267\u884C\u8BBE\u7F6E", "reviewBudgets": "\u5E76\u53D1 {concurrency} \xB7 \u6700\u591A {calls} \u6B21\u8C03\u7528 \xB7 \u6BCF\u8282\u70B9 {steps} \u6B65 / {minutes} \u5206\u949F", "status.awaiting": "\u5C1A\u672A\u5F00\u59CB", "status.blocked": "\u4F9D\u8D56\u53D7\u963B", "status.not_run": "\u672A\u6267\u884C", "awaitingHelp": "\u8BE5\u8282\u70B9\u5C1A\u672A\u521B\u5EFA\u6267\u884C\u4EFB\u52A1\u3002\u542F\u52A8\u540E\u4F1A\u5728\u8FD9\u91CC\u66F4\u65B0\u72B6\u6001\u3002", "blockedHelp": "\u5DF2\u58F0\u660E\u7684\u4E0A\u6E38\u8282\u70B9\u672A\u6210\u529F\uFF0C\u5F53\u524D\u8282\u70B9\u5C1A\u672A\u6267\u884C\u3002", "notRunHelp": "\u672C\u6B21\u8FD0\u884C\u5DF2\u7ECF\u7ED3\u675F\uFF0C\u672A\u89E6\u53D1\u8FD9\u4E2A\u8BA1\u5212\u8282\u70B9\u3002", "dynamicHelp": "\u8282\u70B9\u6570\u91CF\u7531\u8FD0\u884C\u7ED3\u679C\u51B3\u5B9A\uFF1B\u5DF2\u521B\u5EFA\u7684\u8282\u70B9\u4F1A\u5728\u6B64\u5206\u7EC4\u4E2D\u5C55\u5F00\u3002" });
 Object.assign(messages.en, { "reviewCompact": "Ready for review", "reviewCompactHelp": "Check the flow below, then start.", "reviewDetails": "Task details & execution settings", "reviewBudgets": "Concurrency {concurrency} \xB7 Up to {calls} calls \xB7 {steps} steps / {minutes} min per agent", "status.awaiting": "Not started", "status.blocked": "Dependency blocked", "status.not_run": "Not executed", "awaitingHelp": "This planned node has not been dispatched. Its status will update here when it starts.", "blockedHelp": "A declared upstream node did not succeed; this node has not executed.", "notRunHelp": "This run ended without triggering this planned node.", "dynamicHelp": "The number of nodes depends on runtime results. Created nodes expand within this group." });
+Object.assign(messages.zh, { "trash": "\u56DE\u6536\u7AD9", "trashHelp": "\u5220\u9664\u7684\u5DE5\u4F5C\u6D41\u5148\u8FDB\u5165\u56DE\u6536\u7AD9\uFF1A\u4E8B\u4EF6\u3001\u8282\u70B9\u4E0E\u7ED3\u679C\u5168\u90E8\u4FDD\u7559\uFF0C\u53EF\u968F\u65F6\u6062\u590D\u3002\u5230\u671F\u540E\u7531\u5F52\u6863\u8F6E\u8F6C\u56DE\u6536\u5B58\u50A8\uFF1B\u5BA1\u8BA1\u4E8B\u4EF6\u6C38\u4E0D\u5220\u9664\u3002", "trashEmpty": "\u56DE\u6536\u7AD9\u4E3A\u7A7A\u3002", "trashRestore": "\u6062\u590D", "trashRemaining": "\u4FDD\u7559\u5269\u4F59 {days} \u5929", "trashExpired": "\u5DF2\u5230\u671F\uFF0C\u7B49\u5F85\u5F52\u6863\u8F6E\u8F6C", "trashDeleted": "\u5220\u9664\u4E8E {date}", "trashRetention": "\u56DE\u6536\u7AD9\u4FDD\u7559\u671F\uFF08\u5929\uFF09", "trashRetentionHelp": "\u9ED8\u8BA4 30 \u5929\uFF1B0 \u8868\u793A\u4E0D\u5230\u671F\uFF0C\u4EC5\u624B\u52A8\u8F6E\u8F6C\u5F52\u6863\u3002\u4FEE\u6539\u4F1A\u540C\u6B65\u66F4\u65B0\u56DE\u6536\u7AD9\u4E2D\u5DF2\u6709\u6761\u76EE\u7684\u5230\u671F\u65F6\u95F4\u3002", "event.run.deleted": "\u5DF2\u5220\u9664\u5230\u56DE\u6536\u7AD9", "event.run.restored": "\u5DF2\u6062\u590D" });
+Object.assign(messages.en, { "trash": "Trash", "trashHelp": "Deleted workflows move to the trash first: events, nodes, and results are all kept and restorable at any time. Expired entries are rotated into the local archive to reclaim storage; audit events are never deleted.", "trashEmpty": "Trash is empty.", "trashRestore": "Restore", "trashRemaining": "{days} days left", "trashExpired": "Expired; waiting for archive rotation", "trashDeleted": "Deleted {date}", "trashRetention": "Trash retention (days)", "trashRetentionHelp": "Default 30 days; 0 disables expiry, leaving only manual archive rotation. Changes restamp entries already in the trash.", "event.run.deleted": "Moved to trash", "event.run.restored": "Restored" });
 function translate(language, key, vars = {}) {
   if (language === "en" && vars.count === 1 && ["tasks", "eventsCount"].includes(key)) return key === "tasks" ? "1 task" : "1 event";
   return (messages[language]?.[key] ?? messages.en[key] ?? key).replace(/\{(\w+)\}/g, (_2, name) => String(vars[name] ?? `{${name}}`));
@@ -26560,6 +26634,8 @@ var TOOLS = [
   { name: "workflow_cancel", description: "\u53D6\u6D88\u672C\u63D2\u4EF6\u5DE5\u4F5C\u6D41\uFF0C\u7B49\u5F85\u5728\u9014 exec \u9000\u51FA\uFF1B\u4E0D\u53D6\u6D88\u5176\u4ED6 MCode \u4F1A\u8BDD\u3002", inputSchema: obj(id, ["runId"]) },
   { name: "workflow_pause", description: "\u505C\u6B62\u6D3E\u53D1\u5E76\u4E2D\u65AD\u5728\u9014\u8C03\u7528\uFF0C\u4FDD\u7559\u5DF2\u5B8C\u6210\u8282\u70B9\uFF0C\u53EF\u6062\u590D\u3002", inputSchema: obj(id, ["runId"]) },
   { name: "workflow_resume", description: "\u539F\u811A\u672C\u4E0E\u539F\u8F93\u5165\u6062\u590D\uFF0C\u590D\u7528\u5DF2\u6210\u529F\u8282\u70B9\u3002\u53EF\u8C03\u6574 maxSteps/stepTimeoutMs/runTimeoutMs/maxCalls \u540E\u91CD\u8BD5\uFF0C\u6210\u529F\u8282\u70B9\u590D\u7528\uFF0C\u5931\u8D25\u8282\u70B9\u4ECE\u5934\u6267\u884C\u3002\u5F02\u5E38\u9000\u51FA\u9700\u8981\u7528\u6237\u5148\u786E\u8BA4\u65E7 Agent \u5DF2\u505C\u6B62\u3002", inputSchema: obj({ ...id, confirmStopped: { type: "boolean" }, ...LIMIT_SCHEMAS, maxCalls: { type: "integer", minimum: 1, maximum: 100 } }, ["runId"]) },
+  { name: "workflow_delete", description: "\u5220\u9664\u5DF2\u5B8C\u6210\u7684\u5DE5\u4F5C\u6D41\u5230\u56DE\u6536\u7AD9\uFF08\u5893\u7891\u8F6F\u5220\uFF09\uFF1A\u4E8B\u4EF6\u3001\u8282\u70B9\u4E0E\u7ED3\u679C\u5168\u90E8\u4FDD\u7559\uFF0C\u53EF\u968F\u65F6\u6062\u590D\uFF1B\u8FD0\u884C\u4E2D\u6216\u5F85\u5BA1\u6838\u7684\u5DE5\u4F5C\u6D41\u62D2\u7EDD\u5220\u9664\uFF1B\u91CD\u590D\u5220\u9664\u5E42\u7B49\u3002\u5230\u671F\u540E\u7531\u5F52\u6863\u8F6E\u8F6C\u56DE\u6536\u5B58\u50A8\uFF0C\u4E8B\u4EF6\u94FE\u6C38\u4E0D\u5220\u9664\u3002", inputSchema: obj({ ...id, by: { type: "string", description: "\u5220\u9664\u6765\u6E90\uFF08studio/cli/mcp\uFF09\uFF0C\u9ED8\u8BA4 mcp" } }, ["runId"]) },
+  { name: "workflow_restore", description: "\u4ECE\u56DE\u6536\u7AD9\u6216\u5F52\u6863\u6062\u590D\u5DE5\u4F5C\u6D41\uFF1A\u56DE\u6536\u7AD9\u6062\u590D\u6E05\u9664\u5893\u7891\uFF1B\u5DF2\u8F6E\u8F6C\u5F52\u6863\u7684\u4ECE\u672C\u673A\u5F52\u6863\u5E93\u5BFC\u56DE\u8282\u70B9\u6570\u636E\u3002\u8FD4\u56DE\u6062\u590D\u540E\u7684\u8FD0\u884C\u72B6\u6001\uFF1B\u5DF2\u5F52\u6863\u672A\u6062\u590D\u524D workflow_status \u4E0D\u8FD4\u56DE\u8BE5\u8FD0\u884C\u3002", inputSchema: obj({ ...id, by: { type: "string", description: "\u6062\u590D\u6765\u6E90\uFF08studio/cli/mcp\uFF09\uFF0C\u9ED8\u8BA4 mcp" } }, ["runId"]) },
   { name: "workflow_dashboard", description: "\u8FD4\u56DE\u53EF\u6536\u85CF\u7684\u672C\u673A\u53EF\u89C6\u5316\u9762\u677F\u5730\u5740\uFF0C\u65E0\u9700 token\u3002\u670D\u52A1\u72EC\u7ACB\u4E8E\u804A\u5929\u4F1A\u8BDD\uFF0C\u91CD\u542F\u540E\u590D\u7528\u7AEF\u53E3\u3002", inputSchema: obj({}) }
 ];
 function summary(snapshot) {
@@ -26615,6 +26691,10 @@ function createToolHandler(engine, getURL) {
         return summary(await engine.stop(args.runId));
       case "workflow_pause":
         return summary(await engine.stop(args.runId, "paused"));
+      case "workflow_delete":
+        return await engine.deleteRun(args.runId, { by: args.by ?? "mcp" });
+      case "workflow_restore":
+        return await engine.restoreRun(args.runId, { by: args.by ?? "mcp" });
       case "workflow_resume":
         return summary(await engine.resume(args.runId, args));
       case "workflow_dashboard":
@@ -26655,7 +26735,7 @@ async function startHTTP(engine, { port = 0, webRoot = new URL("../web/", import
       const url = new URL(req.url, origin);
       if (url.pathname.startsWith("/api/")) {
         if (req.headers["x-workflow-client"] !== "1" || ["cross-site", "same-site"].includes(req.headers["sec-fetch-site"])) return json({ error: "\u8BF7\u4ECE\u672C\u5730 Workflow Studio \u9762\u677F\u8BBF\u95EE\u3002" }, 403);
-        if (req.method === "GET" && url.pathname === "/api/config") return json({ serviceProtocol: 2, features: { workflowRepair: true }, pid: process.pid, workspace: engine.options.workspace, executor: engine.options.command, defaults: engine.defaults, scheduler: engine.schedulerStatus(), mcodeAvailable: !!await resolveMcode(engine.options.command ?? "mcode"), example: await readFile(new URL("audit.js", exampleRoot), "utf8") });
+        if (req.method === "GET" && url.pathname === "/api/config") return json({ serviceProtocol: 2, features: { workflowRepair: true, trashManagement: true }, pid: process.pid, workspace: engine.options.workspace, executor: engine.options.command, defaults: engine.defaults, scheduler: engine.schedulerStatus(), mcodeAvailable: !!await resolveMcode(engine.options.command ?? "mcode"), example: await readFile(new URL("audit.js", exampleRoot), "utf8") });
         if (req.method === "GET" && url.pathname === "/api/templates") return json(engine.store.templates().map(({ definition, ...t }) => ({ ...t, objective: definition.metadata?.objective ?? "" })));
         const template = url.pathname.match(/^\/api\/templates\/([a-f0-9-]+)$/);
         if (template && req.method === "GET") {
@@ -26670,12 +26750,17 @@ async function startHTTP(engine, { port = 0, webRoot = new URL("../web/", import
           return res.end(file.body);
         }
         if (req.method === "GET" && url.pathname === "/api/scheduler") return json(engine.schedulerStatus());
-        if (req.method === "GET" && url.pathname === "/api/runs") return json(engine.store.list().map(({ script, input, result, fingerprints, ...r }) => r));
-        const match = url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)(?:\/(wait|pause|cancel|resume|edit|approve|repair))?$/);
+        if (req.method === "GET" && url.pathname === "/api/trash") return json({ trashRetentionDays: engine.trashRetentionDays() });
+        if (req.method === "GET" && url.pathname === "/api/runs") {
+          if (url.searchParams.get("trash") === "1") return json(engine.store.listTrash().map(({ script, input, result, fingerprints, ...r }) => r));
+          return json(engine.store.list().map(({ script, input, result, fingerprints, ...r }) => r));
+        }
+        const match = url.pathname.match(/^\/api\/runs\/([a-f0-9-]+)(?:\/(wait|pause|cancel|resume|edit|approve|repair|restore))?$/);
         if (match && req.method === "GET") {
           if (match[2] === "wait") return json(await waitEvents(engine, match[1], Math.max(0, Number(url.searchParams.get("after")) || 0), 2e4));
           return json(engine.snapshot(match[1]));
         }
+        if (match && req.method === "DELETE") return json(await engine.deleteRun(match[1], { by: url.searchParams.get("by") ?? "studio" }));
         if (req.method === "POST") {
           check(req.headers["content-type"]?.startsWith("application/json"), "\u9700\u8981 application/json");
           req.setEncoding("utf8");
@@ -26692,10 +26777,12 @@ async function startHTTP(engine, { port = 0, webRoot = new URL("../web/", import
             return json({ deleted: true });
           }
           if (url.pathname === "/api/scheduler") return json(engine.configureScheduler(data3));
+          if (url.pathname === "/api/trash") return json(engine.configureTrash(data3));
           if (url.pathname === "/api/tools") return json(await createToolHandler(engine, () => `${origin}/`)(data3.name, data3.arguments));
           if (url.pathname === "/api/validate") return json(assertValidDependencies(previewTopology(data3.script)));
           if (url.pathname === "/api/runs") return json(await engine.start(data3), 201);
           if (match && match[2] === "repair") return json(await engine.repair(match[1], data3));
+          if (match && match[2] === "restore") return json(await engine.restoreRun(match[1], { by: data3.by ?? "studio" }));
           if (match && match[2] === "edit") return json(await engine.update(match[1], data3));
           if (match && match[2] === "approve") return json(await engine.approve(match[1], data3));
           if (match && match[2] === "resume") return json(await engine.resume(match[1], data3));
@@ -27746,7 +27833,7 @@ if (values.stdio && process.env.MCODE_WORKFLOW_CHILD === "1") {
       if (!service) throw Error(`\u672C\u5730\u670D\u52A1\u542F\u52A8\u5931\u8D25\u3002\u4E0A\u6B21\u7AEF\u53E3\u53EF\u80FD\u88AB\u5360\u7528\uFF1B\u4E0D\u4F1A\u81EA\u52A8\u66F4\u6362\u5730\u5740\u3002\u8BF7\u67E5\u770B ${join4(dataDir, "service.log")}`);
     }
     const mcp = await startStdio(async (name, args) => {
-      if ((name === "workflow_repair" || name === "workflow_results" && args?.includeDefinition) && !service.config.features?.workflowRepair) throw Error("WORKFLOW_SERVICE_UPGRADE_REQUIRED: \u5F53\u524D\u540E\u53F0\u670D\u52A1\u7248\u672C\u4E0D\u652F\u6301\u811A\u672C\u4FEE\u590D\u3002\u9000\u51FA\u804A\u5929\u4E0D\u4F1A\u91CD\u542F\u670D\u52A1\u3002\u8BF7\u5148\u6682\u505C\u6216\u53D6\u6D88\u6D3B\u52A8\u5DE5\u4F5C\u6D41\uFF0C\u4F7F\u7528\u65B0\u7248\u63D2\u4EF6\u7684 --stop-service\uFF08\u76F8\u540C --workspace \u548C --data-dir\uFF09\u505C\u6B62\u6B64\u9879\u76EE\u670D\u52A1\uFF0C\u518D\u91CD\u65B0\u8FDE\u63A5 MCP\uFF1B\u7AEF\u53E3\u548C\u5386\u53F2\u4F1A\u4FDD\u7559\u3002data-dir: " + dataDir);
+      if ((name === "workflow_repair" || name === "workflow_results" && args?.includeDefinition) && !service.config.features?.workflowRepair || (name === "workflow_delete" || name === "workflow_restore") && !service.config.features?.trashManagement) throw Error("WORKFLOW_SERVICE_UPGRADE_REQUIRED: \u5F53\u524D\u540E\u53F0\u670D\u52A1\u7248\u672C\u4E0D\u652F\u6301\u6B64\u64CD\u4F5C\u3002\u9000\u51FA\u804A\u5929\u4E0D\u4F1A\u91CD\u542F\u670D\u52A1\u3002\u8BF7\u5148\u6682\u505C\u6216\u53D6\u6D88\u6D3B\u52A8\u5DE5\u4F5C\u6D41\uFF0C\u4F7F\u7528\u65B0\u7248\u63D2\u4EF6\u7684 --stop-service\uFF08\u76F8\u540C --workspace \u548C --data-dir\uFF09\u505C\u6B62\u6B64\u9879\u76EE\u670D\u52A1\uFF0C\u518D\u91CD\u65B0\u8FDE\u63A5 MCP\uFF1B\u7AEF\u53E3\u548C\u5386\u53F2\u4F1A\u4FDD\u7559\u3002data-dir: " + dataDir);
       const res = await fetch(service.u.origin + "/api/tools", { method: "POST", headers: headersFor(service.u), body: JSON.stringify({ name, arguments: args }), signal: AbortSignal.timeout(65e3) });
       const v2 = await res.json();
       if (!res.ok) throw Error(v2.error);
