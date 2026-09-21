@@ -1407,6 +1407,14 @@ function workflowGraph(run, { planOnly = false } = {}) {
   return { nodes, phases };
 }
 
+// web/lineage-model.mjs
+function compareSignature(language2, members) {
+  return JSON.stringify([language2, ...(members ?? []).map((member) => [member.id, member.rerunSeq, member.name])]);
+}
+function shouldRebuildCompare(previous, next) {
+  return previous !== next;
+}
+
 // web/i18n.mjs
 var messages = {
   "zh": {
@@ -1911,6 +1919,7 @@ var zoomAuto = true;
 var tab = "output";
 var busy = false;
 var lineage = null;
+var lineageSignature = "";
 var defaults = { maxSteps: 120, stepTimeoutMs: 18e5, runTimeoutMs: 72e5 };
 var ns = "http://www.w3.org/2000/svg";
 var labels = new Proxy({}, { get: (_2, key) => {
@@ -2033,6 +2042,7 @@ async function refreshCurrent() {
     if (viewing(id, version)) {
       current = next;
       renderRun();
+      if ($2("#lineage-panel").open) void loadLineage(id, version, true);
     }
   } catch (e) {
     if (viewing(id, version)) throw e;
@@ -2255,7 +2265,7 @@ function renderEvents() {
   if (nearBottom) list.scrollTop = list.scrollHeight;
   renderNode();
 }
-async function loadLineage(id, version = selectionVersion) {
+async function loadLineage(id, version = selectionVersion, background = false) {
   try {
     const data = await api(`/runs/${id}/lineage`);
     if (viewing(id, version)) {
@@ -2263,7 +2273,7 @@ async function loadLineage(id, version = selectionVersion) {
       renderLineage();
     }
   } catch {
-    if (viewing(id, version)) {
+    if (viewing(id, version) && !background) {
       lineage = null;
       renderLineage();
     }
@@ -2276,7 +2286,10 @@ function renderLineage() {
   const panel = $2("#lineage-panel"), members = lineage?.members ?? [];
   const show = !!current && (members.length > 1 || !!current.rerunOf);
   panel.hidden = !show;
-  if (!show) return;
+  if (!show) {
+    lineageSignature = "";
+    return;
+  }
   $2("#lineage-count").textContent = t("lineageCount", { count: members.length });
   const list = $2("#lineage-members");
   list.replaceChildren();
@@ -2294,6 +2307,9 @@ function renderLineage() {
     row2.append(text, actions);
     list.append(row2);
   }
+  const signature = compareSignature(language, members);
+  if (!shouldRebuildCompare(lineageSignature, signature)) return;
+  lineageSignature = signature;
   const row = $2("#lineage-compare-row"), left = $2("#lineage-left"), right = $2("#lineage-right"), compare = $2("#lineage-compare");
   row.hidden = members.length < 2;
   compare.disabled = members.length < 2;
@@ -2939,6 +2955,7 @@ async function renderTrash() {
         await api(`/runs/${r.id}/restore`, "POST", { by: "studio" });
         await renderTrash();
         await refreshList();
+        if (current && $2("#lineage-panel").open) void loadLineage(current.id);
       } catch (e) {
         $2("#trash-error").hidden = false;
         $2("#trash-error").textContent = apiMessage(e.message);

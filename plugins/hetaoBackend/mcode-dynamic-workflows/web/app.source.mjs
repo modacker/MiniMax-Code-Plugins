@@ -1,12 +1,13 @@
 import {readableHTML,rawText,escapeHTML} from './readable.mjs';
 import {workflowGraph} from './graph-model.mjs';
+import {compareSignature,shouldRebuildCompare} from './lineage-model.mjs';
 import {translate,resolveLanguage,readPreference,savePreference,describeFailure,LANGUAGE_KEY} from './i18n.mjs';
 const $=s=>document.querySelector(s);
 let nodeRaw=false,nodeSignature='',copyValue='',copyTimer;
 
 let scheduler={active:0,limit:8,queued:0};
 let showPlan=false,readSignature="",selectionVersion=0;
-let runs=[],current=null,selected=null,events=[],after=0,zoom=0,zoomAuto=true,tab='output',busy=false,lineage=null,defaults={maxSteps:120,stepTimeoutMs:1800000,runTimeoutMs:7200000};const ns='http://www.w3.org/2000/svg';
+let runs=[],current=null,selected=null,events=[],after=0,zoom=0,zoomAuto=true,tab='output',busy=false,lineage=null,lineageSignature='',defaults={maxSteps:120,stepTimeoutMs:1800000,runTimeoutMs:7200000};const ns='http://www.w3.org/2000/svg';
 const labels=new Proxy({}, {get:(_,key)=>{const v=t('status.'+key);return v==='status.'+key?key:v}});
 const eventLabels=new Proxy({}, {get:(_,key)=>{const v=t('event.'+key);return v==='event.'+key?key:v}});
 let preference=readPreference(safeStorage()),language=resolveLanguage(preference,navigator.languages?.length?navigator.languages:[navigator.language]),connectionKey='connecting',mcodeAvailable=true,readMode=null,lastAlert='',lastFormMessage=null;
@@ -37,7 +38,7 @@ async function loadEvents(id,version=selectionVersion){
 }
 async function refreshCurrent(){
  const id=current?.id,version=selectionVersion;if(!id)return;
- try{const next=await api(`/runs/${id}`);if(viewing(id,version)){current=next;renderRun();}}
+ try{const next=await api(`/runs/${id}`);if(viewing(id,version)){current=next;renderRun();if($('#lineage-panel').open)void loadLineage(id,version,true);}}
  catch(e){if(viewing(id,version))throw e;}
 }
 function renderRun(){renderBrief();const r=current;$('#repair-run').hidden=!r||!['failed','paused','interrupted','cancelled','completed_with_gaps','succeeded'].includes(r.status);const lineage=$('#repair-lineage');lineage.hidden=!r?.repair;lineage.replaceChildren();if(r?.repair){const link=el('a',{href:'?run='+encodeURIComponent(r.repair.sourceRunId)},t('repairSource'));lineage.append(link,document.createTextNode(' · '+r.repair.reason+' · '+t('repairCandidates',{count:r.repair.reuseStepIds.length})));}const review=r?.status==='pending_review';document.querySelector('main').classList.toggle('is-review',review);$('.metrics').hidden=review;$('.timeline').hidden=review;$('#report').hidden=review;$('#save-template').hidden=!r||review;$('#review-budgets').textContent=r?t('reviewBudgets',{concurrency:r.concurrency,calls:r.maxCalls,steps:r.maxSteps,minutes:r.stepTimeoutMs/60000}):'';$('#review-banner').hidden=!review;$('#edit-draft').hidden=!review;$('#approve').hidden=!review;$('#review-version').textContent=review?`v${r.revision}`:'';$('#graph-mode').hidden=!r?.topology||review;$('#graph-mode').textContent=t(showPlan?'showExecution':'showPlan');$('#topology-note').hidden=!r?.topology;$('#topology-warnings').textContent=r?.topology?.warnings.map(w=>t('topology.'+w)).join(' ')??'';$('#empty').hidden=!!r;$('#run-view').hidden=!r;if(!r){$('#run-title').textContent=t('canvas');$('#executor-badge').textContent=t('noRun');for(const id of ['pause','cancel','resume'])$('#'+id).hidden=true;return;}$('#run-title').textContent=r.name;$('#executor-badge').textContent=r.executor==='demo'?t('demoRun'):t('realRun');$('#metric-status').textContent=labels[r.status]??r.status;$('.status-metric').dataset.status=r.status;const tasks=r.steps.filter(s=>s.kind==='agent');const visibleNodes=graphSteps(),knownNodes=visibleNodes.filter(n=>!n.placeholder||!n.dynamic).length;$('#metric-nodes').textContent=`${tasks.filter(s=>s.status==='succeeded').length} / ${knownNodes}${visibleNodes.some(n=>n.placeholder&&n.dynamic)?'+':''}`;$('#metric-calls').textContent=`${r.attempts} / ${r.maxCalls}`;const usage=tasks.flatMap(s=>[...(s.usageHistory??[]),...(s.usage?[s.usage]:[])]);$('#metric-tokens').textContent=r.executor==='demo'?'—':usage.length?usage.reduce((n,s)=>n+(s.totalTokens??((s.inputTokens??0)+(s.outputTokens??0))),0).toLocaleString(language==='zh'?'zh-CN':'en-US')+(usage.length<r.attempts?t('unknownPlus'):''):t('unknown');$('#pause').hidden=r.status!=='running';$('#cancel').hidden=!['running','queued'].includes(r.status);$('#resume').hidden=!((!r.revision||r.approvedRevision===r.revision)&&['paused','failed','interrupted','cancelled','needs_attention','completed_with_gaps'].includes(r.status));$('#canvas-status').textContent=labels[r.status];$('#canvas-status').dataset.status=r.status;if(r.error){const f=describeFailure(language,r.errorDetails,r.error);error(f.title+(f.original?' '+t('originalReason',{cause:f.original}):'')+(/DEPENDENCY/.test(r.errorDetails?.code??'')?' '+f.advice:''),true);}renderGraph();renderNode();renderRead();renderLineage();}
@@ -91,9 +92,9 @@ function renderNode(){
  if(!dialog.open)dialog.showModal();
 }
 function renderEvents(){const list=$('#events'),nearBottom=list.scrollHeight-list.scrollTop-list.clientHeight<60;list.replaceChildren();$('#event-count').textContent=t('eventsCount',{count:events.length});for(const e of events.slice(-100)){const li=el('li');li.append(el('time',{},new Date(e.time).toLocaleTimeString(language==='zh'?'zh-CN':'en-US',{hour12:false})),el('span',{},`${eventLabels[e.type]??e.type}${e.message||e.text?` · ${short(e.message??e.text,90)}`:e.status?` · ${labels[e.status]??e.status}`:''}`),el('span',{class:'event-node'},e.stepId??e.label??''));list.append(li);}if(nearBottom)list.scrollTop=list.scrollHeight;renderNode();}
-async function loadLineage(id,version=selectionVersion){
+async function loadLineage(id,version=selectionVersion,background=false){
  try{const data=await api(`/runs/${id}/lineage`);if(viewing(id,version)){lineage=data;renderLineage();}}
- catch{if(viewing(id,version)){lineage=null;renderLineage();}}
+ catch{if(viewing(id,version)&&!background){lineage=null;renderLineage();}}
 }
 function lineageLabel(m){return `${m.rerunSeq>0?t('lineageRerun',{seq:m.rerunSeq}):t('lineageRootRun')} · ${m.name}`;}
 function renderLineage(){
@@ -102,8 +103,11 @@ function renderLineage(){
  // standalone run keeps the panel out of the layout.
  const show=!!current&&(members.length>1||!!current.rerunOf);
  panel.hidden=!show;
- if(!show)return;
+ if(!show){lineageSignature='';return;}
  $('#lineage-count').textContent=t('lineageCount',{count:members.length});
+ // Member cards are pure data (status, duration, trash/archive flags) and
+ // re-render on every pass, so a refetched lineage can never leave a
+ // restored member wearing a stale deleted flag.
  const list=$('#lineage-members');list.replaceChildren();
  for(const m of members){
   const row=el('article',{class:`lineage-member${m.id===current.id?' current':''}`}),text=el('div');
@@ -117,6 +121,12 @@ function renderLineage(){
   const actions=el('div',{class:'template-actions'});actions.append(open);
   row.append(text,actions);list.append(row);
  }
+ // The compare controls hold user interaction state (chosen pair, open
+ // diff). Rebuild them only when member identity changes: a poll over an
+ // unchanged family must keep the diff the user opened.
+ const signature=compareSignature(language,members);
+ if(!shouldRebuildCompare(lineageSignature,signature))return;
+ lineageSignature=signature;
  const row=$('#lineage-compare-row'),left=$('#lineage-left'),right=$('#lineage-right'),compare=$('#lineage-compare');
  row.hidden=members.length<2;compare.disabled=members.length<2;$('#lineage-diff').hidden=true;
  if(members.length<2){left.replaceChildren();right.replaceChildren();return;}
@@ -256,7 +266,7 @@ async function renderTrash(){
   const days=Math.ceil((r.purgeAfter-Date.now())/86400000);
   text.append(el('h3',{},r.name),el('p',{},`${labels[r.status]??r.status} · ${t('trashDeleted',{date:new Date(r.deletedAt).toLocaleString(language==='zh'?'zh-CN':'en-US')})} · ${days>0?t('trashRemaining',{days}):t('trashExpired')}`));
   const restore=el('button',{type:'button'},t('trashRestore'));
-  restore.onclick=async()=>{restore.disabled=true;try{await api(`/runs/${r.id}/restore`,'POST',{by:'studio'});await renderTrash();await refreshList();}catch(e){$('#trash-error').hidden=false;$('#trash-error').textContent=apiMessage(e.message);restore.disabled=false;}};
+  restore.onclick=async()=>{restore.disabled=true;try{await api(`/runs/${r.id}/restore`,'POST',{by:'studio'});await renderTrash();await refreshList();if(current&&$('#lineage-panel').open)void loadLineage(current.id);}catch(e){$('#trash-error').hidden=false;$('#trash-error').textContent=apiMessage(e.message);restore.disabled=false;}};
   const actions=el('div',{class:'template-actions'});actions.append(restore);row.append(text,actions);list.append(row);}
 }
 $('#open-trash').onclick=async()=>{$('#trash-error').hidden=true;$('#trash-dialog').showModal();try{const {trashRetentionDays}=await api('/trash');$('#trash-form').elements.trashRetentionDays.value=String(trashRetentionDays);await renderTrash();}catch(e){$('#trash-error').hidden=false;$('#trash-error').textContent=apiMessage(e.message);}};
