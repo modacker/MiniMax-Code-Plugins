@@ -16,6 +16,7 @@ import { resolveMcode } from './availability.mjs';
 import { DEFAULT_LIMITS, LEGACY_LIMITS, resolveLimits, runLimits, durationLabel } from './limits.mjs';
 import { agentFailure,failureError } from './failure.mjs';
 import { demoExecute, mcodeExecute } from './executor.mjs';
+import { ROTATE_TOMBSTONE_THRESHOLD,ROTATE_RUNS_BYTES_THRESHOLD } from './store.mjs';
 // Only finished runs may enter the trash. needs_attention stays out: its old
 // agents may still require user confirmation, and the run is not done yet.
 const DELETABLE=new Set(['succeeded','failed','completed_with_gaps','cancelled','interrupted']);
@@ -143,7 +144,12 @@ export class Engine extends EventEmitter {
  // never append a second event.
  async deleteRun(id,{by='studio'}={}) {
    check(!this.closing,'服务正在关闭');check(TRASH_SOURCES.has(by),'无效的删除来源');
-   const run=this.store.get(id);check(run,'工作流不存在');
+   const run=this.store.get(id);
+   if(!run){
+    // Already rotated past the trash: report the archive state truthfully.
+    const archived=this.store.archiveOrigin(id);check(archived,'工作流不存在');
+    return {id,deleted:true,alreadyDeleted:true,archived:true,rotationId:archived.rotationId};
+   }
    if(run.deletedAt)return {id,deleted:true,alreadyDeleted:true,deletedAt:run.deletedAt,deletedBy:run.deletedBy,purgeAfter:run.purgeAfter};
    check(!this.active.has(id),'工作流仍在运行，请先暂停或取消后再删除');
    check(DELETABLE.has(run.status),'仅已完成的工作流可删除（运行中或待审核不可删除）');
@@ -163,7 +169,28 @@ export class Engine extends EventEmitter {
     this.save(run);this.emitEvent(id,'run.restored',{by,origin:'trash'});
     return this.snapshot(id);
    }
-   check(false,'工作流不存在');
+   // Not live: restore from the sidecar archive when the run was rotated.
+   const archived=this.store.restoreArchived(id,{by});
+   check(archived,'工作流不存在或未归档');
+   return this.snapshot(id);
+ }
+ // Manual rotation face: rotate due tombstones now, optionally returning the
+ // archive and integrity verdicts alongside the rotation summary.
+ rotateArchive({verify=false}={}) {
+  check(!this.closing,'服务正在关闭');
+  const result=this.store.rotateDue({now:Date.now()});
+  return verify?{...result,archive:this.store.verifyArchive(),integrity:this.store.verifyIntegrity()}:result;
+ }
+ // Startup compaction: when trash volume or runs-table size crosses the
+ // documented thresholds, expired tombstones are rotated into archive.db
+ // before the dashboard starts serving. trashRetentionDays=0 disables the
+ // expiry clock entirely (manual rotation only) and with it this auto path.
+ autoRotateAtStartup() {
+  const days=this.trashRetentionDays();
+  if(days<=0)return {autoRotated:false,reason:'manual-only',tombstones:this.store.tombstoneCount(),bytes:this.store.runsBytes()};
+  const tombstones=this.store.tombstoneCount(),bytes=this.store.runsBytes();
+  if(tombstones<=ROTATE_TOMBSTONE_THRESHOLD&&bytes<=ROTATE_RUNS_BYTES_THRESHOLD)return {autoRotated:false,tombstones,bytes};
+  return {...this.store.rotateDue({now:Date.now()}),autoRotated:true,tombstones,bytes};
  }
  drain(){
   while(this.slots<this.globalConcurrency){

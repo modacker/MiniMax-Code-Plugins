@@ -37,6 +37,7 @@ export async function startHTTP(engine,{port=0,webRoot=new URL('../web/',import.
        if(template){check(data.action==='delete','模板操作无效');check(engine.store.deleteTemplate(template[1]),'模板不存在');return json({deleted:true});}
        if(url.pathname==='/api/scheduler')return json(engine.configureScheduler(data));
        if(url.pathname==='/api/trash')return json(engine.configureTrash(data));
+       if(url.pathname==='/api/archive/rotate')return json(engine.rotateArchive({verify:data.verify===true}));
        if(url.pathname==='/api/tools')return json(await createToolHandler(engine,()=>`${origin}/`)(data.name,data.arguments));
        if(url.pathname==='/api/validate')return json(assertValidDependencies(previewTopology(data.script)));
        if(url.pathname==='/api/runs')return json(await engine.start(data),201);
