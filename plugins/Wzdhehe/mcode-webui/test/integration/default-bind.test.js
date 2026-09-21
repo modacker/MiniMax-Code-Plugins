@@ -20,17 +20,15 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const serverJsPath = join(__dirname, "..", "..", "server.js");
 
-function pickPort() {
-  // 19700..19799 — disjoint from router-boot (19500s) and C08 (18080s)
-  return 19700 + Math.floor(Math.random() * 100);
-}
+// Port allocation: 19701/19702/19703 — disjoint from router-boot (19500s)
+// and C08 (18080s). Each case gets its OWN deterministic port and the
+// helper only resolves after the child process has fully exited: on
+// Linux, resolving at the listening line and immediately binding the
+// next case raced the dying listener into EADDRINUSE (SIGTERM → close
+// is asynchronous; TIME_WAIT/lingering proc held 0.0.0.0:<port>).
 
-// Spawn server.js; resolve with the captured stdout once it prints the
-// listening line (or reject after 4s). envOverrides may set/clear HOST;
-// settingsJson may pre-write the isolated settings file.
-function bootOnce({ envOverrides = {}, settingsJson } = {}) {
+function bootOnce({ port, envOverrides = {}, settingsJson } = {}) {
   const tmpDir = mkdtempSync(join(tmpdir(), "mcode-webui-bind-"));
-  const port = pickPort();
   const env = {
     ...process.env,
     PORT: String(port),
@@ -55,32 +53,54 @@ function bootOnce({ envOverrides = {}, settingsJson } = {}) {
     });
     let stdout = "";
     let stderr = "";
-    proc.stdout.on("data", (d) => (stdout += d.toString()));
-    proc.stderr.on("data", (d) => (stderr += d.toString()));
-    const timer = setTimeout(() => {
+    let settled = false;
+    const bail = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill("SIGKILL"); } catch {}
       reject(new Error(`no listening line within 4s. stdout:\n${stdout}\nstderr:\n${stderr}`));
     }, 4000);
-    const onChunk = () => {
-      if (/listening on/.test(stdout)) {
-        clearTimeout(timer);
+    proc.stdout.on("data", (d) => {
+      stdout += d.toString();
+      if (!settled && /listening on/.test(stdout)) {
+        settled = true;
+        clearTimeout(bail);
+        // Tear the listener down COMPLETELY before resolving so the
+        // next case's bind on its own port cannot collide with a
+        // lingering socket: SIGTERM, escalate to SIGKILL if close
+        // stalls, await the exit event, then clean the tmp dir.
+        const exited = new Promise((r) => proc.once("exit", r));
         proc.kill("SIGTERM");
-        resolve({ stdout, port });
+        const hardKill = setTimeout(() => {
+          try { proc.kill("SIGKILL"); } catch {}
+        }, 1500);
+        void exited.then(() => {
+          clearTimeout(hardKill);
+          try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+          resolve({ stdout, port });
+        });
       }
-    };
-    proc.stdout.on("data", onChunk);
-    proc.on("exit", () => {
-      clearTimeout(timer);
-      try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
     });
+    proc.stderr.on("data", (d) => (stderr += d.toString()));
     proc.on("error", (e) => {
-      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      clearTimeout(bail);
       reject(e);
+    });
+    proc.on("exit", () => {
+      // Died before printing the listening line → startup failure.
+      if (!settled) {
+        settled = true;
+        clearTimeout(bail);
+        reject(new Error(`server exited before listening. stdout:\n${stdout}\nstderr:\n${stderr}`));
+      }
     });
   });
 }
 
 test("default bind: no env HOST + no settings file → listening on 127.0.0.1", async () => {
-  const { stdout, port } = await bootOnce();
+  const { stdout, port } = await bootOnce({ port: 19701 });
   assert.match(
     stdout,
     new RegExp(`listening on http://127\\.0\\.0\\.1:${port}`),
@@ -89,7 +109,7 @@ test("default bind: no env HOST + no settings file → listening on 127.0.0.1", 
 });
 
 test("LAN opt-in: persisted lanBind:true → listening on 0.0.0.0", async () => {
-  const { stdout, port } = await bootOnce({ settingsJson: { lanBind: true } });
+  const { stdout, port } = await bootOnce({ port: 19702, settingsJson: { lanBind: true } });
   assert.match(
     stdout,
     new RegExp(`listening on http://0\\.0\\.0\\.0:${port}`),
@@ -100,6 +120,7 @@ test("LAN opt-in: persisted lanBind:true → listening on 0.0.0.0", async () => 
 test("explicit env HOST=0.0.0.0 keeps winning over the persisted setting", async () => {
   // lanBind:false on disk + env HOST set → env must own the bind.
   const { stdout, port } = await bootOnce({
+    port: 19703,
     envOverrides: { HOST: "0.0.0.0" },
     settingsJson: { lanBind: false },
   });
