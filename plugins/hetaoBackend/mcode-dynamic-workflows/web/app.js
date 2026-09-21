@@ -1415,6 +1415,25 @@ function shouldRebuildCompare(previous, next) {
   return previous !== next;
 }
 
+// web/fullscreen-model.mjs
+var FULLSCREEN_OFF = "off";
+var FULLSCREEN_API = "api";
+var FULLSCREEN_OVERLAY = "overlay";
+function requestMode(state, { apiSupported = false } = {}) {
+  if (state === FULLSCREEN_API || state === FULLSCREEN_OVERLAY) return state;
+  return apiSupported ? FULLSCREEN_API : FULLSCREEN_OVERLAY;
+}
+function rejectApi(state) {
+  return state === FULLSCREEN_API ? FULLSCREEN_OVERLAY : state;
+}
+function apiChange(state, onPanel) {
+  if (onPanel) return FULLSCREEN_API;
+  return state === FULLSCREEN_API ? FULLSCREEN_OFF : state;
+}
+function shouldExitOnKey(state, { key = "", dialogOpen = false } = {}) {
+  return state === FULLSCREEN_OVERLAY && key === "Escape" && !dialogOpen;
+}
+
 // web/i18n.mjs
 var messages = {
   "zh": {
@@ -1864,6 +1883,8 @@ Object.assign(messages.zh, { "lineage": "\u590D\u8DD1\u8C31\u7CFB", "lineageCoun
 Object.assign(messages.zh, { "event.archive.rotated": "\u56DE\u6536\u7AD9\u5F52\u6863\u8F6E\u8F6C" });
 Object.assign(messages.en, { "lineage": "Rerun lineage", "lineageCount": "{count} runs", "lineageRootRun": "Original run", "lineageRerun": "Rerun #{seq}", "lineageOpen": "Open", "lineageMemberDeleted": "Deleted (in trash)", "lineageMemberArchived": "Archived", "lineageCompareHint": "Every rerun of this workflow", "lineageCompare": "Compare results", "lineageCompareLeft": "Left run to compare", "lineageCompareRight": "Right run to compare", "lineageVersus": "vs", "lineageNoResult": "No result yet" });
 Object.assign(messages.en, { "event.archive.rotated": "Archive rotation" });
+Object.assign(messages.zh, { "canvasFullscreen": "\u5168\u5C4F", "canvasExitFullscreen": "\u9000\u51FA\u5168\u5C4F" });
+Object.assign(messages.en, { "canvasFullscreen": "Fullscreen", "canvasExitFullscreen": "Exit fullscreen" });
 var LANGUAGE_KEY = "workflow-language";
 function normalizePreference(value) {
   return ["zh", "en"].includes(value) ? value : "auto";
@@ -2072,11 +2093,13 @@ function renderRun() {
   $2("#review-version").textContent = review ? `v${r.revision}` : "";
   $2("#graph-mode").hidden = !r?.topology || review;
   $2("#graph-mode").textContent = t(showPlan ? "showExecution" : "showPlan");
+  syncCanvasFullscreenButton();
   $2("#topology-note").hidden = !r?.topology;
   $2("#topology-warnings").textContent = r?.topology?.warnings.map((w) => t("topology." + w)).join(" ") ?? "";
   $2("#empty").hidden = !!r;
   $2("#run-view").hidden = !r;
   if (!r) {
+    setCanvasFullscreen(FULLSCREEN_OFF);
     $2("#run-title").textContent = t("canvas");
     $2("#executor-badge").textContent = t("noRun");
     for (const id of ["pause", "cancel", "resume"]) $2("#" + id).hidden = true;
@@ -2459,6 +2482,58 @@ $2("#graph-mode").onclick = () => {
   zoomAuto = true;
   renderRun();
 };
+var canvasFullscreen = FULLSCREEN_OFF;
+function canvasFullscreenElement() {
+  return document.fullscreenElement ?? document.webkitFullscreenElement ?? null;
+}
+function syncCanvasFullscreenButton() {
+  const active = canvasFullscreen !== FULLSCREEN_OFF, button = $2("#graph-fullscreen");
+  button.textContent = t(active ? "canvasExitFullscreen" : "canvasFullscreen");
+  button.setAttribute("aria-pressed", String(active));
+}
+function refitCanvasFullscreen() {
+  if (current) {
+    zoomAuto = true;
+    renderGraph();
+  }
+}
+function setCanvasFullscreen(mode) {
+  if (mode === canvasFullscreen) return;
+  canvasFullscreen = mode;
+  $2(".canvas-panel").classList.toggle("canvas-overlay", mode === FULLSCREEN_OVERLAY);
+  syncCanvasFullscreenButton();
+  refitCanvasFullscreen();
+}
+$2("#graph-fullscreen").onclick = async () => {
+  const panel = $2(".canvas-panel");
+  if (canvasFullscreen === FULLSCREEN_OFF) {
+    const request = panel.requestFullscreen ?? panel.webkitRequestFullscreen;
+    setCanvasFullscreen(requestMode(canvasFullscreen, { apiSupported: typeof request === "function" }));
+    if (typeof request === "function") {
+      try {
+        await request.call(panel);
+      } catch {
+        setCanvasFullscreen(rejectApi(canvasFullscreen));
+      }
+    }
+  } else if (canvasFullscreenElement()) {
+    try {
+      await (document.exitFullscreen ?? document.webkitExitFullscreen).call(document);
+    } catch {
+    }
+  } else setCanvasFullscreen(FULLSCREEN_OFF);
+};
+document.addEventListener("fullscreenchange", () => {
+  const onPanel = canvasFullscreenElement() === $2(".canvas-panel");
+  setCanvasFullscreen(apiChange(canvasFullscreen, onPanel));
+  if (onPanel || !canvasFullscreenElement()) refitCanvasFullscreen();
+});
+document.addEventListener("webkitfullscreenerror", () => {
+  setCanvasFullscreen(rejectApi(canvasFullscreen));
+});
+document.addEventListener("keydown", (e) => {
+  if (shouldExitOnKey(canvasFullscreen, { key: e.key, dialogOpen: !!document.querySelector("dialog[open]") })) setCanvasFullscreen(FULLSCREEN_OFF);
+});
 $2("#new-run").onclick = showCreate;
 $2("#empty-start").onclick = showCreate;
 $2("#close-create").onclick = () => $2("#create-dialog").close();

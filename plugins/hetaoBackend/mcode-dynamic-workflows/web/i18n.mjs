@@ -448,6 +448,8 @@ Object.assign(messages.zh,{"lineage": "复跑谱系", "lineageCount": "{count} �
 Object.assign(messages.zh,{"event.archive.rotated": "回收站归档轮转"});
 Object.assign(messages.en,{"lineage": "Rerun lineage", "lineageCount": "{count} runs", "lineageRootRun": "Original run", "lineageRerun": "Rerun #{seq}", "lineageOpen": "Open", "lineageMemberDeleted": "Deleted (in trash)", "lineageMemberArchived": "Archived", "lineageCompareHint": "Every rerun of this workflow", "lineageCompare": "Compare results", "lineageCompareLeft": "Left run to compare", "lineageCompareRight": "Right run to compare", "lineageVersus": "vs", "lineageNoResult": "No result yet"});
 Object.assign(messages.en,{"event.archive.rotated": "Archive rotation"});
+Object.assign(messages.zh,{"canvasFullscreen": "全屏", "canvasExitFullscreen": "退出全屏"});
+Object.assign(messages.en,{"canvasFullscreen": "Fullscreen", "canvasExitFullscreen": "Exit fullscreen"});
 export const LANGUAGE_KEY = 'workflow-language';
 export function normalizePreference(value) { return ['zh','en'].includes(value) ? value : 'auto'; }
 export function resolveLanguage(preference, languages = []) {

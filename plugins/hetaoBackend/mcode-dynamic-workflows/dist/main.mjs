@@ -15664,6 +15664,8 @@ Object.assign(messages.zh, { "lineage": "\u590D\u8DD1\u8C31\u7CFB", "lineageCoun
 Object.assign(messages.zh, { "event.archive.rotated": "\u56DE\u6536\u7AD9\u5F52\u6863\u8F6E\u8F6C" });
 Object.assign(messages.en, { "lineage": "Rerun lineage", "lineageCount": "{count} runs", "lineageRootRun": "Original run", "lineageRerun": "Rerun #{seq}", "lineageOpen": "Open", "lineageMemberDeleted": "Deleted (in trash)", "lineageMemberArchived": "Archived", "lineageCompareHint": "Every rerun of this workflow", "lineageCompare": "Compare results", "lineageCompareLeft": "Left run to compare", "lineageCompareRight": "Right run to compare", "lineageVersus": "vs", "lineageNoResult": "No result yet" });
 Object.assign(messages.en, { "event.archive.rotated": "Archive rotation" });
+Object.assign(messages.zh, { "canvasFullscreen": "\u5168\u5C4F", "canvasExitFullscreen": "\u9000\u51FA\u5168\u5C4F" });
+Object.assign(messages.en, { "canvasFullscreen": "Fullscreen", "canvasExitFullscreen": "Exit fullscreen" });
 function translate(language, key, vars = {}) {
   if (language === "en" && vars.count === 1 && ["tasks", "eventsCount"].includes(key)) return key === "tasks" ? "1 task" : "1 event";
   return (messages[language]?.[key] ?? messages.en[key] ?? key).replace(/\{(\w+)\}/g, (_2, name) => String(vars[name] ?? `{${name}}`));
