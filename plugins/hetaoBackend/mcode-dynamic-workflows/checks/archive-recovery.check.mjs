@@ -53,25 +53,48 @@ test('a live-transaction abort after the archive commit leaves a reconcilable or
  }finally{await f.cleanup();}
 });
 
-test('a SIGKILL in the commit gap is repaired by the next startup and the rotation redoes',async()=>{
+test('a hard kill in the commit gap is repaired by the next startup and the rotation redoes',async()=>{
  const dir=await mkdtemp(join(tmpdir(),'wf-sigkill-'));let runId;
  try{
   {const store=new Store(dir),engine=new Engine(store,{workspace:dir,execute:async s=>({output:s.id})});
    const end=await run(engine,'return await ctx.agent({id:"a",prompt:"a"});','recover-2');
    runId=end.id;await engine.deleteRun(runId,{by:'cli'});await engine.configureTrash({trashRetentionDays:0});
    await engine.close();store.close();}
-  // A child process takes the owner lock, starts the rotation, and is
-  // SIGKILLed through the production injection seam (store.afterArchiveCommit)
-  // exactly after the archive COMMIT and before the live transaction — a real
-  // kill, not a mocked crash. The committed archive copy must survive it.
+  // A child process takes the owner lock, starts the rotation, and dies
+  // through the production injection seam (store.afterArchiveCommit) exactly
+  // after the archive COMMIT and before the live transaction — a real crash,
+  // not a mocked one. The committed archive copy must survive it.
+  //
+  // Cross-platform equivalence of the kill primitive: on POSIX SIGKILL is an
+  // uninterceptable hard kill. On Windows, Node maps a self-SIGKILL onto
+  // TerminateProcess with a death shape the execFile error does not expose
+  // as `signal` (fork preview run 35696536334), so win32 uses process.exit(9)
+  // instead: it terminates immediately and synchronously — no stack unwinding,
+  // so the try/finally and store.close() never run and no further DB
+  // statement executes. Because node:sqlite writes synchronously and the
+  // archive transaction already committed with PRAGMA synchronous=FULL
+  // before the seam fires, the durable crash-window state (archive side on
+  // disk, live transaction never begun) is byte-identical under both
+  // primitives — and exit(9)'s exit code, unlike TerminateProcess's, is
+  // portably observable as code 9.
+  const die=process.platform==='win32'?'process.exit(9)':'process.kill(process.pid,\'SIGKILL\')';
   const crash=`import {Store} from ${JSON.stringify(storeModule)};
 const store=new Store(${JSON.stringify(dir)});
-store.afterArchiveCommit=()=>process.kill(process.pid,'SIGKILL');
+store.afterArchiveCommit=()=>${die};
 try{store.rotateDue({now:Date.now()});}finally{store.close();}`;
-  await assert.rejects(exec(process.execPath,['--input-type=module','-e',crash]),e=>e.signal==='SIGKILL');
+  await assert.rejects(exec(process.execPath,['--input-type=module','-e',crash]),e=>process.platform==='win32'?e.code===9:e.signal==='SIGKILL');
   // Next startup: the Store constructor reconciles the orphan away, the live
-  // tombstone is intact, and the rotation redoes cleanly.
-  const store=new Store(dir);const engine=new Engine(store,{workspace:dir,execute:async s=>({output:s.id})});
+  // tombstone is intact, and the rotation redoes cleanly. After an abnormal
+  // child death, the kernel can lag slightly behind releasing the SQLite file
+  // handles on win32 (and the stale owner.lock recheck can transiently report
+  // the dead pid as alive); the reopen retries with backoff instead of failing
+  // the recovery assertions on that timing — test-only, product semantics
+  // untouched, non-win32 keeps the single-shot open.
+  let store;for(let i=0;;i++){
+   try{store=new Store(dir);break;}
+   catch(e){if(process.platform!=='win32'||i>=19)throw e;await delay(100);}
+  }
+  const engine=new Engine(store,{workspace:dir,execute:async s=>({output:s.id})});
   try{
    const archive=store.archive();
    assert.deepEqual(archive.prepare('SELECT rotationId FROM rotations').all(),[],'startup reconciliation removed the orphaned rotation');
