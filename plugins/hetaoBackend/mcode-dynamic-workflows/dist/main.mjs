@@ -14709,12 +14709,14 @@ var Engine = class extends EventEmitter {
       const steps = this.store.steps(run.id);
       const agents = steps.filter((s) => s.kind === "agent");
       const executorFailure = agents.find((s) => s.status !== "succeeded" && EXECUTOR_FAILURE_CODES.has(s.errorDetails?.code))?.errorDetails ?? null;
+      const requiredAgentNodes = run.topology?.nodes?.filter((n) => n.kind === "agent" && !n.conditional && !n.dynamic) ?? [];
       if (ok && !ctx.intent) {
-        if (!agents.length && run.topology?.nodes?.some((n) => n.kind === "agent")) {
+        if (!agents.length && requiredAgentNodes.length) {
           run.status = "failed";
           run.errorDetails = {
             code: "NO_AGENTS_EXECUTED",
             plannedAgentNodes: run.topology.nodes.filter((n) => n.kind === "agent").length,
+            requiredAgentNodes: requiredAgentNodes.length,
             message: "\u811A\u672C\u5DF2\u5B8C\u6210\uFF0C\u4F46\u62D3\u6251\u4E2D\u8BA1\u5212\u7684 Agent \u8282\u70B9\u4E00\u4E2A\u90FD\u6CA1\u6709\u6267\u884C\uFF080 \u4E2A\u6B65\u9AA4\u88AB\u6D3E\u53D1\uFF09\u3002\u8FD0\u884C\u6309\u5931\u8D25\u5904\u7406\u3002",
             suggestion: "\u68C0\u67E5\u811A\u672C\u662F\u5426\u5728 try/catch \u4E2D\u541E\u6389\u4E86\u542F\u52A8\u5931\u8D25\u5E76\u63D0\u524D\u8FD4\u56DE\uFF1B\u4FEE\u590D\u540E\u53EF\u6062\u590D\u8FD0\u884C\uFF0C\u5DF2\u6267\u884C\u8282\u70B9\u4F1A\u590D\u7528\u3002"
           };

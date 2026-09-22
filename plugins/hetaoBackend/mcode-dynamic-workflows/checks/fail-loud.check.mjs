@@ -18,7 +18,11 @@ import {Engine} from '../src/engine.mjs';
 // checks pin the opposite behavior through the same surfaces that lied:
 // a PATH-injected dead CLI must fail the run with actionable details, a
 // swallowed pre-dispatch failure must not finish as zero-step success, and a
-// healthy CLI must not be blocked by the preflight.
+// healthy CLI must not be blocked by the preflight. The zero-dispatch guard
+// splits planned nodes into required (neither conditional nor dynamic per
+// static analysis) and optional: zero dispatch over an optional-only plan is
+// a legitimate branch outcome and succeeds, while any undispatched required
+// node keeps the incident verdict — failed NO_AGENTS_EXECUTED.
 const binary=resolve('dist/main.mjs');
 const exec=promisify(execFile);
 const brokenCliBody=`process.stderr.write('simulated broken CLI: native module ABI mismatch\\n');process.exit(1);`;
@@ -124,6 +128,60 @@ test('legal zero-agent scripts are not implicated by the guard',async()=>{
   assert.equal(end.status,'succeeded');
   assert.equal(end.errorDetails,null);
   assert.equal(end.steps.length,0);
+ }finally{await f.cleanup();}
+});
+test('a conditional agent on an untaken branch is a legal zero-dispatch success',async()=>{
+ const f=await engineFixture();try{
+  const run=await startRun(f.engine,{requestId:'fail-loud-untaken-branch',executor:'demo',input:{run:false},script:`if(input.run){await ctx.agent({id:'opt',prompt:'p'});}\nreturn {skipped:input.run!==true};`});
+  const end=await done(f.engine,run.id);
+  // The contract allows conditional branches not to run: static analysis
+  // marks the node conditional, the runtime took the skip path, and the run
+  // must finish succeeded with zero dispatched steps — not NO_AGENTS_EXECUTED.
+  const node=end.topology.nodes.find(n=>n.stepId==='opt');
+  assert.equal(node?.kind,'agent');
+  assert.equal(node?.conditional,true);
+  assert.equal(node?.dynamic,false);
+  assert.equal(end.status,'succeeded',end.error);
+  assert.equal(end.errorDetails,null);
+  assert.equal(end.steps.length,0);
+  assert.deepEqual(end.result,{skipped:true});
+ }finally{await f.cleanup();}
+});
+test('a mixed plan with an undispatched required agent still fails NO_AGENTS_EXECUTED',async()=>{
+ const f=await engineFixture();try{
+  const run=await startRun(f.engine,{requestId:'fail-loud-mixed',executor:'demo',input:{run:false},script:`if(input.run){await ctx.agent({id:'opt',prompt:'p'});}\ntry{await ctx.agent({id:'req',prompt:'p',dependsOn:['ghost2']});}catch(e){}\nreturn {handled:true};`});
+  const end=await done(f.engine,run.id);
+  // The conditional node legitimately did not run, but the required node's
+  // dependency error was swallowed — the incident shape. One undispatched
+  // required node is enough to fail the run.
+  const conditional=end.topology.nodes.find(n=>n.stepId==='opt');
+  const required=end.topology.nodes.find(n=>n.stepId==='req');
+  assert.equal(conditional?.conditional,true);
+  assert.equal(required?.conditional,false);
+  assert.equal(required?.dynamic,false);
+  assert.equal(end.status,'failed');
+  assert.notEqual(end.status,'succeeded');
+  assert.equal(end.errorDetails.code,'NO_AGENTS_EXECUTED');
+  assert.equal(end.errorDetails.plannedAgentNodes,2);
+  assert.equal(end.errorDetails.requiredAgentNodes,1);
+  assert.equal(end.steps.length,0);
+ }finally{await f.cleanup();}
+});
+test('a dynamic node whose runtime collection is empty is a legal zero-dispatch success',async()=>{
+ const f=await engineFixture();try{
+  const run=await startRun(f.engine,{requestId:'fail-loud-dynamic-empty',executor:'demo',input:{tasks:[]},script:`for(const t of input.tasks??[]){await ctx.agent({id:'task-'+t,prompt:'p'});}\nreturn {dispatched:0};`});
+  const end=await done(f.engine,run.id);
+  // Static analysis marks loop-backed, non-literal-id nodes dynamic: the
+  // dispatch count is unknowable in advance, so zero iterations over an
+  // empty collection is a legitimate outcome, not a swallowed failure.
+  const node=end.topology.nodes.find(n=>n.kind==='agent');
+  assert.ok(node,'topology plans the dynamic agent node');
+  assert.equal(node.dynamic,true);
+  assert.equal(node.conditional,false);
+  assert.equal(end.status,'succeeded',end.error);
+  assert.equal(end.errorDetails,null);
+  assert.equal(end.steps.length,0);
+  assert.deepEqual(end.result,{dispatched:0});
  }finally{await f.cleanup();}
 });
 test('preflight passes a healthy CLI and the run succeeds with a readable health field',async()=>{

@@ -173,15 +173,29 @@ export class Engine extends EventEmitter {
      // itself (never started / no completion protocol / protocol break /
      // unreconciled exit). Null when every failure was business-level.
      const executorFailure=agents.find(s=>s.status!=='succeeded'&&EXECUTOR_FAILURE_CODES.has(s.errorDetails?.code))?.errorDetails??null;
+     // Required-vs-optional split for the zero-dispatch guard. A planned agent
+     // node is REQUIRED only when static analysis marked it neither conditional
+     // (IfStatement/ConditionalExpression/SwitchCase/LogicalExpression/
+     // CatchClause ancestor — the documented contract allows such branches not
+     // to run) nor dynamic (loop/function ancestor or non-literal id — the
+     // dispatch count cannot be known in advance). Zero dispatch over an
+     // all-optional plan is a legitimate branch outcome, not an incident;
+     // zero dispatch while any required node sits undispatched is the
+     // swallowed-failure shape and must fail. Nodes missing both flags
+     // (unexpected or legacy shapes) count as required — the conservative
+     // side, because a false success is worse than a false failure.
+     const requiredAgentNodes=run.topology?.nodes?.filter(n=>n.kind==='agent'&&!n.conditional&&!n.dynamic)??[];
      if(ok&&!ctx.intent){
-      if(!agents.length&&run.topology?.nodes?.some(n=>n.kind==='agent')){
+      if(!agents.length&&requiredAgentNodes.length){
        // Zero-expansion guard (incident 2026-09-20): the script completed
-       // while the topology still planned agent nodes and not one was
+       // while the topology still planned required agent nodes and not one was
        // dispatched — typically a swallowed pre-dispatch failure. Such a run
        // is failed, never a zero-step success. Scripts whose topology plans
-       // no agent nodes at all are exempt (legal zero-step scripts).
+       // no agent nodes at all are exempt (legal zero-step scripts), and so
+       // are scripts whose every planned node is conditional/dynamic and the
+       // runtime legitimately took the zero-dispatch path.
        run.status='failed';
-       run.errorDetails={code:'NO_AGENTS_EXECUTED',plannedAgentNodes:run.topology.nodes.filter(n=>n.kind==='agent').length,
+       run.errorDetails={code:'NO_AGENTS_EXECUTED',plannedAgentNodes:run.topology.nodes.filter(n=>n.kind==='agent').length,requiredAgentNodes:requiredAgentNodes.length,
         message:'脚本已完成，但拓扑中计划的 Agent 节点一个都没有执行（0 个步骤被派发）。运行按失败处理。',
         suggestion:'检查脚本是否在 try/catch 中吞掉了启动失败并提前返回；修复后可恢复运行，已执行节点会复用。'};
        run.error=run.errorDetails.message;
