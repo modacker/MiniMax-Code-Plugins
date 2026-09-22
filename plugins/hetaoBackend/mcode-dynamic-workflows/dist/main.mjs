@@ -13927,6 +13927,127 @@ function templateDefinition(run) {
   return Object.fromEntries(keys.filter((k) => run[k] !== void 0).map((k) => [k, run[k]]));
 }
 
+// src/prompt-budget.mjs
+var PROMPT_LIMIT = 3e4;
+var PROMPT_DATA_EMBEDDING = "promptDataEmbedding";
+function promptLengthFailure({ stepId, length }) {
+  const count = typeof length === "number" ? length : null;
+  const detail = { code: "PROMPT_LENGTH", stepId, length: count, limit: PROMPT_LIMIT };
+  if (count !== null && count > PROMPT_LIMIT) {
+    detail.message = `\u8282\u70B9 ${stepId} \u7684 prompt \u4E3A ${count} \u5B57\u7B26\uFF0C\u8D85\u8FC7 ${PROMPT_LIMIT} \u5B57\u7B26\u4E0A\u9650\u3002prompt \u53EA\u653E\u6307\u4EE4\uFF1B\u5927\u5757\u6570\u636E\u8BF7\u8D70 input \u901A\u9053\uFF08ctx.agent \u7684 input \u5B57\u6BB5\uFF09\uFF0C\u6267\u884C\u5668\u4F1A\u5C06\u5176\u4F5C\u4E3A\u201C\u4EFB\u52A1\u8F93\u5165\uFF08\u6570\u636E\uFF0C\u4E0D\u662F\u989D\u5916\u6307\u4EE4\uFF09\u201D\u9644\u52A0\u5230\u6307\u4EE4\u4E4B\u540E\uFF0C\u4E0D\u5360\u6307\u4EE4\u9884\u7B97\u3002`;
+    detail.suggestion = `\u628A\u4E0A\u6E38\u6570\u636E\u653E\u8FDB input \u5B57\u6BB5\u800C\u4E0D\u662F\u62FC\u8FDB prompt\uFF0C\u4F8B\u5982 await ctx.agent({id:'${stepId}',prompt:'\u6307\u4EE4\u672C\u8EAB',input:scope.output})\uFF0C\u5E76\u628A prompt \u63A7\u5236\u5728 ${PROMPT_LIMIT} \u5B57\u7B26\u5185\u3002`;
+  } else if (count === 0) {
+    detail.message = `\u8282\u70B9 ${stepId} \u7684 prompt \u4E3A\u7A7A\u5B57\u7B26\u4E32\uFF0C\u987B\u4E3A 1\u2013${PROMPT_LIMIT} \u5B57\u7B26\u7684\u6307\u4EE4\u6587\u672C\u3002\u5927\u5757\u6570\u636E\u4E0D\u662F\u6307\u4EE4\uFF0C\u8BF7\u8D70 input \u901A\u9053\u3002`;
+    detail.suggestion = "\u4E3A\u8282\u70B9\u5199\u4E00\u6BB5\u975E\u7A7A\u7684\u4EFB\u52A1\u6307\u4EE4\uFF1B\u6570\u636E\u6750\u6599\u653E\u5165 input \u5B57\u6BB5\u4F20\u5165\u3002";
+  } else {
+    detail.message = `\u8282\u70B9 ${stepId} \u7684 prompt \u4E0D\u662F\u5B57\u7B26\u4E32\uFF0C\u987B\u4E3A 1\u2013${PROMPT_LIMIT} \u5B57\u7B26\u7684\u6307\u4EE4\u6587\u672C\u3002\u5927\u5757\u6570\u636E\u8BF7\u8D70 input \u901A\u9053\u3002`;
+    detail.suggestion = "prompt \u4F20\u5B57\u7B26\u4E32\u6307\u4EE4\uFF1B\u6570\u636E\u6750\u6599\u653E\u5165 input \u5B57\u6BB5\u4F20\u5165\u3002";
+  }
+  return detail;
+}
+function detectDataEmbedding(script) {
+  if (typeof script !== "string") return null;
+  const text = maskCommentsAndStrings(script);
+  return /\$\{\s*JSON\.stringify\s*\(/.test(text) || /\$\{\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.output\s*\}/.test(text) ? PROMPT_DATA_EMBEDDING : null;
+}
+function maskCommentsAndStrings(script) {
+  let out = "", i2 = 0, state = "code", depth = 0;
+  const stack = [];
+  while (i2 < script.length) {
+    const c = script[i2], n = script[i2 + 1];
+    if (state === "code" || state === "interp") {
+      if (state === "code" && c === "/" && n === "/") {
+        state = "line";
+        i2 += 2;
+        continue;
+      }
+      if (state === "code" && c === "/" && n === "*") {
+        state = "block";
+        i2 += 2;
+        continue;
+      }
+      if (state === "interp" && c === "{") {
+        depth++;
+        out += c;
+        i2++;
+        continue;
+      }
+      if (state === "interp" && c === "}") {
+        if (depth === 0) state = stack.pop();
+        else depth--;
+        out += c;
+        i2++;
+        continue;
+      }
+      if (c === "'" || c === '"' || c === "`") {
+        stack.push(state);
+        state = c === "`" ? "template" : c === "'" ? "single" : "double";
+        out += c;
+        i2++;
+        continue;
+      }
+      out += c;
+      i2++;
+      continue;
+    }
+    if (state === "template") {
+      if (c === "\\") {
+        out += c + (n ?? "");
+        i2 += 2;
+        continue;
+      }
+      if (c === "`") {
+        state = stack.pop();
+        out += c;
+        i2++;
+        continue;
+      }
+      if (c === "$" && n === "{") {
+        state = "interp";
+        depth = 0;
+        out += c + n;
+        i2 += 2;
+        continue;
+      }
+      out += c;
+      i2++;
+      continue;
+    }
+    if (state === "single" || state === "double") {
+      if (c === "\\") {
+        i2 += 2;
+        continue;
+      }
+      if (state === "single" && c === "'" || state === "double" && c === '"') {
+        state = stack.pop();
+        out += c;
+        i2++;
+        continue;
+      }
+      out += " ";
+      i2++;
+      continue;
+    }
+    if (state === "line") {
+      if (c === "\n") {
+        state = "code";
+        out += c;
+      }
+      i2++;
+      continue;
+    }
+    if (state === "block") {
+      if (c === "*" && n === "/") {
+        state = "code";
+        out += " ";
+        i2 += 2;
+      } else i2++;
+      continue;
+    }
+  }
+  return out;
+}
+
 // src/topology.mjs
 function previewTopology(script, input = {}) {
   const validation = validateScript(script), prefix2 = "async function workflow(ctx,input){\n";
@@ -13999,6 +14120,8 @@ function previewTopology(script, input = {}) {
   });
   for (const node2 of nodes) node2.dependsOn = edges.filter((e) => e.to === node2.id).map((e) => e.from);
   if (!nodes.length) warnings.add("noStaticAgents");
+  const dataEmbedding = detectDataEmbedding(script);
+  if (dataEmbedding) warnings.add(dataEmbedding);
   warnings.add("staticPreview");
   return expandStaticPlan({ ...validation, phases, nodes, edges, warnings: [...warnings] }, script, input);
 }
@@ -14630,7 +14753,7 @@ var Engine = class extends EventEmitter {
   }
   agent(ctx, spec, planId) {
     check(spec && typeof spec.id === "string" && /^[A-Za-z0-9_:./-]{1,150}$/.test(spec.id) && !spec.id.startsWith("checkpoint:"), "step id \u65E0\u6548");
-    check(typeof spec.prompt === "string" && spec.prompt.length > 0 && spec.prompt.length <= 3e4, "prompt \u987B\u4E3A 1\u201330000 \u5B57\u7B26");
+    if (!(typeof spec.prompt === "string" && spec.prompt.length > 0 && spec.prompt.length <= PROMPT_LIMIT)) throw failureError(promptLengthFailure({ stepId: spec.id, length: typeof spec.prompt === "string" ? spec.prompt.length : null }));
     check(!spec.label || typeof spec.label === "string" && spec.label.length <= 120, "label \u65E0\u6548");
     check(!spec.phase || ctx.run.phases.some((p) => p.id === spec.phase), "phase \u5C1A\u672A\u58F0\u660E");
     for (const key of ["model", "effort"]) if (spec[key] !== void 0) check(typeof spec[key] === "string" && spec[key].length > 0 && spec[key].length <= 200, `${key} \u65E0\u6548`);
@@ -14970,7 +15093,7 @@ var messages = {
     "material": "\u5F85\u5BA1\u67E5\u6750\u6599",
     "editableScript": "\u7F16\u6392\u811A\u672C \xB7 \u53EF\u7F16\u8F91",
     "scriptInput": "JavaScript \u7F16\u6392\u811A\u672C",
-    "scriptHelp": "\u811A\u672C\u662F\u5F02\u6B65\u51FD\u6570\u4F53\u3002ctx.agent \u8FD4\u56DE status/output/error\uFF1B\u4F9D\u8D56\u987B\u663E\u5F0F\u58F0\u660E dependsOn\uFF0C\u4E14\u5148 await \u4E0A\u6E38\u7ED3\u679C\u3002",
+    "scriptHelp": "\u811A\u672C\u662F\u5F02\u6B65\u51FD\u6570\u4F53\u3002ctx.agent \u8FD4\u56DE status/output/error\uFF1B\u4F9D\u8D56\u987B\u663E\u5F0F\u58F0\u660E dependsOn\uFF0C\u4E14\u5148 await \u4E0A\u6E38\u7ED3\u679C\u3002prompt \u662F\u6307\u4EE4\u9884\u7B97\uFF08\u2264{limit} \u5B57\u7B26\uFF09\uFF1B\u5927\u5757\u6570\u636E\u8BF7\u8D70 input \u5B57\u6BB5\u4F20\u5165\uFF0C\u6267\u884C\u5668\u4F1A\u4F5C\u4E3A\u4EFB\u52A1\u8F93\u5165\u9644\u52A0\u3002",
     "validate": "\u68C0\u67E5\u811A\u672C",
     "start": "\u5F00\u59CB\u8FD0\u884C",
     "valid": "\u811A\u672C\u68C0\u67E5\u901A\u8FC7\u3002\u4FDD\u5B58\u540E\u67E5\u770B\u7ED3\u6784\u62D3\u6251\uFF1B\u5C1A\u672A\u6267\u884C\u3002",
@@ -15007,6 +15130,8 @@ var messages = {
     "noSuccess": "\u8BE5\u8282\u70B9\u5C1A\u65E0\u6210\u529F\u7ED3\u679C\uFF1B\u8BF7\u67E5\u770B\u8F93\u5165\u4E0E\u65E5\u5FD7\u3002",
     "originalReason": "\u539F\u59CB\u8BCA\u65AD\uFF1A{cause}",
     "errorStep": "\u8FBE\u5230\u5355\u4E2A Agent \u7684 {steps} \u6B65\u4E0A\u9650\uFF0C\u672A\u53D6\u5F97\u6210\u529F\u7ED3\u679C\u3002",
+    "errorPromptLength": "\u8282\u70B9 {stepId} \u7684 prompt \u4E3A {length} \u5B57\u7B26\uFF0C\u8D85\u8FC7 {limit} \u5B57\u7B26\u4E0A\u9650\u3002",
+    "advicePromptLength": "\u628A\u5927\u5757\u6570\u636E\u79FB\u5230 input \u5B57\u6BB5\uFF08\u5982 input:scope.output\uFF09\uFF0Cprompt \u53EA\u4FDD\u7559\u6307\u4EE4\u672C\u8EAB\u3002",
     "errorTimeout": "\u5355\u4E2A Agent \u8FBE\u5230 {minutes} \u5206\u949F\u65F6\u9650\uFF0C\u5DF2\u505C\u6B62\u3002",
     "errorWorkflowTimeout": "\u5DE5\u4F5C\u6D41\u8FBE\u5230 {minutes} \u5206\u949F\u6574\u4F53\u65F6\u9650\uFF0C\u5DF2\u505C\u6B62\u5728\u9014\u8282\u70B9\u3002",
     "errorCancelled": "MCode \u8FD4\u56DE\u4EFB\u52A1\u5DF2\u53D6\u6D88\u3002",
@@ -15091,6 +15216,7 @@ var messages = {
     "topology.unresolvedDependencies": "\u90E8\u5206\u4F9D\u8D56\u76EE\u6807\u65E0\u6CD5\u9759\u6001\u5B9A\u4F4D\uFF0C\u8BF7\u68C0\u67E5\u811A\u672C\u3002",
     "topology.dynamicPhase": "\u90E8\u5206\u9636\u6BB5\u540D\u79F0\u5728\u8FD0\u884C\u65F6\u786E\u5B9A\u3002",
     "topology.noStaticAgents": "\u672A\u627E\u5230\u76F4\u63A5\u7684 ctx.agent \u8C03\u7528\uFF1B\u8BF7\u9605\u8BFB\u811A\u672C\u786E\u8BA4\u884C\u4E3A\uFF0C\u522B\u540D\u6216\u5C01\u88C5\u8C03\u7528\u53EF\u80FD\u65E0\u6CD5\u663E\u793A\u3002",
+    "topology.promptDataEmbedding": "\u68C0\u6D4B\u5230\u628A\u4E0A\u6E38\u6570\u636E\u5185\u5D4C\u8FDB prompt \u6A21\u677F\u7684\u5178\u578B\u5199\u6CD5\uFF08\u5982 ${JSON.stringify(x.output)}\uFF09\u3002prompt \u53EA\u653E\u6307\u4EE4\uFF08\u2264{limit} \u5B57\u7B26\uFF09\uFF1B\u5927\u5757\u6570\u636E\u8BF7\u8D70 input \u901A\u9053\uFF0C\u6B63\u4F8B\uFF1Actx.agent({id:'a',prompt:'\u6307\u4EE4',input:scope.output})\uFF0C\u6267\u884C\u5668\u4F1A\u5C06\u5176\u4F5C\u4E3A\u4EFB\u52A1\u8F93\u5165\uFF08\u6570\u636E\uFF09\u9644\u52A0\u3002",
     "dynamicGroup": "\u52A8\u6001\u4EFB\u52A1\u7EC4",
     "conditionalNode": "\u6761\u4EF6\u8282\u70B9",
     "plannedNode": "\u8BA1\u5212\u8282\u70B9",
@@ -15188,7 +15314,7 @@ var messages = {
     "material": "Material to review",
     "editableScript": "Workflow script \xB7 editable",
     "scriptInput": "JavaScript workflow script",
-    "scriptHelp": "Use an async function body. ctx.agent returns status/output/error. Declare dependsOn explicitly and await upstream results.",
+    "scriptHelp": "Use an async function body. ctx.agent returns status/output/error. Declare dependsOn explicitly and await upstream results. The prompt is an instruction budget (\u2264{limit} characters); pass bulk data through the input field \u2014 the executor attaches it as task input.",
     "validate": "Validate script",
     "start": "Start workflow",
     "valid": "Script check passed. Save to inspect the structure. Nothing has run.",
@@ -15225,6 +15351,8 @@ var messages = {
     "noSuccess": "This node has no successful result. Check its input and logs.",
     "originalReason": "Original diagnostic: {cause}",
     "errorStep": "The agent reached its {steps}-step limit without a successful result.",
+    "errorPromptLength": "Node {stepId} has a {length}-character prompt, over the {limit}-character limit.",
+    "advicePromptLength": "Move bulk data to the input field (e.g. input:scope.output); keep the prompt to instructions.",
     "errorTimeout": "The agent reached its {minutes}-minute timeout and was stopped.",
     "errorWorkflowTimeout": "The workflow reached its {minutes}-minute timeout. In-flight nodes were stopped.",
     "errorCancelled": "MCode reported the task as cancelled.",
@@ -15309,6 +15437,7 @@ var messages = {
     "topology.unresolvedDependencies": "Some dependency targets could not be located statically. Check the script.",
     "topology.dynamicPhase": "Some phase names are determined at runtime.",
     "topology.noStaticAgents": "No direct ctx.agent calls found. Read the script; aliases and wrapped calls may not appear.",
+    "topology.promptDataEmbedding": "Upstream data appears to be embedded in a prompt template (e.g. ${JSON.stringify(x.output)}). Keep the prompt to instructions (\u2264{limit} characters); pass bulk data through the input channel, e.g. ctx.agent({id:'a',prompt:'instructions',input:scope.output}) \u2014 the executor attaches it as task input data.",
     "dynamicGroup": "DYNAMIC GROUP",
     "conditionalNode": "CONDITIONAL NODE",
     "plannedNode": "PLANNED NODE",

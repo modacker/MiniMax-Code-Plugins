@@ -15,6 +15,7 @@ import { check, hash, boundedJSON, validateScript } from './common.mjs';
 import { resolveMcode } from './availability.mjs';
 import { DEFAULT_LIMITS, LEGACY_LIMITS, resolveLimits, runLimits, durationLabel } from './limits.mjs';
 import { agentFailure,failureError } from './failure.mjs';
+import {PROMPT_LIMIT,promptLengthFailure} from './prompt-budget.mjs';
 import { demoExecute, mcodeExecute } from './executor.mjs';
 export class Engine extends EventEmitter {
  constructor(store,options){super();this.store=store;this.options=options;this.defaults=resolveLimits(options,DEFAULT_LIMITS);this.globalConcurrency=this.store.setting('globalConcurrency')??8;this.lastServedRun=null;this.approving=new Set();this.active=new Map();this.slots=0;this.queue=[];this.closing=false;}
@@ -172,7 +173,7 @@ const step={id:key,kind:'checkpoint',status:'succeeded',output:payload.value,req
  }
  agent(ctx,spec,planId){
    check(spec&&typeof spec.id==='string'&&/^[A-Za-z0-9_:./-]{1,150}$/.test(spec.id)&&!spec.id.startsWith('checkpoint:'),'step id 无效');
-   check(typeof spec.prompt==='string'&&spec.prompt.length>0&&spec.prompt.length<=30_000,'prompt 须为 1–30000 字符');
+   if(!(typeof spec.prompt==='string'&&spec.prompt.length>0&&spec.prompt.length<=PROMPT_LIMIT))throw failureError(promptLengthFailure({stepId:spec.id,length:typeof spec.prompt==='string'?spec.prompt.length:null}));
    check(!spec.label||typeof spec.label==='string'&&spec.label.length<=120,'label 无效');check(!spec.phase||ctx.run.phases.some(p=>p.id===spec.phase),'phase 尚未声明');
    for(const key of ['model','effort'])if(spec[key]!==undefined)check(typeof spec[key]==='string'&&spec[key].length>0&&spec[key].length<=200,`${key} 无效`);
    const node=ctx.run.topology?.nodes.find(n=>(n.planId??n.id)===planId),line=node?.dependencyLine??node?.line;

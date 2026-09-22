@@ -1492,7 +1492,7 @@ var messages = {
     "material": "\u5F85\u5BA1\u67E5\u6750\u6599",
     "editableScript": "\u7F16\u6392\u811A\u672C \xB7 \u53EF\u7F16\u8F91",
     "scriptInput": "JavaScript \u7F16\u6392\u811A\u672C",
-    "scriptHelp": "\u811A\u672C\u662F\u5F02\u6B65\u51FD\u6570\u4F53\u3002ctx.agent \u8FD4\u56DE status/output/error\uFF1B\u4F9D\u8D56\u987B\u663E\u5F0F\u58F0\u660E dependsOn\uFF0C\u4E14\u5148 await \u4E0A\u6E38\u7ED3\u679C\u3002",
+    "scriptHelp": "\u811A\u672C\u662F\u5F02\u6B65\u51FD\u6570\u4F53\u3002ctx.agent \u8FD4\u56DE status/output/error\uFF1B\u4F9D\u8D56\u987B\u663E\u5F0F\u58F0\u660E dependsOn\uFF0C\u4E14\u5148 await \u4E0A\u6E38\u7ED3\u679C\u3002prompt \u662F\u6307\u4EE4\u9884\u7B97\uFF08\u2264{limit} \u5B57\u7B26\uFF09\uFF1B\u5927\u5757\u6570\u636E\u8BF7\u8D70 input \u5B57\u6BB5\u4F20\u5165\uFF0C\u6267\u884C\u5668\u4F1A\u4F5C\u4E3A\u4EFB\u52A1\u8F93\u5165\u9644\u52A0\u3002",
     "validate": "\u68C0\u67E5\u811A\u672C",
     "start": "\u5F00\u59CB\u8FD0\u884C",
     "valid": "\u811A\u672C\u68C0\u67E5\u901A\u8FC7\u3002\u4FDD\u5B58\u540E\u67E5\u770B\u7ED3\u6784\u62D3\u6251\uFF1B\u5C1A\u672A\u6267\u884C\u3002",
@@ -1529,6 +1529,8 @@ var messages = {
     "noSuccess": "\u8BE5\u8282\u70B9\u5C1A\u65E0\u6210\u529F\u7ED3\u679C\uFF1B\u8BF7\u67E5\u770B\u8F93\u5165\u4E0E\u65E5\u5FD7\u3002",
     "originalReason": "\u539F\u59CB\u8BCA\u65AD\uFF1A{cause}",
     "errorStep": "\u8FBE\u5230\u5355\u4E2A Agent \u7684 {steps} \u6B65\u4E0A\u9650\uFF0C\u672A\u53D6\u5F97\u6210\u529F\u7ED3\u679C\u3002",
+    "errorPromptLength": "\u8282\u70B9 {stepId} \u7684 prompt \u4E3A {length} \u5B57\u7B26\uFF0C\u8D85\u8FC7 {limit} \u5B57\u7B26\u4E0A\u9650\u3002",
+    "advicePromptLength": "\u628A\u5927\u5757\u6570\u636E\u79FB\u5230 input \u5B57\u6BB5\uFF08\u5982 input:scope.output\uFF09\uFF0Cprompt \u53EA\u4FDD\u7559\u6307\u4EE4\u672C\u8EAB\u3002",
     "errorTimeout": "\u5355\u4E2A Agent \u8FBE\u5230 {minutes} \u5206\u949F\u65F6\u9650\uFF0C\u5DF2\u505C\u6B62\u3002",
     "errorWorkflowTimeout": "\u5DE5\u4F5C\u6D41\u8FBE\u5230 {minutes} \u5206\u949F\u6574\u4F53\u65F6\u9650\uFF0C\u5DF2\u505C\u6B62\u5728\u9014\u8282\u70B9\u3002",
     "errorCancelled": "MCode \u8FD4\u56DE\u4EFB\u52A1\u5DF2\u53D6\u6D88\u3002",
@@ -1613,6 +1615,7 @@ var messages = {
     "topology.unresolvedDependencies": "\u90E8\u5206\u4F9D\u8D56\u76EE\u6807\u65E0\u6CD5\u9759\u6001\u5B9A\u4F4D\uFF0C\u8BF7\u68C0\u67E5\u811A\u672C\u3002",
     "topology.dynamicPhase": "\u90E8\u5206\u9636\u6BB5\u540D\u79F0\u5728\u8FD0\u884C\u65F6\u786E\u5B9A\u3002",
     "topology.noStaticAgents": "\u672A\u627E\u5230\u76F4\u63A5\u7684 ctx.agent \u8C03\u7528\uFF1B\u8BF7\u9605\u8BFB\u811A\u672C\u786E\u8BA4\u884C\u4E3A\uFF0C\u522B\u540D\u6216\u5C01\u88C5\u8C03\u7528\u53EF\u80FD\u65E0\u6CD5\u663E\u793A\u3002",
+    "topology.promptDataEmbedding": "\u68C0\u6D4B\u5230\u628A\u4E0A\u6E38\u6570\u636E\u5185\u5D4C\u8FDB prompt \u6A21\u677F\u7684\u5178\u578B\u5199\u6CD5\uFF08\u5982 ${JSON.stringify(x.output)}\uFF09\u3002prompt \u53EA\u653E\u6307\u4EE4\uFF08\u2264{limit} \u5B57\u7B26\uFF09\uFF1B\u5927\u5757\u6570\u636E\u8BF7\u8D70 input \u901A\u9053\uFF0C\u6B63\u4F8B\uFF1Actx.agent({id:'a',prompt:'\u6307\u4EE4',input:scope.output})\uFF0C\u6267\u884C\u5668\u4F1A\u5C06\u5176\u4F5C\u4E3A\u4EFB\u52A1\u8F93\u5165\uFF08\u6570\u636E\uFF09\u9644\u52A0\u3002",
     "dynamicGroup": "\u52A8\u6001\u4EFB\u52A1\u7EC4",
     "conditionalNode": "\u6761\u4EF6\u8282\u70B9",
     "plannedNode": "\u8BA1\u5212\u8282\u70B9",
@@ -1710,7 +1713,7 @@ var messages = {
     "material": "Material to review",
     "editableScript": "Workflow script \xB7 editable",
     "scriptInput": "JavaScript workflow script",
-    "scriptHelp": "Use an async function body. ctx.agent returns status/output/error. Declare dependsOn explicitly and await upstream results.",
+    "scriptHelp": "Use an async function body. ctx.agent returns status/output/error. Declare dependsOn explicitly and await upstream results. The prompt is an instruction budget (\u2264{limit} characters); pass bulk data through the input field \u2014 the executor attaches it as task input.",
     "validate": "Validate script",
     "start": "Start workflow",
     "valid": "Script check passed. Save to inspect the structure. Nothing has run.",
@@ -1747,6 +1750,8 @@ var messages = {
     "noSuccess": "This node has no successful result. Check its input and logs.",
     "originalReason": "Original diagnostic: {cause}",
     "errorStep": "The agent reached its {steps}-step limit without a successful result.",
+    "errorPromptLength": "Node {stepId} has a {length}-character prompt, over the {limit}-character limit.",
+    "advicePromptLength": "Move bulk data to the input field (e.g. input:scope.output); keep the prompt to instructions.",
     "errorTimeout": "The agent reached its {minutes}-minute timeout and was stopped.",
     "errorWorkflowTimeout": "The workflow reached its {minutes}-minute timeout. In-flight nodes were stopped.",
     "errorCancelled": "MCode reported the task as cancelled.",
@@ -1831,6 +1836,7 @@ var messages = {
     "topology.unresolvedDependencies": "Some dependency targets could not be located statically. Check the script.",
     "topology.dynamicPhase": "Some phase names are determined at runtime.",
     "topology.noStaticAgents": "No direct ctx.agent calls found. Read the script; aliases and wrapped calls may not appear.",
+    "topology.promptDataEmbedding": "Upstream data appears to be embedded in a prompt template (e.g. ${JSON.stringify(x.output)}). Keep the prompt to instructions (\u2264{limit} characters); pass bulk data through the input channel, e.g. ctx.agent({id:'a',prompt:'instructions',input:scope.output}) \u2014 the executor attaches it as task input data.",
     "dynamicGroup": "DYNAMIC GROUP",
     "conditionalNode": "CONDITIONAL NODE",
     "plannedNode": "PLANNED NODE",
@@ -1879,11 +1885,14 @@ function describeFailure(language2, failure = {}, fallback = "") {
   failure = failure && typeof failure === "object" ? failure : {};
   fallback = typeof fallback === "string" ? fallback : "";
   const t2 = (key, vars) => translate(language2, key, vars);
-  const keys = { OUTPUT_SCHEMA_INVALID: "errorStructured", DEPENDENCY_INVALID: "errorDependency", DEPENDENCY_NOT_READY: "errorDependencyReady", LEGACY_DEPENDENCY_STRING: "errorLegacyDependency", AGENT_STEP_LIMIT: "errorStep", AGENT_TIMEOUT: "errorTimeout", WORKFLOW_TIMEOUT: "errorWorkflowTimeout", MCODE_CANCELLED: "errorCancelled", RUN_INTERRUPTED: "errorInterrupted", MCODE_START_FAILED: "errorStart", MCODE_PROTOCOL_ERROR: "errorProtocol", MCODE_MISSING_RESULT: "errorMissing", MCODE_EXIT: "errorExit" };
-  const title = t2(keys[failure.code] ?? "errorGeneric", { stepId: failure.stepId ?? "?", dependency: failure.dependency ?? "?", status: failure.dependencyStatus ?? "?", steps: failure.maxSteps ?? "?", minutes: (failure.timeoutMs ?? failure.runTimeoutMs ?? 0) / 6e4, code: failure.exitCode ?? t2("unknown") });
-  const advice = t2(failure.code === "OUTPUT_SCHEMA_INVALID" ? "adviceStructured" : failure.code === "LEGACY_DEPENDENCY_STRING" ? "adviceLegacyDependency" : /^DEPENDENCY_/.test(failure.code ?? "") ? "adviceDependency" : failure.code === "AGENT_STEP_LIMIT" ? "adviceStep" : /TIMEOUT/.test(failure.code ?? "") ? "adviceTimeout" : "adviceGeneric");
+  const keys = { OUTPUT_SCHEMA_INVALID: "errorStructured", DEPENDENCY_INVALID: "errorDependency", DEPENDENCY_NOT_READY: "errorDependencyReady", LEGACY_DEPENDENCY_STRING: "errorLegacyDependency", AGENT_STEP_LIMIT: "errorStep", AGENT_TIMEOUT: "errorTimeout", WORKFLOW_TIMEOUT: "errorWorkflowTimeout", MCODE_CANCELLED: "errorCancelled", RUN_INTERRUPTED: "errorInterrupted", MCODE_START_FAILED: "errorStart", MCODE_PROTOCOL_ERROR: "errorProtocol", MCODE_MISSING_RESULT: "errorMissing", MCODE_EXIT: "errorExit", PROMPT_LENGTH: "errorPromptLength" };
+  const title = t2(keys[failure.code] ?? "errorGeneric", { stepId: failure.stepId ?? "?", dependency: failure.dependency ?? "?", status: failure.dependencyStatus ?? "?", steps: failure.maxSteps ?? "?", minutes: (failure.timeoutMs ?? failure.runTimeoutMs ?? 0) / 6e4, code: failure.exitCode ?? t2("unknown"), length: failure.length ?? "?", limit: failure.limit ?? "?" });
+  const advice = t2(failure.code === "OUTPUT_SCHEMA_INVALID" ? "adviceStructured" : failure.code === "LEGACY_DEPENDENCY_STRING" ? "adviceLegacyDependency" : /^DEPENDENCY_/.test(failure.code ?? "") ? "adviceDependency" : failure.code === "AGENT_STEP_LIMIT" ? "adviceStep" : failure.code === "PROMPT_LENGTH" ? "advicePromptLength" : /TIMEOUT/.test(failure.code ?? "") ? "adviceTimeout" : "adviceGeneric");
   return { title: language2 === "zh" ? failure.message || fallback || title : title, advice: language2 === "zh" ? failure.suggestion || advice : advice, original: failure.cause || (language2 === "en" ? failure.message || fallback : "") };
 }
+
+// src/prompt-budget.mjs
+var PROMPT_LIMIT = 3e4;
 
 // web/app.source.mjs
 var $2 = (s) => document.querySelector(s);
@@ -2054,7 +2063,7 @@ function renderRun() {
   $2("#graph-mode").hidden = !r?.topology || review;
   $2("#graph-mode").textContent = t(showPlan ? "showExecution" : "showPlan");
   $2("#topology-note").hidden = !r?.topology;
-  $2("#topology-warnings").textContent = r?.topology?.warnings.map((w) => t("topology." + w)).join(" ") ?? "";
+  $2("#topology-warnings").textContent = r?.topology?.warnings.map((w) => t("topology." + w, { limit: PROMPT_LIMIT })).join(" ") ?? "";
   $2("#empty").hidden = !!r;
   $2("#run-view").hidden = !r;
   if (!r) {
@@ -2385,12 +2394,16 @@ $2("#create-form").onsubmit = async (e) => {
     submit.disabled = false;
   }
 };
+function topologyText(keys) {
+  return (keys ?? []).map((w) => t("topology." + w, { limit: PROMPT_LIMIT })).join(" ");
+}
 $2("#validate").onclick = async () => {
   try {
-    await api("/validate", "POST", { script: $2("#script-input").value });
+    const preview = await api("/validate", "POST", { script: $2("#script-input").value });
+    const warnings = topologyText(preview.warnings);
     $2("#form-error").hidden = false;
-    $2("#form-error").textContent = t("valid");
-    lastFormMessage = { key: "valid" };
+    $2("#form-error").textContent = t("valid") + (warnings ? " " + warnings : "");
+    lastFormMessage = { key: "valid", warnings: preview.warnings ?? [] };
   } catch (e) {
     $2("#form-error").hidden = false;
     $2("#form-error").textContent = apiMessage(e.message);
@@ -2648,7 +2661,8 @@ function applyLanguage() {
   renderEvents();
   renderRead();
   if (!current) error(lastAlert);
-  if (lastFormMessage) $2("#form-error").textContent = lastFormMessage.key ? t(lastFormMessage.key) : apiMessage(lastFormMessage.error);
+  $2("#script-help").textContent = t("scriptHelp", { limit: PROMPT_LIMIT });
+  if (lastFormMessage) $2("#form-error").textContent = lastFormMessage.key ? t(lastFormMessage.key) + (lastFormMessage.warnings?.length ? " " + topologyText(lastFormMessage.warnings) : "") : apiMessage(lastFormMessage.error);
   if ($2("#resume-dialog").open && current) $2("#resume-note").textContent = t("resumeNote", { used: current.attempts, max: current.maxCalls }) + (current.legacyLimits ? " " + t("legacyNote") : "");
 }
 $2("#script-input").addEventListener("input", (e) => e.target.dataset.edited = "true");

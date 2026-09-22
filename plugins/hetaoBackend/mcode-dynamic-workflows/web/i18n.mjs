@@ -83,7 +83,7 @@ export const messages = {
     "material": "待审查材料",
     "editableScript": "编排脚本 · 可编辑",
     "scriptInput": "JavaScript 编排脚本",
-    "scriptHelp": "脚本是异步函数体。ctx.agent 返回 status/output/error；依赖须显式声明 dependsOn，且先 await 上游结果。",
+    "scriptHelp": "脚本是异步函数体。ctx.agent 返回 status/output/error；依赖须显式声明 dependsOn，且先 await 上游结果。prompt 是指令预算（≤{limit} 字符）；大块数据请走 input 字段传入，执行器会作为任务输入附加。",
     "validate": "检查脚本",
     "start": "开始运行",
     "valid": "脚本检查通过。保存后查看结构拓扑；尚未执行。",
@@ -120,6 +120,8 @@ export const messages = {
     "noSuccess": "该节点尚无成功结果；请查看输入与日志。",
     "originalReason": "原始诊断：{cause}",
     "errorStep": "达到单个 Agent 的 {steps} 步上限，未取得成功结果。",
+    "errorPromptLength": "节点 {stepId} 的 prompt 为 {length} 字符，超过 {limit} 字符上限。",
+    "advicePromptLength": "把大块数据移到 input 字段（如 input:scope.output），prompt 只保留指令本身。",
     "errorTimeout": "单个 Agent 达到 {minutes} 分钟时限，已停止。",
     "errorWorkflowTimeout": "工作流达到 {minutes} 分钟整体时限，已停止在途节点。",
     "errorCancelled": "MCode 返回任务已取消。",
@@ -204,6 +206,7 @@ export const messages = {
     "topology.unresolvedDependencies": "部分依赖目标无法静态定位，请检查脚本。",
     "topology.dynamicPhase": "部分阶段名称在运行时确定。",
     "topology.noStaticAgents": "未找到直接的 ctx.agent 调用；请阅读脚本确认行为，别名或封装调用可能无法显示。",
+    "topology.promptDataEmbedding": "检测到把上游数据内嵌进 prompt 模板的典型写法（如 ${JSON.stringify(x.output)}）。prompt 只放指令（≤{limit} 字符）；大块数据请走 input 通道，正例：ctx.agent({id:'a',prompt:'指令',input:scope.output})，执行器会将其作为任务输入（数据）附加。",
     "dynamicGroup": "动态任务组",
     "conditionalNode": "条件节点",
     "plannedNode": "计划节点",
@@ -302,7 +305,7 @@ export const messages = {
     "material": "Material to review",
     "editableScript": "Workflow script · editable",
     "scriptInput": "JavaScript workflow script",
-    "scriptHelp": "Use an async function body. ctx.agent returns status/output/error. Declare dependsOn explicitly and await upstream results.",
+    "scriptHelp": "Use an async function body. ctx.agent returns status/output/error. Declare dependsOn explicitly and await upstream results. The prompt is an instruction budget (≤{limit} characters); pass bulk data through the input field — the executor attaches it as task input.",
     "validate": "Validate script",
     "start": "Start workflow",
     "valid": "Script check passed. Save to inspect the structure. Nothing has run.",
@@ -339,6 +342,8 @@ export const messages = {
     "noSuccess": "This node has no successful result. Check its input and logs.",
     "originalReason": "Original diagnostic: {cause}",
     "errorStep": "The agent reached its {steps}-step limit without a successful result.",
+    "errorPromptLength": "Node {stepId} has a {length}-character prompt, over the {limit}-character limit.",
+    "advicePromptLength": "Move bulk data to the input field (e.g. input:scope.output); keep the prompt to instructions.",
     "errorTimeout": "The agent reached its {minutes}-minute timeout and was stopped.",
     "errorWorkflowTimeout": "The workflow reached its {minutes}-minute timeout. In-flight nodes were stopped.",
     "errorCancelled": "MCode reported the task as cancelled.",
@@ -423,6 +428,7 @@ export const messages = {
     "topology.unresolvedDependencies": "Some dependency targets could not be located statically. Check the script.",
     "topology.dynamicPhase": "Some phase names are determined at runtime.",
     "topology.noStaticAgents": "No direct ctx.agent calls found. Read the script; aliases and wrapped calls may not appear.",
+    "topology.promptDataEmbedding": "Upstream data appears to be embedded in a prompt template (e.g. ${JSON.stringify(x.output)}). Keep the prompt to instructions (≤{limit} characters); pass bulk data through the input channel, e.g. ctx.agent({id:'a',prompt:'instructions',input:scope.output}) — the executor attaches it as task input data.",
     "dynamicGroup": "DYNAMIC GROUP",
     "conditionalNode": "CONDITIONAL NODE",
     "plannedNode": "PLANNED NODE",
@@ -458,8 +464,8 @@ export function describeFailure(language, failure = {}, fallback = '') {
   failure = failure && typeof failure === 'object' ? failure : {};
   fallback = typeof fallback === 'string' ? fallback : '';
   const t = (key, vars) => translate(language, key, vars);
-  const keys = {OUTPUT_SCHEMA_INVALID:'errorStructured',DEPENDENCY_INVALID:'errorDependency',DEPENDENCY_NOT_READY:'errorDependencyReady',LEGACY_DEPENDENCY_STRING:'errorLegacyDependency',AGENT_STEP_LIMIT:'errorStep', AGENT_TIMEOUT:'errorTimeout', WORKFLOW_TIMEOUT:'errorWorkflowTimeout', MCODE_CANCELLED:'errorCancelled', RUN_INTERRUPTED:'errorInterrupted', MCODE_START_FAILED:'errorStart', MCODE_PROTOCOL_ERROR:'errorProtocol', MCODE_MISSING_RESULT:'errorMissing', MCODE_EXIT:'errorExit'};
-  const title = t(keys[failure.code] ?? 'errorGeneric', {stepId:failure.stepId??'?',dependency:failure.dependency??'?',status:failure.dependencyStatus??'?',steps: failure.maxSteps ?? '?', minutes: (failure.timeoutMs ?? failure.runTimeoutMs ?? 0)/60000, code: failure.exitCode ?? t('unknown')});
-  const advice = t(failure.code === 'OUTPUT_SCHEMA_INVALID' ? 'adviceStructured' : failure.code === 'LEGACY_DEPENDENCY_STRING' ? 'adviceLegacyDependency' : /^DEPENDENCY_/.test(failure.code??'') ? 'adviceDependency' : failure.code === 'AGENT_STEP_LIMIT' ? 'adviceStep' : /TIMEOUT/.test(failure.code ?? '') ? 'adviceTimeout' : 'adviceGeneric');
+  const keys = {OUTPUT_SCHEMA_INVALID:'errorStructured',DEPENDENCY_INVALID:'errorDependency',DEPENDENCY_NOT_READY:'errorDependencyReady',LEGACY_DEPENDENCY_STRING:'errorLegacyDependency',AGENT_STEP_LIMIT:'errorStep', AGENT_TIMEOUT:'errorTimeout', WORKFLOW_TIMEOUT:'errorWorkflowTimeout', MCODE_CANCELLED:'errorCancelled', RUN_INTERRUPTED:'errorInterrupted', MCODE_START_FAILED:'errorStart', MCODE_PROTOCOL_ERROR:'errorProtocol', MCODE_MISSING_RESULT:'errorMissing', MCODE_EXIT:'errorExit', PROMPT_LENGTH:'errorPromptLength'};
+  const title = t(keys[failure.code] ?? 'errorGeneric', {stepId:failure.stepId??'?',dependency:failure.dependency??'?',status:failure.dependencyStatus??'?',steps: failure.maxSteps ?? '?', minutes: (failure.timeoutMs ?? failure.runTimeoutMs ?? 0)/60000, code: failure.exitCode ?? t('unknown'), length: failure.length ?? '?', limit: failure.limit ?? '?'});
+  const advice = t(failure.code === 'OUTPUT_SCHEMA_INVALID' ? 'adviceStructured' : failure.code === 'LEGACY_DEPENDENCY_STRING' ? 'adviceLegacyDependency' : /^DEPENDENCY_/.test(failure.code??'') ? 'adviceDependency' : failure.code === 'AGENT_STEP_LIMIT' ? 'adviceStep' : failure.code === 'PROMPT_LENGTH' ? 'advicePromptLength' : /TIMEOUT/.test(failure.code ?? '') ? 'adviceTimeout' : 'adviceGeneric');
   return {title: language === 'zh' ? failure.message || fallback || title : title, advice: language === 'zh' ? failure.suggestion || advice : advice, original: failure.cause || (language === 'en' ? failure.message || fallback : '')};
 }

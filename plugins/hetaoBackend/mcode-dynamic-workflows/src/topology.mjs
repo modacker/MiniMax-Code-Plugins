@@ -1,6 +1,7 @@
 import {expandStaticPlan} from './static-plan.mjs';
 import {parse} from 'acorn';
 import {validateScript} from './common.mjs';
+import {detectDataEmbedding} from './prompt-budget.mjs';
 // Parse only: never evaluate the workflow or fabricate agent results for a preview.
 export function previewTopology(script,input={}) {
  const validation=validateScript(script),prefix='async function workflow(ctx,input){\n';
@@ -45,6 +46,7 @@ export function previewTopology(script,input={}) {
  });
  for(const node of nodes)node.dependsOn=edges.filter(e=>e.to===node.id).map(e=>e.from);
  if(!nodes.length)warnings.add('noStaticAgents');
+ const dataEmbedding=detectDataEmbedding(script);if(dataEmbedding)warnings.add(dataEmbedding);
  warnings.add('staticPreview');
  return expandStaticPlan({...validation,phases,nodes,edges,warnings:[...warnings]},script,input);
 }
