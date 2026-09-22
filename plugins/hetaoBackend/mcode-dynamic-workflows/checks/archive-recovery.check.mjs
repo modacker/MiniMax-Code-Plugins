@@ -11,13 +11,21 @@ import assert from 'node:assert/strict';
 import {mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath,pathToFileURL} from 'node:url';
 import {setTimeout as delay} from 'node:timers/promises';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {Store} from '../src/store.mjs';
 import {Engine} from '../src/engine.mjs';
-const exec=promisify(execFile),storeModule=fileURLToPath(new URL('../src/store.mjs',import.meta.url)),DAY=86400000;
+const exec=promisify(execFile),DAY=86400000;
+// The crash child imports the source Store via `node --input-type=module -e`.
+// The import specifier MUST be a file:// URL: a bare absolute Windows path
+// ("D:\\...\\store.mjs") dies at module load with ERR_UNSUPPORTED_ESM_URL_SCHEME
+// (the drive letter parses as protocol 'd:') before any injection logic runs —
+// fork preview runs 35696536334 and its predecessor both failed on this, with
+// the true stderr hidden behind "Command failed". pathToFileURL().href is the
+// portable spelling and is equally legal on POSIX.
+const storeURL=pathToFileURL(fileURLToPath(new URL('../src/store.mjs',import.meta.url))).href;
 async function fixture(execute){const dir=await mkdtemp(join(tmpdir(),'wf-recover-'));const store=new Store(dir),engine=new Engine(store,{workspace:dir,execute});return {dir,store,engine,cleanup:async()=>{await engine.close();store.close();await rm(dir,{recursive:true,force:true});}};}
 async function finish(engine,id){for(let i=0;i<300;i++){if(!engine.active.has(id))return engine.snapshot(id);await delay(20);}throw Error('timeout');}
 async function run(engine,script,requestId){const r=await engine.start({requestId,name:'Recovery suite',executor:'demo',script,input:{}});await engine.approve(r.id,{revision:1});return finish(engine,r.id);}
@@ -78,7 +86,7 @@ test('a hard kill in the commit gap is repaired by the next startup and the rota
   // primitives — and exit(9)'s exit code, unlike TerminateProcess's, is
   // portably observable as code 9.
   const die=process.platform==='win32'?'process.exit(9)':'process.kill(process.pid,\'SIGKILL\')';
-  const crash=`import {Store} from ${JSON.stringify(storeModule)};
+  const crash=`import {Store} from ${JSON.stringify(storeURL)};
 const store=new Store(${JSON.stringify(dir)});
 store.afterArchiveCommit=()=>${die};
 try{store.rotateDue({now:Date.now()});}finally{store.close();}`;
