@@ -2,7 +2,7 @@
 
 Turn a complex task into a reviewable multi-agent workflow. Inspect and edit the topology before execution, follow each agent's progress and output, then repair a failed script without discarding valid completed work.
 
-Version **0.8.0** · Apache-2.0 · one English Skill and one local MCP server with 13 tools.
+Version **0.8.0** · Apache-2.0 · one English Skill and one local MCP server with 14 tools.
 
 ## Try it
 

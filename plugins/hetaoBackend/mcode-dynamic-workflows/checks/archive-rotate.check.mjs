@@ -94,6 +94,46 @@ test('tampering an archived step, the rotations hash, or deleting a rotation rec
  }finally{await f.cleanup();}
 });
 
+test('restore refuses tampered archive data fail-closed and passes again once the archive is healed',async()=>{
+ const f=await fixture(async s=>({output:s.id}));try{
+ const end=await run(f.engine,twoSteps,'rotate-guard');
+ await f.engine.deleteRun(end.id);f.engine.configureTrash({trashRetentionDays:0});
+ const result=f.store.rotateDue({now:Date.now()});
+ const archive=f.store.archive();
+ assert.equal(f.store.verifyArchive().verified,true);
+ // Tampered archived STEP body: restore must refuse BEFORE any live write.
+ const step=archive.prepare('SELECT body FROM archive_steps WHERE id=?').get('a');
+ archive.prepare('UPDATE archive_steps SET body=? WHERE id=?').run(JSON.stringify({...JSON.parse(step.body),output:'tampered'}),'a');
+ const eventsBefore=eventCount(f.store);
+ await assert.rejects(()=>f.engine.restoreRun(end.id,{by:'cli'}),error=>{
+  assert.ok(error.message.includes(result.rotationId),'the refusal names the failing rotation id');
+  assert.ok(error.message.includes(end.id),'the refusal names the refused run');
+  assert.match(error.message,/different manifest|chained event|runCount|archive\.rotated/,'the refusal states the verification reason');
+  return true;});
+ assert.equal(f.store.get(end.id),null,'tampered archive data never becomes a live run row');
+ assert.equal(Number(f.store.db.prepare('SELECT COUNT(*) AS n FROM steps WHERE runId=?').get(end.id).n),0,'and never live steps rows');
+ assert.equal(f.store.events(end.id).filter(e=>e.type==='run.restored').length,0,'no run.restored event was appended');
+ assert.equal(eventCount(f.store),eventsBefore,'fail-closed restore writes nothing at all');
+ // Heal the archive: the same restore passes again (round-trip).
+ archive.prepare('UPDATE archive_steps SET body=? WHERE id=?').run(step.body,'a');
+ const restored=await f.engine.restoreRun(end.id,{by:'cli'});
+ assert.equal(restored.status,'succeeded');
+ assert.equal(f.store.events(end.id).filter(e=>e.type==='run.restored').length,1,'the healed restore appends exactly one run.restored');
+ // Tampered archived RUN body fails the same way under a fresh rotation.
+ await f.engine.deleteRun(restored.id,{by:'cli'});f.engine.configureTrash({trashRetentionDays:0});
+ const second=f.store.rotateDue({now:Date.now()});
+ const runRow=archive.prepare('SELECT body FROM archive_runs WHERE rotationId=? AND runId=?').get(second.rotationId,end.id);
+ archive.prepare('UPDATE archive_runs SET body=? WHERE rotationId=? AND runId=?').run(JSON.stringify({...JSON.parse(runRow.body),name:'tampered'}),second.rotationId,end.id);
+ await assert.rejects(()=>f.engine.restoreRun(end.id,{by:'cli'}),error=>error.message.includes(second.rotationId));
+ assert.equal(f.store.get(end.id),null,'still no live row from the tampered rotation');
+ assert.equal(f.store.events(end.id).filter(e=>e.type==='run.restored').length,1,'still exactly the earlier healthy restore event');
+ archive.prepare('UPDATE archive_runs SET body=? WHERE rotationId=? AND runId=?').run(runRow.body,second.rotationId,end.id);
+ const again=await f.engine.restoreRun(end.id,{by:'cli'});
+ assert.equal(again.status,'succeeded');
+ assert.equal(f.store.verifyArchive().verified,true,'both healed rotations verify');
+ }finally{await f.cleanup();}
+});
+
 test('archive restore returns the run live with provenance; re-rotation keeps every old manifest verifiable',async()=>{
  const f=await fixture(async s=>({output:s.id}));try{
  const end=await run(f.engine,twoSteps,'rotate-3');

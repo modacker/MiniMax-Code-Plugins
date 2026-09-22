@@ -196,6 +196,28 @@ export class Store {
    });
    return {rotated:true,runCount:entries.length,runs:entries.map(entry=>entry.run.id),rotationId,manifestHash,bytes};
   }
+  // Single-rotation verification shared by the whole-archive sweep below and
+  // by restoreArchived()'s fail-closed gate: recomputes THIS rotation's
+  // manifest from the archived rows (same archiveManifestHash face rotation
+  // itself uses — never a second hash implementation) and cross-checks it
+  // against BOTH the rotations record (tamperable sidecar) and the chained
+  // archive.rotated event (the trust anchor). Returns {verified,problems} and
+  // never throws — callers decide what a failed verdict means.
+  verifyRotation(rotationId) {
+   const archive=this.archive();
+   const rotation=archive.prepare('SELECT rotationId,manifestHash,runCount FROM rotations WHERE rotationId=?').get(rotationId);
+   if(!rotation)return {rotationId,runCount:null,verified:false,problems:['rotations record missing']};
+   const audit=this.db.prepare('SELECT body FROM events WHERE runId=?').all(rotationId).map(e=>JSON.parse(e.body)).filter(e=>e.type==='archive.rotated');
+   const entries=archive.prepare('SELECT runId AS id,requestId,requestHash,body FROM archive_runs WHERE rotationId=? ORDER BY runId').all(rotationId)
+    .map(run=>({run,steps:archive.prepare('SELECT id,body FROM archive_steps WHERE rotationId=? AND runId=? ORDER BY id').all(rotationId,run.id)}));
+   const actual=archiveManifestHash(entries),event=audit[0],problems=[];
+   if(audit.length!==1)problems.push(`expected exactly one archive.rotated event, found ${audit.length}`);
+   if(event&&event.manifestHash!==rotation.manifestHash)problems.push('rotations.manifestHash differs from the chained event');
+   if(event&&event.manifestHash!==actual)problems.push('archived rows recompute to a different manifest');
+   if(event&&event.runCount!==rotation.runCount)problems.push('event runCount differs from the rotations record');
+   if(entries.length!==rotation.runCount)problems.push(`archived ${entries.length} run rows for runCount ${rotation.runCount}`);
+   return {rotationId,runCount:rotation.runCount,verified:problems.length===0,problems};
+  }
   // Archive verification recomputes each rotation's manifest from the archived
   // rows and compares it against BOTH the rotations record (tamperable sidecar)
   // and the archive.rotated event anchored on the events hash chain (the trust
@@ -205,20 +227,12 @@ export class Store {
   verifyArchive() {
    if(!existsSync(this.archivePath))return {exists:false,rotations:0,checked:0,verified:true,results:[],divergences:[]};
    const archive=this.archive();
-   const rotations=archive.prepare('SELECT rotationId,manifestHash,runCount FROM rotations ORDER BY rotationId').all();
+   const rotations=archive.prepare('SELECT rotationId FROM rotations ORDER BY rotationId').all();
    const results=[],divergences=[];
-   for(const rotation of rotations){
-    const audit=this.db.prepare('SELECT body FROM events WHERE runId=?').all(rotation.rotationId).map(e=>JSON.parse(e.body)).filter(e=>e.type==='archive.rotated');
-    const entries=archive.prepare('SELECT runId AS id,requestId,requestHash,body FROM archive_runs WHERE rotationId=? ORDER BY runId').all(rotation.rotationId)
-     .map(run=>({run,steps:archive.prepare('SELECT id,body FROM archive_steps WHERE rotationId=? AND runId=? ORDER BY id').all(rotation.rotationId,run.id)}));
-    const actual=archiveManifestHash(entries),event=audit[0],problems=[];
-    if(audit.length!==1)problems.push(`expected exactly one archive.rotated event, found ${audit.length}`);
-    if(event&&event.manifestHash!==rotation.manifestHash)problems.push('rotations.manifestHash differs from the chained event');
-    if(event&&event.manifestHash!==actual)problems.push('archived rows recompute to a different manifest');
-    if(event&&event.runCount!==rotation.runCount)problems.push('event runCount differs from the rotations record');
-    if(entries.length!==rotation.runCount)problems.push(`archived ${entries.length} run rows for runCount ${rotation.runCount}`);
-    if(problems.length)divergences.push(`rotation ${rotation.rotationId}: ${problems.join('; ')}`);
-    results.push({rotationId:rotation.rotationId,runCount:rotation.runCount,verified:problems.length===0});
+   for(const {rotationId} of rotations){
+    const verdict=this.verifyRotation(rotationId);
+    if(!verdict.verified)divergences.push(`rotation ${rotationId}: ${verdict.problems.join('; ')}`);
+    results.push({rotationId,runCount:verdict.runCount,verified:verdict.verified});
    }
    const chained=this.db.prepare("SELECT runId FROM events WHERE json_extract(body,'$.type')='archive.rotated'").all().map(e=>e.runId);
    for(const runId of chained)if(!rotations.some(rotation=>rotation.rotationId===runId))divergences.push(`rotation ${runId} is chained but missing from the archive`);
@@ -236,10 +250,21 @@ export class Store {
   // idempotent through upserts), clear its tombstone and append one
   // run.restored {origin:'archive'} audit event — all in one transaction.
   // The archive keeps its copy: restore is a copy-back, not a move.
+  // Before ANY live write, the rotation this copy was exported under must
+  // re-verify (verifyRotation): a valid-JSON but modified archived run/step
+  // would otherwise re-enter the library as trusted live data even though
+  // verifyArchive() reports the tampering. Refusal is fail-closed: nothing is
+  // written and no run.restored event is appended.
   restoreArchived(runId,{by='cli'}={}) {
    if(!existsSync(this.archivePath))return null;
    const row=this.archive().prepare('SELECT a.rotationId AS rotationId,a.requestId AS requestId,a.requestHash AS requestHash,a.body AS body FROM archive_runs a JOIN rotations r ON r.rotationId=a.rotationId WHERE a.runId=? ORDER BY r.rotatedAt DESC,a.rotationId DESC LIMIT 1').get(runId);
    if(!row)return null;
+   // Verify-then-write: the archived rows must still recompute to the manifest
+   // anchored by this rotation's chained archive.rotated event. This gate
+   // deliberately precedes every other restore action — tampered archive data
+   // is refused before the live library is even consulted for conflicts.
+   const verdict=this.verifyRotation(row.rotationId);
+   if(!verdict.verified)throw new Error(`轮转 ${row.rotationId} 校验失败，拒绝从归档恢复 ${runId}：${verdict.problems.join('；')}`);
    // Rotation frees the requestId; a newer live run may have claimed it since.
    // Restoring must not silently evict that run — fail loud instead.
    const conflict=this.db.prepare('SELECT id FROM runs WHERE requestId=? AND id<>?').get(row.requestId,runId);
