@@ -16,13 +16,13 @@ import { resolveMcode } from './availability.mjs';
 import { DEFAULT_LIMITS, LEGACY_LIMITS, resolveLimits, runLimits, durationLabel } from './limits.mjs';
 import { agentFailure,failureError } from './failure.mjs';
 import { demoExecute, mcodeExecute } from './executor.mjs';
-import { ROTATE_TOMBSTONE_THRESHOLD,ROTATE_RUNS_BYTES_THRESHOLD } from './store.mjs';
+import { ROTATE_TOMBSTONE_THRESHOLD,ROTATE_RUNS_BYTES_THRESHOLD,ROTATE_MAX_BATCHES } from './store.mjs';
 // Only finished runs may enter the trash. needs_attention stays out: its old
 // agents may still require user confirmation, and the run is not done yet.
 const DELETABLE=new Set(['succeeded','failed','completed_with_gaps','cancelled','interrupted']);
 const TRASH_SOURCES=new Set(['studio','cli','mcp']);
 export class Engine extends EventEmitter {
- constructor(store,options){super();this.store=store;this.options=options;this.defaults=resolveLimits(options,DEFAULT_LIMITS);this.globalConcurrency=this.store.setting('globalConcurrency')??8;this.lastServedRun=null;this.approving=new Set();this.active=new Map();this.slots=0;this.queue=[];this.closing=false;}
+ constructor(store,options){super();this.store=store;this.options=options;this.defaults=resolveLimits(options,DEFAULT_LIMITS);this.globalConcurrency=this.store.setting('globalConcurrency')??8;this.lastServedRun=null;this.approving=new Set();this.active=new Map();this.slots=0;this.queue=[];this.closing=false;this.rotationDrain=false;}
  async fingerprints(files=[]) {
    check(Array.isArray(files)&&files.length<=100,'files 最多 100 项');const root=await realpath(this.options.workspace);const out=Object.create(null);
    for(const path of files){
@@ -140,8 +140,10 @@ export class Engine extends EventEmitter {
  }
  // Tombstone soft delete. Steps, events, result and the integrity ledger all
  // stay untouched — only the run body gains deletedAt/deletedBy/purgeAfter and
- // one append-only run.deleted audit event. Repeat deletes are idempotent and
- // never append a second event.
+ // one append-only run.deleted audit event. Body change and audit event are
+ // committed by ONE transaction (store.tombstoneRun): an event-insert failure
+ // rolls the tombstone back too, so the operation fails closed with zero state
+ // change. Repeat deletes are idempotent and never append a second event.
  async deleteRun(id,{by='studio'}={}) {
    check(!this.closing,'服务正在关闭');check(TRASH_SOURCES.has(by),'无效的删除来源');
    const run=this.store.get(id);
@@ -154,19 +156,23 @@ export class Engine extends EventEmitter {
    check(!this.active.has(id),'工作流仍在运行，请先暂停或取消后再删除');
    check(DELETABLE.has(run.status),'仅已完成的工作流可删除（运行中或待审核不可删除）');
    const days=this.trashRetentionDays();
-   run.deletedAt=Date.now();run.deletedBy=by;run.purgeAfter=run.deletedAt+days*86400000;
-   this.save(run);this.emitEvent(id,'run.deleted',{by,purgeAfter:run.purgeAfter});
+   run.deletedAt=Date.now();run.deletedBy=by;run.purgeAfter=run.deletedAt+days*86400000;run.updatedAt=Date.now();
+   const event=this.store.tombstoneRun(run,{by,purgeAfter:run.purgeAfter});
+   this.emit('change',{runId:id,...event});
    return {id,deleted:true,alreadyDeleted:false,deletedAt:run.deletedAt,purgeAfter:run.purgeAfter};
  }
- // Restore clears the tombstone and appends run.restored. Everything else was
- // never removed, so the run reappears byte-identical on every query face.
+ // Restore clears the tombstone and appends run.restored — atomically via
+ // store.untombstoneRun, so a failing audit event leaves the tombstone exactly
+ // as it was. Everything else was never removed, so the run reappears
+ // byte-identical on every query face.
  async restoreRun(id,{by='studio'}={}) {
    check(!this.closing,'服务正在关闭');check(TRASH_SOURCES.has(by),'无效的恢复来源');
    const run=this.store.get(id);
    if(run){
     check(run.deletedAt,'工作流未删除，无需恢复');
-    delete run.deletedAt;delete run.deletedBy;delete run.purgeAfter;
-    this.save(run);this.emitEvent(id,'run.restored',{by,origin:'trash'});
+    delete run.deletedAt;delete run.deletedBy;delete run.purgeAfter;run.updatedAt=Date.now();
+    const event=this.store.untombstoneRun(run,{by,origin:'trash'});
+    this.emit('change',{runId:id,...event});
     return this.snapshot(id);
    }
    // Not live: restore from the sidecar archive when the run was rotated.
@@ -174,23 +180,46 @@ export class Engine extends EventEmitter {
    check(archived,'工作流不存在或未归档');
    return this.snapshot(id);
  }
- // Manual rotation face: rotate due tombstones now, optionally returning the
+ // Manual rotation face: rotate due tombstones now in bounded batches (at
+ // most ROTATE_MAX_BATCHES per call; callers may pass fewer), reporting the
+ // remaining backlog honestly in `remaining`, optionally returning the
  // archive and integrity verdicts alongside the rotation summary.
- rotateArchive({verify=false}={}) {
+ rotateArchive({verify=false,batches}={}) {
   check(!this.closing,'服务正在关闭');
-  const result=this.store.rotateDue({now:Date.now()});
+  const limit=batches===undefined?ROTATE_MAX_BATCHES:(check(Number.isInteger(batches)&&batches>=1&&batches<=ROTATE_MAX_BATCHES,`单次轮转批数须为 1–${ROTATE_MAX_BATCHES} 的整数`),batches);
+  const result=this.store.rotateDue({now:Date.now(),maxBatches:limit});
   return verify?{...result,archive:this.store.verifyArchive(),integrity:this.store.verifyIntegrity()}:result;
  }
  // Startup compaction: when trash volume or runs-table size crosses the
  // documented thresholds, expired tombstones are rotated into archive.db
- // before the dashboard starts serving. trashRetentionDays=0 disables the
- // expiry clock entirely (manual rotation only) and with it this auto path.
+ // before the dashboard starts serving — bounded to exactly ONE batch so
+ // startup blocking time is bounded by one batch, never by the backlog size;
+ // the honest `remaining` count tells the caller how much is still due.
+ // trashRetentionDays=0 disables the expiry clock entirely (manual rotation
+ // only) and with it this auto path.
  autoRotateAtStartup() {
   const days=this.trashRetentionDays();
-  if(days<=0)return {autoRotated:false,reason:'manual-only',tombstones:this.store.tombstoneCount(),bytes:this.store.runsBytes()};
+  if(days<=0)return {autoRotated:false,reason:'manual-only',tombstones:this.store.tombstoneCount(),bytes:this.store.runsBytes(),remaining:this.store.dueTombstoneCount()};
   const tombstones=this.store.tombstoneCount(),bytes=this.store.runsBytes();
-  if(tombstones<=ROTATE_TOMBSTONE_THRESHOLD&&bytes<=ROTATE_RUNS_BYTES_THRESHOLD)return {autoRotated:false,tombstones,bytes};
-  return {...this.store.rotateDue({now:Date.now()}),autoRotated:true,tombstones,bytes};
+  if(tombstones<=ROTATE_TOMBSTONE_THRESHOLD&&bytes<=ROTATE_RUNS_BYTES_THRESHOLD)return {autoRotated:false,tombstones,bytes,remaining:this.store.dueTombstoneCount()};
+  return {...this.store.rotateDue({now:Date.now(),maxBatches:1}),autoRotated:true,tombstones,bytes};
+ }
+ // Background drain for the backlog the bounded startup pass leaves behind:
+ // one batch per tick, throttled by intervalMs, until nothing is due. The
+ // service is already serving when this runs, so a failing batch is logged
+ // to stderr and stops the drain — rotation is idempotent, so the next
+ // startup pass or manual rotation retries without loss.
+ drainRotationsInBackground({intervalMs=250}={}) {
+  if(this.closing||this.rotationDrain)return;
+  this.rotationDrain=true;
+  const tick=()=>{
+   if(this.closing){this.rotationDrain=false;return;}
+   let result;try{result=this.store.rotateDue({now:Date.now(),maxBatches:1});}
+   catch(e){this.rotationDrain=false;process.stderr.write(`Archive rotation drain failed: ${e.message}\n`);return;}
+   if(result.remaining>0){const timer=setTimeout(tick,intervalMs);timer.unref?.();}
+   else this.rotationDrain=false;
+  };
+  const timer=setTimeout(tick,intervalMs);timer.unref?.();
  }
  drain(){
   while(this.slots<this.globalConcurrency){

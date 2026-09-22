@@ -16,7 +16,7 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
-import {Store} from '../src/store.mjs';
+import {Store,ROTATE_BATCH_RUNS,ROTATE_BATCH_BYTES,ROTATE_MAX_BATCHES} from '../src/store.mjs';
 import {Engine} from '../src/engine.mjs';
 import {createToolHandler} from '../src/tools.mjs';
 const exec=promisify(execFile),binary=resolve('dist/main.mjs');
@@ -131,6 +131,124 @@ test('archive restore returns the run live with provenance; re-rotation keeps ev
  }finally{await f.cleanup();}
 });
 
+test('deleting the entire archive sidecar fails closed against the chained rotations; a clean install stays green',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'wf-gone-'));let store=new Store(dir),engine=new Engine(store,{workspace:dir,execute:async s=>({output:s.id})});
+ try{
+ // Clean install: no chain promise plus no sidecar verifies green — it is a
+ // verdict about nothing to verify, never a silent skip past the anchor.
+ assert.deepEqual(store.verifyArchive(),{exists:false,rotations:0,checked:0,verified:true,results:[],divergences:[]});
+ const end=await run(engine,twoSteps,'gone-1');
+ await engine.deleteRun(end.id);engine.configureTrash({trashRetentionDays:0});
+ assert.equal(store.rotateDue({now:Date.now()}).rotated,true);
+ assert.equal(store.verifyArchive().verified,true);
+ await engine.close();store.close();
+ // Delete the whole sidecar — main database and its WAL siblings — with
+ // everything closed, exactly as a whole-archive deletion would look.
+ for(const suffix of ['','-wal','-shm'])await rm(join(dir,`archive.db${suffix}`),{force:true});
+ store=new Store(dir);engine=new Engine(store,{workspace:dir,execute:async s=>({output:s.id})});
+ const verdict=store.verifyArchive();
+ assert.equal(verdict.exists,false);
+ assert.equal(verdict.verified,false,'the live chain still promises the rotation: a missing archive is not an all-clear');
+ assert.ok(verdict.divergences.some(d=>d.includes('whole-archive-deleted')),'the divergence names the cause');
+ assert.equal(store.verifyIntegrity().archive.verified,false,'verifyIntegrity surfaces the same fail-closed verdict');
+ // The rotated run is gone from live faces and cannot be resurrected: with
+ // the chain promising an archive that is not there, restore refuses.
+ assert.equal(store.get(end.id),null);
+ assert.equal(store.restoreArchived(end.id),null);
+ }finally{await engine.close();store.close();await rm(dir,{recursive:true,force:true});}
+});
+
+test('rotation is bounded: one call rotates one batch and reports the honest remainder',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'wf-batch-'));const store=new Store(dir);
+ try{
+  const now=Date.now();
+  for(let i=0;i<120;i++)store.save({id:`batch-${String(i).padStart(3,'0')}`,requestId:`breq-${i}`,requestHash:`h${i}`,status:'succeeded',name:'batch',deletedAt:now-40*DAY,purgeAfter:now-10*DAY,deletedBy:'cli'});
+  const first=store.rotateDue({now:Date.now()});
+  assert.equal(first.rotated,true);assert.equal(first.runCount,ROTATE_BATCH_RUNS,'exactly one batch of 50 per call');
+  assert.equal(first.remaining,70,'the remainder is reported honestly');
+  assert.equal(first.rotations.length,1);assert.match(first.rotationId,/^[0-9a-f-]{36}$/);assert.match(first.manifestHash,/^[0-9a-f]{64}$/);
+  assert.deepEqual(first.runs.map(id=>id.slice(-3)),Array.from({length:50},(_,i)=>String(i).padStart(3,'0')),'the id-ordered cursor takes the first 50');
+  const second=store.rotateDue({now:Date.now()});
+  assert.equal(second.runCount,50);assert.equal(second.remaining,20);
+  assert.notEqual(second.rotationId,first.rotationId,'each batch is its own rotation');
+  const third=store.rotateDue({now:Date.now()});
+  assert.equal(third.runCount,20);assert.equal(third.remaining,0);
+  assert.equal(store.tombstoneCount(),0,'nothing due is left behind');
+  const verdict=store.verifyIntegrity();
+  assert.equal(verdict.archive.verified,true);assert.equal(verdict.archive.rotations,3);
+  assert.equal(verdict.events.verified,true,'three chained archive.rotated events anchor the three batches');
+ }finally{store.close();await rm(dir,{recursive:true,force:true});}
+});
+
+test('the per-batch byte budget splits oversized rotations; a single oversized run still rotates alone',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'wf-batchbytes-'));const store=new Store(dir);
+ try{
+  const now=Date.now(),big='x'.repeat(1024*1024);
+  for(let i=0;i<30;i++)store.save({id:`big-${String(i).padStart(3,'0')}`,requestId:`zreq-${i}`,requestHash:`h${i}`,status:'succeeded',name:'big',big,deletedAt:now-40*DAY,purgeAfter:now-10*DAY,deletedBy:'cli'});
+  const first=store.rotateDue({now:Date.now()});
+  assert.equal(first.rotated,true);
+  assert.ok(first.runCount>=4&&first.runCount<30,`the byte budget cuts the batch short (${first.runCount} of 30)`);
+  assert.equal(first.remaining,30-first.runCount);
+  // Drain the rest one bounded call at a time; every rotation stays within
+  // the budget and the totals reconcile exactly.
+  let total=first.runCount,calls=1;
+  while(total<30){
+   const next=store.rotateDue({now:Date.now()});
+   assert.ok(next.rotated);assert.ok(next.rotations.every(r=>r.bytes<=ROTATE_BATCH_BYTES),'no batch exceeds the byte budget');
+   total+=next.runCount;calls++;
+   assert.ok(calls<=12,'the drain must converge');
+  }
+  assert.equal(total,30);assert.equal(store.rotateDue({now:Date.now()}).remaining,0);
+  // A single tombstone larger than the whole budget still rotates — alone.
+  store.save({id:'huge',requestId:'zreq-huge',requestHash:'huge',status:'succeeded',name:'huge',big:'y'.repeat(ROTATE_BATCH_BYTES+65536),deletedAt:now-40*DAY,purgeAfter:now-10*DAY,deletedBy:'cli'});
+  const huge=store.rotateDue({now:Date.now()});
+  assert.equal(huge.runCount,1);assert.deepEqual(huge.runs,['huge']);assert.ok(huge.bytes>ROTATE_BATCH_BYTES);
+  const verdict=store.verifyIntegrity();
+  assert.equal(verdict.archive.verified,true);
+  assert.equal(verdict.events.verified,true);
+ }finally{store.close();await rm(dir,{recursive:true,force:true});}
+});
+
+test('startup auto-rotation is bounded to one batch; the backlog drains in the background',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'wf-startbatch-'));const store=new Store(dir);const engine=new Engine(store,{workspace:dir,execute:async s=>({output:s.id})});
+ try{
+  const now=Date.now();
+  for(let i=0;i<501;i++)store.save({id:`sb-${String(i).padStart(3,'0')}`,requestId:`sreq-${i}`,requestHash:`h${i}`,status:'succeeded',name:'sb',deletedAt:now-40*DAY,purgeAfter:now-10*DAY,deletedBy:'cli'});
+  const compaction=engine.autoRotateAtStartup();
+  assert.equal(compaction.autoRotated,true);
+  assert.equal(compaction.runCount,ROTATE_BATCH_RUNS,'the synchronous startup pass rotates exactly one batch');
+  assert.equal(compaction.remaining,451,'the rest of the backlog is reported, not silently rotated before serving');
+  assert.equal(store.verifyIntegrity().archive.verified,true);
+  // The background drain empties the trash one throttled batch at a time.
+  engine.drainRotationsInBackground({intervalMs:1});
+  for(let i=0;i<600&&store.tombstoneCount()>0;i++)await delay(10);
+  assert.equal(store.tombstoneCount(),0,'the drain completes');
+  const verdict=store.verifyIntegrity();
+  assert.equal(verdict.archive.rotations,Math.ceil(501/ROTATE_BATCH_RUNS),'501 tombstones rotate in 11 bounded batches');
+  assert.equal(verdict.archive.verified,true);
+  assert.equal(verdict.events.verified,true);
+ }finally{await engine.close();store.close();await rm(dir,{recursive:true,force:true});}
+});
+
+test('the manual rotate face chains bounded batches per call',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'wf-batchface-'));const store=new Store(dir);const engine=new Engine(store,{workspace:dir,execute:async s=>({output:s.id})});
+ try{
+  const now=Date.now();
+  for(let i=0;i<130;i++)store.save({id:`bf-${String(i).padStart(3,'0')}`,requestId:`freq-${i}`,requestHash:`h${i}`,status:'succeeded',name:'bf',deletedAt:now-40*DAY,purgeAfter:now-10*DAY,deletedBy:'cli'});
+  const capped=engine.rotateArchive({batches:2});
+  assert.equal(capped.runCount,100,'an explicit two-batch request rotates exactly two batches');
+  assert.equal(capped.remaining,30);
+  assert.equal(capped.rotationId,null);assert.equal(capped.manifestHash,null,'multi-batch results carry their hashes per rotation, not flat');
+  assert.equal(capped.rotations.length,2);assert.ok(capped.rotations.every(r=>r.manifestHash&&r.rotationId));
+  const rest=engine.rotateArchive({});
+  assert.equal(rest.runCount,30);assert.equal(rest.remaining,0);
+  assert.equal(rest.rotationId,rest.rotations[0].rotationId,'the final single-batch call keeps the flat shape');
+  const verdict=store.verifyIntegrity();
+  assert.equal(verdict.archive.verified,true);assert.equal(verdict.events.verified,true);
+  for(const bad of [0,-1,1.5,'3',ROTATE_MAX_BATCHES+1])await assert.rejects(async()=>engine.rotateArchive({batches:bad}),/批数/);
+ }finally{await engine.close();store.close();await rm(dir,{recursive:true,force:true});}
+});
+
 async function connect(dir){
  const client=new Client({name:'archive-check',version:'1'});
  await client.connect(new StdioClientTransport({command:process.execPath,args:[binary,'--stdio','--workspace',dir,'--data-dir',dir],stderr:'pipe'}));
@@ -139,7 +257,7 @@ async function connect(dir){
 const call=async(client,name,args={})=>{const result=await client.callTool({name,arguments:args});assert.ok(!result.isError,result.content[0].text);return JSON.parse(result.content[0].text);};
 const stop=dir=>exec(process.execPath,[binary,'--stop-service','--workspace',dir,'--data-dir',dir]);
 
-test('service startup auto-rotates oversized expired trash but leaves moderate trash alone',{timeout:90000},async()=>{
+test('service startup auto-rotates oversized expired trash in bounded batches; moderate trash stays',{timeout:90000},async()=>{
  const dirs=[await mkdtemp(join(tmpdir(),'wf-autorot-')),await mkdtemp(join(tmpdir(),'wf-autorot-ctl-'))];
  const seed=async(dir,n)=>{const store=new Store(dir);const now=Date.now();for(let i=0;i<n;i++)store.save({id:`tomb-${i}`,requestId:`req-${i}`,requestHash:`h${i}`,status:'succeeded',name:'tomb',deletedAt:now-40*DAY,purgeAfter:now-10*DAY,deletedBy:'cli'});store.close();};
  try{
@@ -151,16 +269,24 @@ test('service startup auto-rotates oversized expired trash but leaves moderate t
    assert.equal(existsSync(join(dir,'archive.db')),expectRotated,`${dir} archive presence`);
    const runs=await(await fetch(new URL('/api/runs',dashboard.url),{headers})).json();
    assert.equal(runs.length,0,'no tombstone leaks into the live list');
-   const trash=await(await fetch(new URL('/api/runs?trash=1',dashboard.url),{headers})).json();
-   assert.equal(trash.length,expectRotated?0:100,'moderate trash stays (listing window caps at 100)');
+   // The service was already serving after ONE bounded batch; the backlog
+   // drains in the background — poll until the oversized trash is empty.
+   let trash;
+   for(let i=0;i<160;i++){
+    trash=await(await fetch(new URL('/api/runs?trash=1',dashboard.url),{headers})).json();
+    if(!expectRotated||trash.length===0)break;
+    await delay(500);
+   }
+   if(expectRotated)assert.equal(trash.length,0,'the background drain empties the oversized expired trash');
+   else assert.equal(trash.length,100,'moderate trash stays (listing window caps at 100)');
    const status=await call(client,'workflow_status',{verifyIntegrity:true});
    // verified:null is the #48 "no anchored rows yet" verdict (the seeded
    // control library never wrote an event); only false is a failure.
    assert.notEqual(status.integrity.events.verified,false,'events chain must never fail');
    assert.notEqual(status.integrity.archive.verified,false);
    if(expectRotated){
-    assert.equal(status.integrity.events.verified,true,'rotation anchored exactly one archive.rotated event');
-    assert.equal(status.integrity.archive.rotations,1);
+    assert.equal(status.integrity.events.verified,true,'every drained batch anchored exactly one archive.rotated event');
+    assert.equal(status.integrity.archive.rotations,Math.ceil(501/ROTATE_BATCH_RUNS),'501 tombstones rotate in 11 bounded batches');
    }
   }finally{await client.close();await stop(dir);}
  }

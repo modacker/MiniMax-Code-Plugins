@@ -121,13 +121,20 @@ if(values.stdio&&process.env.MCODE_WORKFLOW_CHILD==='1'){
   try{
    engine=new Engine(store,{workspace,command:values['mcode-script']?process.execPath:'mcode',args:values['mcode-script']?[resolve(values['mcode-script'])]:[],configPath:values['worker-config']?resolve(values['worker-config']):undefined});
    // Startup compaction: expired tombstones past the volume thresholds are
-   // rotated into archive.db before the dashboard starts serving. Failure is
+   // rotated into archive.db before the dashboard starts serving — bounded to
+   // exactly ONE batch so startup never blocks on a large backlog. Failure is
    // not swallowed — an unrotatable library fails the service start loudly.
    const compaction=engine.autoRotateAtStartup();
-   if(compaction.rotated)process.stdout.write(`Rotated ${compaction.runCount} trashed workflow(s) into archive.db (rotation ${compaction.rotationId}).\n`);
+   if(compaction.rotated)process.stdout.write(`Rotated ${compaction.runCount} trashed workflow(s) into archive.db (rotation ${compaction.rotationId}); ${compaction.remaining} still due.\n`);
    panel=await startHTTP(engine,{port});
    await saveAddress(panel.url);
    const temp=endpointPath+'.'+process.pid+'.tmp';await writeFile(temp,JSON.stringify({pid:process.pid,url:panel.url,workspace,serviceProtocol:2}),{mode:0o600});await rename(temp,endpointPath);
+   // The bounded startup pass may leave due tombstones behind once its batch
+   // budget is spent; now that the dashboard is listening, the backlog drains
+   // in the background — one throttled batch at a time, never holding the
+   // service hostage. Rotation batches are idempotent recovery units, so an
+   // interrupted drain simply resumes on the next start or manual rotation.
+   if(compaction.autoRotated&&compaction.remaining>0)engine.drainRotationsInBackground();
   }catch(e){await engine?.close();await panel?.close();store.close();throw e;}
   process.stdout.write(`Workflow Studio: ${panel.url}\n`);
   let closing=false;async function close(){if(closing)return;closing=true;await engine.close();await panel.close();store.close();process.exitCode=0;}

@@ -13455,6 +13455,9 @@ ${script}
 // src/store.mjs
 var ROTATE_TOMBSTONE_THRESHOLD = 500;
 var ROTATE_RUNS_BYTES_THRESHOLD = 100 * 1024 * 1024;
+var ROTATE_BATCH_RUNS = 50;
+var ROTATE_BATCH_BYTES = 8 * 1024 * 1024;
+var ROTATE_MAX_BATCHES = 20;
 function archiveManifestHash(entries) {
   return hash(entries);
 }
@@ -13485,6 +13488,7 @@ var Store = class {
     this.owner = randomUUID();
     this.txDepth = 0;
     this.archivePath = join(dir, "archive.db");
+    this.afterArchiveCommit = null;
     try {
       writeFileSync(this.fd, JSON.stringify({ pid: process.pid, owner: this.owner }));
       this.db = new DatabaseSync(join(dir, "workflows.sqlite"));
@@ -13505,6 +13509,7 @@ var Store = class {
         run.error = "\u4E0A\u6B21\u670D\u52A1\u5F02\u5E38\u7EC8\u6B62\u3002\u5148\u786E\u8BA4\u65E7 Agent \u5DF2\u505C\u6B62\uFF0C\u518D\u6062\u590D\u3002";
         this.save(run);
       }
+      this.reconcileOrphans();
     } catch (error2) {
       this.db?.close();
       this.releaseLock();
@@ -13571,6 +13576,25 @@ var Store = class {
         const run = JSON.parse(row.body);
         this.db.prepare("UPDATE runs SET body=? WHERE id=?").run(JSON.stringify({ ...run, purgeAfter: run.deletedAt + days * 864e5 }), row.id);
       }
+    });
+  }
+  // Atomic tombstone/restore primitives: the run body change and its
+  // run.deleted/run.restored audit event land in ONE live transaction. An
+  // event-insert failure (the last write in the transaction) rolls the body
+  // change back with it, so the operation fails closed with zero state
+  // change instead of leaving a mutated run whose promised audit event never
+  // landed. The caller mutates the run object in memory first; on failure the
+  // exception propagates and the persisted state is untouched.
+  tombstoneRun(run, eventData = {}) {
+    return this.transaction(() => {
+      this.save(run);
+      return this.event(run.id, "run.deleted", eventData);
+    });
+  }
+  untombstoneRun(run, eventData = {}) {
+    return this.transaction(() => {
+      this.save(run);
+      return this.event(run.id, "run.restored", eventData);
     });
   }
   tombstoneCount() {
@@ -13697,51 +13721,119 @@ var Store = class {
     this.archiveDb = db;
     return db;
   }
-  // Rotate every due tombstone (purgeAfter <= now) into the archive and drop
-  // its live runs/steps rows. Ordering is archive-first, live-delete-second: a
-  // crash in between only leaves tombstones in place; the next rotation
-  // supersedes the stale archive copy under a fresh rotationId. The audit
-  // event is appended in the SAME live transaction as the deletes, so the
-  // events chain always reflects exactly what left the library.
-  rotateDue({ now = Date.now() } = {}) {
-    const due = this.db.prepare("SELECT id,requestId,requestHash,body FROM runs WHERE json_extract(body,'$.deletedAt') IS NOT NULL AND json_extract(body,'$.purgeAfter')<=? ORDER BY id").all(now);
-    if (!due.length) return { rotated: false, runCount: 0, runs: [], rotationId: null, manifestHash: null, bytes: 0 };
-    const rotationId = randomUUID(), readSteps = this.db.prepare("SELECT id,body FROM steps WHERE runId=? ORDER BY id");
-    const entries = due.map((r) => ({ run: { id: r.id, requestId: r.requestId, requestHash: r.requestHash, body: r.body }, steps: readSteps.all(r.id) }));
-    const manifestHash = archiveManifestHash(entries);
-    const bytes = entries.reduce((n, e) => n + Buffer.byteLength(e.run.body) + e.steps.reduce((m2, s) => m2 + Buffer.byteLength(s.body), 0), 0);
+  // Crash-window reconciliation across the two databases. Rotation commits
+  // the archive side FIRST (archive_runs + archive_steps + the rotations
+  // record) and the live side SECOND (row deletes + archive.rotated event in
+  // ONE live transaction); no SQLite transaction can span both files. A crash
+  // in between leaves exactly one corrupt shape: a rotations record whose
+  // archive.rotated event never landed. The live transaction never ran, so
+  // the runs/steps rows are still in place and untouched — rolling the
+  // archive copy back is therefore always safe and loses nothing:
+  // reconcileOrphans() deletes such orphaned rotations (archive rows +
+  // rotations record) and leaves the live library alone. It runs at startup
+  // (Store constructor) and before every rotation, after which the rotation
+  // simply runs again under a fresh rotationId, so redo is idempotent by
+  // construction.
+  reconcileOrphans() {
+    if (!existsSync(this.archivePath)) return { removed: [] };
     const archive = this.archive();
-    archive.exec("BEGIN IMMEDIATE");
-    try {
-      const insertRun = archive.prepare("INSERT OR REPLACE INTO archive_runs VALUES(?,?,?,?,?)"), insertStep = archive.prepare("INSERT OR REPLACE INTO archive_steps VALUES(?,?,?,?)");
-      for (const entry of entries) {
-        insertRun.run(rotationId, entry.run.id, entry.run.requestId, entry.run.requestHash, entry.run.body);
-        for (const step of entry.steps) insertStep.run(rotationId, entry.run.id, step.id, step.body);
+    const chained = new Set(this.db.prepare("SELECT runId FROM events WHERE json_extract(body,'$.type')='archive.rotated'").all().map((e) => e.runId));
+    const removed = [];
+    for (const { rotationId } of archive.prepare("SELECT rotationId FROM rotations").all()) {
+      if (chained.has(rotationId)) continue;
+      archive.exec("BEGIN IMMEDIATE");
+      try {
+        archive.prepare("DELETE FROM archive_runs WHERE rotationId=?").run(rotationId);
+        archive.prepare("DELETE FROM archive_steps WHERE rotationId=?").run(rotationId);
+        archive.prepare("DELETE FROM rotations WHERE rotationId=?").run(rotationId);
+        archive.exec("COMMIT");
+      } catch (e) {
+        archive.exec("ROLLBACK");
+        throw e;
       }
-      archive.prepare("INSERT INTO rotations VALUES(?,?,?,?,?)").run(rotationId, Date.now(), manifestHash, entries.length, bytes);
-      archive.exec("COMMIT");
-    } catch (e) {
-      archive.exec("ROLLBACK");
-      throw e;
+      removed.push(rotationId);
     }
-    this.transaction(() => {
-      const deleteSteps = this.db.prepare("DELETE FROM steps WHERE runId=?"), deleteRun = this.db.prepare("DELETE FROM runs WHERE id=?");
-      for (const entry of entries) {
-        deleteSteps.run(entry.run.id);
-        deleteRun.run(entry.run.id);
+    return { removed };
+  }
+  dueTombstoneCount(now = Date.now()) {
+    return Number(this.db.prepare("SELECT COUNT(*) AS n FROM runs WHERE json_extract(body,'$.deletedAt') IS NOT NULL AND json_extract(body,'$.purgeAfter')<=?").get(now).n);
+  }
+  // Rotate due tombstones (purgeAfter <= now) into the archive and drop their
+  // live runs/steps rows, in bounded batches. Within a batch the ordering is
+  // fixed and crash-safe: archive-first (rows + rotations record, one archive
+  // transaction), then live-second (deletes + the audit event in one live
+  // transaction). Each batch is its own rotation and its own recovery unit
+  // (see reconcileOrphans). maxBatches bounds one call — the startup path
+  // uses exactly 1 so service start never blocks on a backlog; the API/CLI
+  // face uses ROTATE_MAX_BATCHES — and `remaining` reports honestly how many
+  // due tombstones are still unrotated. The cursor is implicit: processed
+  // rows are deleted inside the batch, so re-issuing the same ordered query
+  // advances on its own. Single-batch results keep the historical flat
+  // rotationId/manifestHash shape; multi-batch callers read `rotations`.
+  rotateDue({ now = Date.now(), maxBatches = 1 } = {}) {
+    this.reconcileOrphans();
+    const readSteps = this.db.prepare("SELECT id,body FROM steps WHERE runId=? ORDER BY id"), dueQuery = this.db.prepare("SELECT id,requestId,requestHash,body FROM runs WHERE json_extract(body,'$.deletedAt') IS NOT NULL AND json_extract(body,'$.purgeAfter')<=? ORDER BY id LIMIT ?");
+    const rotations = [];
+    for (let batch = 0; batch < maxBatches; batch++) {
+      const due = dueQuery.all(now, ROTATE_BATCH_RUNS);
+      if (!due.length) break;
+      const entries = [];
+      let bytes = 0;
+      for (const r of due) {
+        const steps = readSteps.all(r.id);
+        const entryBytes = Buffer.byteLength(r.body) + steps.reduce((m2, s) => m2 + Buffer.byteLength(s.body), 0);
+        if (entries.length && bytes + entryBytes > ROTATE_BATCH_BYTES) break;
+        entries.push({ run: { id: r.id, requestId: r.requestId, requestHash: r.requestHash, body: r.body }, steps });
+        bytes += entryBytes;
       }
-      this.event(rotationId, "archive.rotated", { runs: entries.map((entry) => entry.run.id), manifestHash, runCount: entries.length, bytes });
-    });
-    return { rotated: true, runCount: entries.length, runs: entries.map((entry) => entry.run.id), rotationId, manifestHash, bytes };
+      const rotationId = randomUUID(), manifestHash = archiveManifestHash(entries);
+      const archive = this.archive();
+      archive.exec("BEGIN IMMEDIATE");
+      try {
+        const insertRun = archive.prepare("INSERT OR REPLACE INTO archive_runs VALUES(?,?,?,?,?)"), insertStep = archive.prepare("INSERT OR REPLACE INTO archive_steps VALUES(?,?,?,?)");
+        for (const entry of entries) {
+          insertRun.run(rotationId, entry.run.id, entry.run.requestId, entry.run.requestHash, entry.run.body);
+          for (const step of entry.steps) insertStep.run(rotationId, entry.run.id, step.id, step.body);
+        }
+        archive.prepare("INSERT INTO rotations VALUES(?,?,?,?,?)").run(rotationId, Date.now(), manifestHash, entries.length, bytes);
+        archive.exec("COMMIT");
+      } catch (e) {
+        archive.exec("ROLLBACK");
+        throw e;
+      }
+      this.afterArchiveCommit?.(rotationId);
+      this.transaction(() => {
+        const deleteSteps = this.db.prepare("DELETE FROM steps WHERE runId=?"), deleteRun = this.db.prepare("DELETE FROM runs WHERE id=?");
+        for (const entry of entries) {
+          deleteSteps.run(entry.run.id);
+          deleteRun.run(entry.run.id);
+        }
+        this.event(rotationId, "archive.rotated", { runs: entries.map((entry) => entry.run.id), manifestHash, runCount: entries.length, bytes });
+      });
+      rotations.push({ rotationId, manifestHash, runCount: entries.length, runs: entries.map((entry) => entry.run.id), bytes });
+    }
+    const remaining = this.dueTombstoneCount(now);
+    if (!rotations.length) return { rotated: false, runCount: 0, runs: [], rotationId: null, manifestHash: null, bytes: 0, remaining, rotations: [] };
+    const summary2 = rotations.reduce((acc, r) => ({ runCount: acc.runCount + r.runCount, runs: [...acc.runs, ...r.runs], bytes: acc.bytes + r.bytes }), { runCount: 0, runs: [], bytes: 0 });
+    const flat = rotations.length === 1 ? { rotationId: rotations[0].rotationId, manifestHash: rotations[0].manifestHash } : { rotationId: null, manifestHash: null };
+    return { rotated: true, ...summary2, ...flat, remaining, rotations };
   }
   // Archive verification recomputes each rotation's manifest from the archived
   // rows and compares it against BOTH the rotations record (tamperable sidecar)
   // and the archive.rotated event anchored on the events hash chain (the trust
-  // anchor). Extra cross-checks: every chained rotation must still have its
-  // rotations record, and archive rows may not exist outside known rotations,
-  // so deleting archive history fails closed too.
+  // anchor). The chain is consulted FIRST and is the gate: every rotation the
+  // chain promises must exist in the archive, so a missing archive.db
+  // (whole-archive deletion) or a missing rotations record fails closed BEFORE
+  // any archive-side read could return an all-clear. Extra cross-checks:
+  // archive rows may not exist outside known rotations, so deleting archive
+  // history fails closed from both directions. Only a chain that promises
+  // nothing plus a missing sidecar (a clean install) verifies green.
   verifyArchive() {
-    if (!existsSync(this.archivePath)) return { exists: false, rotations: 0, checked: 0, verified: true, results: [], divergences: [] };
+    const chained = this.db.prepare("SELECT runId FROM events WHERE json_extract(body,'$.type')='archive.rotated'").all().map((e) => e.runId);
+    if (!existsSync(this.archivePath)) {
+      if (!chained.length) return { exists: false, rotations: 0, checked: 0, verified: true, results: [], divergences: [] };
+      return { exists: false, rotations: 0, checked: 0, verified: false, results: [], divergences: [`whole-archive-deleted: the events chain anchors ${chained.length} rotation(s) but archive.db is missing`] };
+    }
     const archive = this.archive();
     const rotations = archive.prepare("SELECT rotationId,manifestHash,runCount FROM rotations ORDER BY rotationId").all();
     const results = [], divergences = [];
@@ -13757,8 +13849,7 @@ var Store = class {
       if (problems.length) divergences.push(`rotation ${rotation.rotationId}: ${problems.join("; ")}`);
       results.push({ rotationId: rotation.rotationId, runCount: rotation.runCount, verified: problems.length === 0 });
     }
-    const chained = this.db.prepare("SELECT runId FROM events WHERE json_extract(body,'$.type')='archive.rotated'").all().map((e) => e.runId);
-    for (const runId of chained) if (!rotations.some((rotation) => rotation.rotationId === runId)) divergences.push(`rotation ${runId} is chained but missing from the archive`);
+    for (const runId of chained) if (!rotations.some((rotation) => rotation.rotationId === runId)) divergences.push(`rotation-missing: chained rotation ${runId} has no rotations record in the archive`);
     for (const orphan of archive.prepare("SELECT DISTINCT rotationId FROM archive_runs WHERE rotationId NOT IN (SELECT rotationId FROM rotations)").all()) divergences.push(`archive rows exist for unknown rotation ${orphan.rotationId}`);
     return { exists: true, rotations: rotations.length, checked: rotations.length, verified: divergences.length === 0, results, divergences };
   }
@@ -14419,6 +14510,7 @@ var Engine = class extends EventEmitter {
     this.slots = 0;
     this.queue = [];
     this.closing = false;
+    this.rotationDrain = false;
   }
   async fingerprints(files = []) {
     check(Array.isArray(files) && files.length <= 100, "files \u6700\u591A 100 \u9879");
@@ -14645,8 +14737,10 @@ var Engine = class extends EventEmitter {
   }
   // Tombstone soft delete. Steps, events, result and the integrity ledger all
   // stay untouched — only the run body gains deletedAt/deletedBy/purgeAfter and
-  // one append-only run.deleted audit event. Repeat deletes are idempotent and
-  // never append a second event.
+  // one append-only run.deleted audit event. Body change and audit event are
+  // committed by ONE transaction (store.tombstoneRun): an event-insert failure
+  // rolls the tombstone back too, so the operation fails closed with zero state
+  // change. Repeat deletes are idempotent and never append a second event.
   async deleteRun(id2, { by = "studio" } = {}) {
     check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
     check(TRASH_SOURCES.has(by), "\u65E0\u6548\u7684\u5220\u9664\u6765\u6E90");
@@ -14663,12 +14757,15 @@ var Engine = class extends EventEmitter {
     run.deletedAt = Date.now();
     run.deletedBy = by;
     run.purgeAfter = run.deletedAt + days * 864e5;
-    this.save(run);
-    this.emitEvent(id2, "run.deleted", { by, purgeAfter: run.purgeAfter });
+    run.updatedAt = Date.now();
+    const event = this.store.tombstoneRun(run, { by, purgeAfter: run.purgeAfter });
+    this.emit("change", { runId: id2, ...event });
     return { id: id2, deleted: true, alreadyDeleted: false, deletedAt: run.deletedAt, purgeAfter: run.purgeAfter };
   }
-  // Restore clears the tombstone and appends run.restored. Everything else was
-  // never removed, so the run reappears byte-identical on every query face.
+  // Restore clears the tombstone and appends run.restored — atomically via
+  // store.untombstoneRun, so a failing audit event leaves the tombstone exactly
+  // as it was. Everything else was never removed, so the run reappears
+  // byte-identical on every query face.
   async restoreRun(id2, { by = "studio" } = {}) {
     check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
     check(TRASH_SOURCES.has(by), "\u65E0\u6548\u7684\u6062\u590D\u6765\u6E90");
@@ -14678,31 +14775,68 @@ var Engine = class extends EventEmitter {
       delete run.deletedAt;
       delete run.deletedBy;
       delete run.purgeAfter;
-      this.save(run);
-      this.emitEvent(id2, "run.restored", { by, origin: "trash" });
+      run.updatedAt = Date.now();
+      const event = this.store.untombstoneRun(run, { by, origin: "trash" });
+      this.emit("change", { runId: id2, ...event });
       return this.snapshot(id2);
     }
     const archived = this.store.restoreArchived(id2, { by });
     check(archived, "\u5DE5\u4F5C\u6D41\u4E0D\u5B58\u5728\u6216\u672A\u5F52\u6863");
     return this.snapshot(id2);
   }
-  // Manual rotation face: rotate due tombstones now, optionally returning the
+  // Manual rotation face: rotate due tombstones now in bounded batches (at
+  // most ROTATE_MAX_BATCHES per call; callers may pass fewer), reporting the
+  // remaining backlog honestly in `remaining`, optionally returning the
   // archive and integrity verdicts alongside the rotation summary.
-  rotateArchive({ verify = false } = {}) {
+  rotateArchive({ verify = false, batches } = {}) {
     check(!this.closing, "\u670D\u52A1\u6B63\u5728\u5173\u95ED");
-    const result = this.store.rotateDue({ now: Date.now() });
+    const limit = batches === void 0 ? ROTATE_MAX_BATCHES : (check(Number.isInteger(batches) && batches >= 1 && batches <= ROTATE_MAX_BATCHES, `\u5355\u6B21\u8F6E\u8F6C\u6279\u6570\u987B\u4E3A 1\u2013${ROTATE_MAX_BATCHES} \u7684\u6574\u6570`), batches);
+    const result = this.store.rotateDue({ now: Date.now(), maxBatches: limit });
     return verify ? { ...result, archive: this.store.verifyArchive(), integrity: this.store.verifyIntegrity() } : result;
   }
   // Startup compaction: when trash volume or runs-table size crosses the
   // documented thresholds, expired tombstones are rotated into archive.db
-  // before the dashboard starts serving. trashRetentionDays=0 disables the
-  // expiry clock entirely (manual rotation only) and with it this auto path.
+  // before the dashboard starts serving — bounded to exactly ONE batch so
+  // startup blocking time is bounded by one batch, never by the backlog size;
+  // the honest `remaining` count tells the caller how much is still due.
+  // trashRetentionDays=0 disables the expiry clock entirely (manual rotation
+  // only) and with it this auto path.
   autoRotateAtStartup() {
     const days = this.trashRetentionDays();
-    if (days <= 0) return { autoRotated: false, reason: "manual-only", tombstones: this.store.tombstoneCount(), bytes: this.store.runsBytes() };
+    if (days <= 0) return { autoRotated: false, reason: "manual-only", tombstones: this.store.tombstoneCount(), bytes: this.store.runsBytes(), remaining: this.store.dueTombstoneCount() };
     const tombstones = this.store.tombstoneCount(), bytes = this.store.runsBytes();
-    if (tombstones <= ROTATE_TOMBSTONE_THRESHOLD && bytes <= ROTATE_RUNS_BYTES_THRESHOLD) return { autoRotated: false, tombstones, bytes };
-    return { ...this.store.rotateDue({ now: Date.now() }), autoRotated: true, tombstones, bytes };
+    if (tombstones <= ROTATE_TOMBSTONE_THRESHOLD && bytes <= ROTATE_RUNS_BYTES_THRESHOLD) return { autoRotated: false, tombstones, bytes, remaining: this.store.dueTombstoneCount() };
+    return { ...this.store.rotateDue({ now: Date.now(), maxBatches: 1 }), autoRotated: true, tombstones, bytes };
+  }
+  // Background drain for the backlog the bounded startup pass leaves behind:
+  // one batch per tick, throttled by intervalMs, until nothing is due. The
+  // service is already serving when this runs, so a failing batch is logged
+  // to stderr and stops the drain — rotation is idempotent, so the next
+  // startup pass or manual rotation retries without loss.
+  drainRotationsInBackground({ intervalMs = 250 } = {}) {
+    if (this.closing || this.rotationDrain) return;
+    this.rotationDrain = true;
+    const tick = () => {
+      if (this.closing) {
+        this.rotationDrain = false;
+        return;
+      }
+      let result;
+      try {
+        result = this.store.rotateDue({ now: Date.now(), maxBatches: 1 });
+      } catch (e) {
+        this.rotationDrain = false;
+        process.stderr.write(`Archive rotation drain failed: ${e.message}
+`);
+        return;
+      }
+      if (result.remaining > 0) {
+        const timer2 = setTimeout(tick, intervalMs);
+        timer2.unref?.();
+      } else this.rotationDrain = false;
+    };
+    const timer = setTimeout(tick, intervalMs);
+    timer.unref?.();
   }
   drain() {
     while (this.slots < this.globalConcurrency) {
@@ -26937,7 +27071,7 @@ async function startHTTP(engine, { port = 0, webRoot = new URL("../web/", import
           }
           if (url.pathname === "/api/scheduler") return json(engine.configureScheduler(data3));
           if (url.pathname === "/api/trash") return json(engine.configureTrash(data3));
-          if (url.pathname === "/api/archive/rotate") return json(engine.rotateArchive({ verify: data3.verify === true }));
+          if (url.pathname === "/api/archive/rotate") return json(engine.rotateArchive({ verify: data3.verify === true, batches: data3.batches }));
           if (url.pathname === "/api/tools") return json(await createToolHandler(engine, () => `${origin}/`)(data3.name, data3.arguments));
           if (url.pathname === "/api/validate") return json(assertValidDependencies(previewTopology(data3.script)));
           if (url.pathname === "/api/runs") return json(await engine.start(data3), 201);
@@ -28046,13 +28180,14 @@ if (values.stdio && process.env.MCODE_WORKFLOW_CHILD === "1") {
     try {
       engine = new Engine(store, { workspace, command: values["mcode-script"] ? process.execPath : "mcode", args: values["mcode-script"] ? [resolve3(values["mcode-script"])] : [], configPath: values["worker-config"] ? resolve3(values["worker-config"]) : void 0 });
       const compaction = engine.autoRotateAtStartup();
-      if (compaction.rotated) process.stdout.write(`Rotated ${compaction.runCount} trashed workflow(s) into archive.db (rotation ${compaction.rotationId}).
+      if (compaction.rotated) process.stdout.write(`Rotated ${compaction.runCount} trashed workflow(s) into archive.db (rotation ${compaction.rotationId}); ${compaction.remaining} still due.
 `);
       panel = await startHTTP(engine, { port });
       await saveAddress(panel.url);
       const temp = endpointPath + "." + process.pid + ".tmp";
       await writeFile(temp, JSON.stringify({ pid: process.pid, url: panel.url, workspace, serviceProtocol: 2 }), { mode: 384 });
       await rename(temp, endpointPath);
+      if (compaction.autoRotated && compaction.remaining > 0) engine.drainRotationsInBackground();
     } catch (e) {
       await engine?.close();
       await panel?.close();

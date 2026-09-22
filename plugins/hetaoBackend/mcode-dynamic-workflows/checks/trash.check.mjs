@@ -70,6 +70,51 @@ test('repeated delete is idempotent and never appends a second audit event',asyn
  }finally{await f.cleanup();}
 });
 
+// REAL failure injection helper (PR #58 re-review point 3): a SQLite RAISE
+// trigger makes the audit-event insert genuinely fail inside the live
+// transaction, so the tombstone/restore primitives must roll back whole.
+const injectEventFailure=store=>store.db.exec("CREATE TRIGGER inject_event_fail BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'injected event failure'); END");
+
+test('delete fails closed atomically when the audit event cannot be inserted',async()=>{
+ const f=await fixture(async s=>({output:s.id}));try{
+ const end=await run(f.engine,script);
+ const before=f.store.get(end.id),eventsBefore=f.store.events(end.id);
+ injectEventFailure(f.store);
+ await assert.rejects(f.engine.deleteRun(end.id),/injected event failure/);
+ f.store.db.exec('DROP TRIGGER inject_event_fail');
+ // Zero state change: no tombstone fields, no audit event, run byte-identical.
+ assert.deepEqual(f.store.get(end.id),before,'the run body is exactly as it was');
+ assert.deepEqual(f.store.events(end.id),eventsBefore,'no run.deleted event landed');
+ assert.ok(f.store.list().some(r=>r.id===end.id));
+ assert.ok(!f.store.listTrash().some(r=>r.id===end.id));
+ assert.equal(f.store.verifyIntegrity().events.verified,true,'the events chain is untouched by the rollback');
+ // Normal path is unaffected once the failure clears.
+ assert.equal((await f.engine.deleteRun(end.id)).deleted,true);
+ assert.equal(f.store.events(end.id).filter(e=>e.type==='run.deleted').length,1);
+ }finally{await f.cleanup();}
+});
+
+test('restore fails closed atomically when the audit event cannot be inserted',async()=>{
+ const f=await fixture(async s=>({output:s.id}));try{
+ const end=await run(f.engine,script);
+ await f.engine.deleteRun(end.id);
+ const tombstoned=f.store.get(end.id),eventsAtTombstone=f.store.events(end.id);
+ injectEventFailure(f.store);
+ await assert.rejects(f.engine.restoreRun(end.id),/injected event failure/);
+ f.store.db.exec('DROP TRIGGER inject_event_fail');
+ // Zero state change: the tombstone survives intact, no run.restored event.
+ assert.deepEqual(f.store.get(end.id),tombstoned,'the tombstone is exactly as it was');
+ assert.deepEqual(f.store.events(end.id),eventsAtTombstone,'no run.restored event landed');
+ assert.ok(f.store.listTrash().some(r=>r.id===end.id));
+ assert.ok(!f.store.list().some(r=>r.id===end.id));
+ assert.equal(f.store.verifyIntegrity().events.verified,true);
+ // Normal path is unaffected once the failure clears.
+ const restored=await f.engine.restoreRun(end.id);
+ assert.equal(restored.status,'succeeded');assert.equal(restored.deletedAt,undefined);
+ assert.equal(f.store.events(end.id).filter(e=>e.type==='run.restored').length,1);
+ }finally{await f.cleanup();}
+});
+
 test('cross-run reuse never adopts from a tombstoned run and the restored run is a candidate again',async()=>{
  const calls=[],f=await fixture(async s=>{calls.push(s.id);return {output:s.id};});try{
  const probe='return await ctx.agent({id:"a",prompt:"a"});';
